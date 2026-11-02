@@ -691,6 +691,43 @@ test("the dividers the plugin's record places are drawn between the turns", asyn
   })
 })
 
+test("a chat the host compacted with nothing at the seam still offers its archive", async () => {
+  const { host } = await onChatNext("c-rowless")
+  host.seed([
+    { user: "First", reply: "One." },
+    { user: "Second", reply: "Two." },
+    { user: "Third", reply: "Three." },
+  ])
+  // Hermes archived the older turns and wrote nothing where the summary went.
+  host.compact({ keep: 1, hidden: false })
+  await db.conversations.update("c-rowless", {
+    compactions: [{ at: Date.now(), tokens: 168_000, window: 200_000 }],
+  })
+  await mount(chatScreen("c-rowless"), async () => {
+    await until(() => replies().length === 1, "the window the compaction left")
+    const offer = find("[data-earlier]")
+    assert.ok(offer, "the archive is offered over it")
+    await click(offer)
+    await until(() => replies().length === 3, "every turn the compaction archived")
+  })
+})
+
+test("an archive the host cannot give retires the offer rather than saying it loaded", async () => {
+  await onChatNext("c-lost-session")
+  // The chat's record says a compaction ran and the host still holds the session, but nothing in it:
+  // both reads are answered with the host's own word for a session it has no rows for.
+  await db.conversations.update("c-lost-session", {
+    compactions: [{ at: Date.now(), tokens: 168_000, window: 200_000 }],
+  })
+  await mount(chatScreen("c-lost-session"), async () => {
+    await until(() => Boolean(find("[data-earlier]")), "the offer over the window")
+    await click(find("[data-earlier]")!)
+    await until(() => !find("[data-earlier]"), "the offer to go when the host gave nothing")
+    const record = await db.sessionStates.get("memento-c-lost-session")
+    assert.ok(!record?.archived, "no archive is recorded that the host never gave")
+  })
+})
+
 test("a compaction mid-run draws its divider between the calls it fell between", async () => {
   const { host } = await onChatNext("c-mid-run")
   await mount(chatScreen("c-mid-run"), async () => {

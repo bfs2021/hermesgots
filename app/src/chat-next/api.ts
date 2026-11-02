@@ -54,9 +54,22 @@ const within = (signal?: AbortSignal, timeoutMs = READ_TIMEOUT_MS) =>
 export class HostAway extends Error {}
 /** A 409 on a run start: whatever the host says of it, where it says anything. */
 export class HostRefused extends Error {}
+/**
+ * A run the host no longer has (404 `run_not_found`). Nothing to watch, only the transcript to read.
+ * The current chat screen answers the same 404 by polling instead (`chat.ts`).
+ */
+export class RunGone extends Error {}
 const answered = (response: Response) => `The host answered ${response.status}.`
 const ensure = (response: Response) => {
   if (!response.ok) throw new Error(answered(response))
+}
+/**
+ * Only the host's own `run_not_found` is a run that ended; a bare 404 is a route that isn't there.
+ */
+const goneRun = async (response: Response, runId: string) => {
+  if (response.status !== 404) return
+  const code = (await response.json().catch(() => null))?.error?.code
+  if (code === "run_not_found") throw new RunGone(`The host has no run ${runId}.`)
 }
 
 /**
@@ -201,6 +214,7 @@ export async function stopRun(connection: Connection, runId: string) {
     headers: headers(connection),
     signal: within(),
   })
+  await goneRun(response, runId)
   ensure(response)
 }
 
@@ -387,6 +401,7 @@ export async function respond(connection: Connection, waiting: Waiting, value: s
       signal: within(),
     },
   )
+  await goneRun(response, waiting.run)
   ensure(response)
 }
 
@@ -401,6 +416,7 @@ export async function followRun(
     headers: headers(connection),
     signal,
   })
+  await goneRun(response, runId)
   ensure(response)
   if (!response.body) throw new Error("The host sent no stream.")
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()

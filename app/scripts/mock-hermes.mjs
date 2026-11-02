@@ -5958,7 +5958,10 @@ http
     // copy stands for them, so a turn reads once. A device that already showed those turns meets them
     // again as new rows.
     if (url.pathname === "/__mock/compact" && req.method === "POST") {
-      const { session_id: sessionId, rows = 50 } = await readBody(req)
+      // `hidden: false` is the host that leaves nothing at the seam: the same archive and the same
+      // carried tail, with no summary row and no task-list notice where the compaction ran — the
+      // shape a real recording of it has, and the one no row of the transcript can date.
+      const { session_id: sessionId, rows = 50, hidden = true } = await readBody(req)
       const stored = transcripts.get(sessionId)
       if (!stored) return json(res, 404, { error: { message: "Session not found" } })
       const tail = stored.slice(-Math.max(1, rows))
@@ -5973,45 +5976,49 @@ http
           ? { ...row, archived: true, superseded: true }
           : { ...row, archived: true, timestamp: floor },
       )
+      const ran = Date.now() / 1000
       // The summary opens the live context, stamped with the moment the compaction ran; Hermes
       // flags it `_compressed_summary`, which the API strips, so the plugin's mark names its row.
-      const summary = {
-        id: ++lastRowId,
-        session_id: sessionId,
-        timestamp: Date.now() / 1000,
-        role: "user",
-        content: [
-          "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below.",
-          "The mock's summary of what came before.",
-          "",
-          "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---",
-        ].join("\n"),
-      }
+      const summary = hidden
+        ? {
+            id: ++lastRowId,
+            session_id: sessionId,
+            timestamp: ran,
+            role: "user",
+            content: [
+              "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below.",
+              "The mock's summary of what came before.",
+              "",
+              "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---",
+            ].join("\n"),
+          }
+        : undefined
       const copies = tail.map((row) => ({ ...row, id: ++lastRowId }))
-      transcripts.set(sessionId, [
-        ...archived,
-        summary,
-        {
-          id: ++lastRowId,
-          session_id: sessionId,
-          timestamp: Date.now() / 1000,
-          role: "user",
-          // The host ships this row as a plain `user` row: its synthetic flag never reaches the
-          // store, so no `display_kind` marks it and the app must read the seam off the text.
-          content: [
-            "[Your active task list was preserved across context compression]",
-            "- [>] 4. Compaction note row (in_progress)",
-            "",
-            "[Skills pruned during compression — reload before acting on these tasks]",
-            "The task list above crossed the compression boundary verbatim, but the skill " +
-              "instructions that governed it were pruned.",
-          ].join("\n"),
-        },
-        ...copies,
-      ])
+      const seam = hidden
+        ? [
+            summary,
+            {
+              id: ++lastRowId,
+              session_id: sessionId,
+              timestamp: ran,
+              role: "user",
+              // The host ships this row as a plain `user` row: its synthetic flag never reaches the
+              // store, so no `display_kind` marks it and the app must read the seam off the text.
+              content: [
+                "[Your active task list was preserved across context compression]",
+                "- [>] 4. Compaction note row (in_progress)",
+                "",
+                "[Skills pruned during compression — reload before acting on these tasks]",
+                "The task list above crossed the compression boundary verbatim, but the skill " +
+                  "instructions that governed it were pruned.",
+              ].join("\n"),
+            },
+          ]
+        : []
+      transcripts.set(sessionId, [...archived, ...seam, ...copies])
       compactions.set(sessionId, [
         ...(compactions.get(sessionId) ?? []),
-        { at: Math.round(summary.timestamp * 1000), row: summary.id },
+        { at: Math.round(ran * 1000), row: summary?.id },
       ])
       return json(res, 200, { ok: true, rows: copies.length, archived: archived.length })
     }

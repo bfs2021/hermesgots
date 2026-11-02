@@ -182,13 +182,14 @@ export function fakeHost(
   const rows: Row[] = []
   const expected: ExpectedTurn[] = []
   const runs = new Map<string, RunState>()
+  let droppedRun: string | undefined
   const answers: { run: string; prompt_id: string; generation: number; answer: string }[] = []
   const approvals: { run: string; choice: string }[] = []
   const asked = {
     transcript: 0,
     archive: 0,
     runs: 0,
-    subscriptions: 0,
+    eventReads: 0,
     health: 0,
     stops: 0,
     agentStops: 0,
@@ -245,7 +246,7 @@ export function fakeHost(
   }
   const agents: AgentRecord[] = []
   const children = new Map<string, Row[]>()
-  const compactions: { row: Row; turn: number; inside: boolean }[] = []
+  const compactions: { row?: Row; turn: number; inside: boolean }[] = []
   const gone = new Set<number>()
   const lostRequest = new Set<number>()
   let nextId = 1000
@@ -551,7 +552,6 @@ export function fakeHost(
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(encoder.encode(": open\n\n"))
-        asked.subscriptions++
         for (const sent of state.events)
           if (sent.seq > after && !(withhold && PROMPT_EVENTS.has(sent.event)))
             controller.enqueue(encoder.encode(frame(sent)))
@@ -764,10 +764,12 @@ export function fakeHost(
     if (plugin && path === "/api/plugins/memento/runs/live") {
       dispatch()
       const live = [...runs].filter(([, state]) => !state.done).at(-1)
+      // A run the gateway dropped is still listed: the plugin's own sweep is what forgets it.
+      const named = live?.[0] ?? droppedRun
       return reply({
         object: "memento.runs",
-        sessions: live ? { [session]: "running" } : {},
-        run_ids: live ? { [session]: live[0] } : {},
+        sessions: named ? { [session]: "running" } : {},
+        run_ids: named ? { [session]: named } : {},
         waiting: {},
         subagents: agents.some((agent) => agent.status === "running")
           ? { [session]: agents.filter((agent) => agent.status === "running").length }
@@ -848,11 +850,18 @@ export function fakeHost(
         outcome === "invalid" ? 400 : 409,
       )
     }
+    // A run's two routes answer the host's own word for a run it no longer has, rather than the bare
+    // no-route 404 below: the id the plugin's listing still names is a run the gateway dropped, and a
+    // screen reads the two answers differently (`api.ts`).
     const stream = /^\/v1\/runs\/([^/]+)\/events$/.exec(path)
-    if (stream && runs.has(stream[1]))
+    if (stream) {
+      asked.eventReads++
+      if (!runs.has(stream[1])) return reply({ error: { code: "run_not_found" } }, 404)
       return events(stream[1], Number(url.searchParams.get("last_seq") ?? -1))
+    }
     const status = /^\/v1\/runs\/([^/]+)$/.exec(path)
-    if (status && runs.has(status[1])) {
+    if (status && !runs.has(status[1])) return reply({ error: { code: "run_not_found" } }, 404)
+    if (status) {
       const state = runs.get(status[1])!
       return reply({
         object: "hermes.run",
@@ -902,7 +911,7 @@ export function fakeHost(
    * went. A turn still being worked keeps its work but loses its request to the archive, which is
    * what the real host did to a request in flight. Wake turns are not modelled.
    */
-  function compact({ keep = 1 }: { keep?: number } = {}) {
+  function compact({ keep = 1, hidden = true }: { keep?: number; hidden?: boolean } = {}) {
     const live = rows.filter((row) => !row.archived).sort((a, b) => a.order - b.order)
     const starts = live.filter((row) => row.role === "user" && !row.display_kind)
     const last = live.at(-1)
@@ -918,9 +927,14 @@ export function fakeHost(
     doomed.forEach((row) => (row.archived = true))
     const after = live.filter((row) => !row.archived)
     const at = after[0] ? after[0].order - 0.5 : (live.at(-1)?.order ?? 0) + 0.5
-    write("user", "", { display_kind: "hidden", order: at })
+    // A host that leaves nothing at the seam still records the compaction, without a row to mark it.
+    if (hidden) write("user", "", { display_kind: "hidden", order: at })
     const base = expected.length - count
-    compactions.push({ row: rows.at(-1)!, turn: base + count, inside: carried })
+    compactions.push({
+      row: hidden ? rows.at(-1)! : undefined,
+      turn: base + count,
+      inside: carried,
+    })
     for (let index = base; index < base + (open ? cut : cut); index++) gone.add(index)
     if (carried) lostRequest.add(base + cut)
   }
@@ -931,7 +945,7 @@ export function fakeHost(
    */
   function view(full = false): ExpectedTurn[] {
     const out: ExpectedTurn[] = []
-    const marks = compactions.filter((mark) => full || !mark.row.archived)
+    const marks = compactions.filter((mark) => full || !mark.row?.archived)
     expected.forEach((turn, index) => {
       if (!full && gone.has(index)) return
       // The divider stands above the first turn written after the compaction: the last turn the
@@ -970,6 +984,15 @@ export function fakeHost(
     latest.run = run
     latest.id = id
     return run
+  }
+
+  /** Drops the run started last, as the gateway does before the plugin's sweep forgets it. */
+  function retireLatest() {
+    const retired = [...runs.keys()].at(-1)
+    if (!retired) throw new Error("No run to retire.")
+    runs.delete(retired)
+    droppedRun = retired
+    return retired
   }
 
   /**
@@ -1021,5 +1044,6 @@ export function fakeHost(
     dropConnections,
     breakConnections,
     startElsewhere,
+    retireLatest,
   }
 }
