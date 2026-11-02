@@ -138,7 +138,10 @@ import {
 import { lastActivityAt } from "@/lib/session-work"
 import { hold, type HoldSlot } from "@/lib/chat-hold"
 import { useBotThreads, useThreads } from "@/lib/threads"
-import { EmptyState, MainEmptyState } from "@/components/chat/empty-states"
+import { EmptyState, MainEmptyState, MissingThread } from "@/components/chat/empty-states"
+import type { DiagReadFailure } from "@/lib/read-failure"
+import { describeReadFailure, formatReadFailure } from "@/lib/read-failure"
+import { reportUnreadThread } from "@/lib/sentry"
 import { isUnsent } from "@/chat-next/unsent"
 import { HeaderBack } from "@/components/chat/header-back"
 import { useSessionLeave } from "@/components/chat/session-leave"
@@ -854,7 +857,8 @@ function CurrentChatPage({ chatId, paneThread, slot }: ChatPageProps) {
       .catch((error) => toast.error(error instanceof Error ? error.message : "Couldn't load more."))
       .finally(() => setLoadingEarlier(false))
   }, [id])
-  const [historyMissing, setHistoryMissing] = useState<string>()
+  /** The read that left the thread empty: what it was, and the facts the pane and the report keep. */
+  const [readFailure, setReadFailure] = useState<DiagReadFailure>()
   const readyRef = useRef<{ id?: string }>(undefined)
 
   const resolved = { ...DEFAULT_SETTINGS, ...settings }
@@ -1013,23 +1017,56 @@ function CurrentChatPage({ chatId, paneThread, slot }: ChatPageProps) {
   const needsHistory =
     Boolean(conversation && conversation.updatedAt > conversation.createdAt) &&
     messages?.length === 0
-  const loadingHistory = needsHistory && historyMissing !== id
+  const threadUnread = needsHistory && readFailure?.chat.id === id
+  const loadingHistory = needsHistory && !threadUnread
+  // A read describes the chat as it is when it fails, which is no reason for the read to run again.
+  const latest = useRef({ chat: conversation, profile, stored: messages?.length ?? 0 })
   useEffect(() => {
-    if (!id || !needsHistory) return
-    reconcileHistory(id)
-      .then((count) => count || setHistoryMissing(id))
-      .catch((error) => {
-        setHistoryMissing(id)
-        toast.error(error instanceof Error ? error.message : "Couldn't load this chat.")
+    latest.current = { chat: conversation, profile, stored: messages?.length ?? 0 }
+  })
+  // The pane says the read failed and offers Try again; a toast on top of it says it twice.
+  const readHistory = useCallback(() => {
+    if (!id) return
+    const at = Date.now()
+    const failed = (error?: unknown) => {
+      const { chat, profile, stored } = latest.current
+      if (!chat || !profile) return
+      const failure = describeReadFailure({
+        at,
+        error,
+        chat,
+        profile,
+        stored,
+        endpoint: "/api/sessions/{id}/messages",
       })
-  }, [id, needsHistory])
+      setReadFailure(failure)
+      reportUnreadThread(failure)
+    }
+    reconcileHistory(id)
+      .then((count) => {
+        if (!count) failed()
+      })
+      .catch(failed)
+  }, [id])
+  useEffect(() => {
+    if (needsHistory) readHistory()
+  }, [needsHistory, readHistory])
+  const retryHistory = useCallback(() => {
+    setReadFailure(undefined)
+    readHistory()
+  }, [readHistory])
+  const readDetails = useCallback(
+    () => (readFailure ? formatReadFailure(readFailure) : ""),
+    [readFailure],
+  )
 
   // Other devices add turns on Hermes. Catch up when the chat opens, when sync brings news of it,
   // when this tab comes back, and now and then while it's on screen.
   const updatedAt = conversation?.updatedAt
   const hasMessages = (messages?.length ?? 0) > 0
   const hasCards = Boolean(cards && (cards.before.size || cards.trailing.length))
-  const unstarted = !gone && configured && !hasMessages && !hasCards && !loadingHistory
+  // A session with a past is never drawn as one nobody started: it has a thread, unread.
+  const unstarted = !gone && configured && !hasMessages && !hasCards && !needsHistory
   // The agents this chat's agent delegated to, for their cards in the thread. Only a call that set a
   // subagent to work turns the poll on: a list, steer or stop runs no agent to wait for (ADR 0053).
   const spawning = useMemo(() => spawnInFlight(messages), [messages])
@@ -1421,6 +1458,8 @@ function CurrentChatPage({ chatId, paneThread, slot }: ChatPageProps) {
         <div className="flex flex-1 items-center justify-center">
           <Spinner className="size-6" />
         </div>
+      ) : threadUnread ? (
+        <MissingThread onRetry={retryHistory} details={readDetails} />
       ) : conversation?.main && botThreads && configured ? (
         <MainEmptyState botId={profile?.botId} id={conversation?.id} onSend={send} />
       ) : (
