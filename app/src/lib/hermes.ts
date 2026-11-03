@@ -28,6 +28,7 @@ import {
   type WorkflowEntry,
 } from "@/lib/workflow"
 import { isNative } from "@/lib/native"
+import { ask, sawFrame, sawWords, sent, sentFrom } from "@/lib/net-watch"
 import type { Fingerprint, Totals } from "@/lib/dictation-log"
 import { promptEntry } from "@/lib/run-prompt"
 import type { CronSchedule } from "@/lib/schedule"
@@ -177,7 +178,8 @@ function headers(config: HermesConfig, extra?: Record<string, string>) {
 async function request(url: string, init: RequestInit) {
   let response: Response
   try {
-    response = await fetch(url, init)
+    // The one place a request to a bot's host is made: the network log watches here (ADR 0086).
+    response = await ask(url, init)
   } catch (error) {
     if (error instanceof DOMException && ["AbortError", "TimeoutError"].includes(error.name))
       throw error
@@ -231,10 +233,16 @@ function readWithin(reader: ReadableStreamDefaultReader<Uint8Array>, ms: number)
  * Yields `{event, data}` for each SSE frame in the body. With `idleMs`, a body that sends nothing
  * for that long (comments included) is cancelled and the read rejects with a `TimeoutError`.
  */
-async function* readSse(body: ReadableStream<Uint8Array>, idleMs?: number) {
+async function* readSse(
+  body: ReadableStream<Uint8Array>,
+  idleMs?: number,
+  /** Called once, when the stream's first frame lands: that instant is what the network log reads. */
+  onFrame?: () => void,
+) {
   const reader = body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
+  let framed = false
   try {
     while (true) {
       const { value, done } = await (idleMs ? readWithin(reader, idleMs) : reader.read())
@@ -254,7 +262,13 @@ async function* readSse(body: ReadableStream<Uint8Array>, idleMs?: number) {
           if (field === "event") event = value
           else if (field === "data") data.push(value)
         }
-        if (data.length) yield { event, data: data.join("\n") }
+        if (data.length) {
+          if (onFrame && !framed) {
+            framed = true
+            onFrame()
+          }
+          yield { event, data: data.join("\n") }
+        }
       }
     }
   } catch (error) {
@@ -300,7 +314,7 @@ export async function streamChat(
   let usage: TurnUsage | undefined
   let runId: string | null = null
 
-  for await (const { event, data } of readSse(response.body)) {
+  for await (const { event, data } of readSse(response.body, undefined, () => sawFrame(response))) {
     if (data === "[DONE]") break
     let payload: any
     try {
@@ -330,7 +344,11 @@ export async function streamChat(
         const choice = payload?.choices?.[0]
         const delta = choice?.delta
         if (delta?.reasoning_content) handlers.onReasoning?.(delta.reasoning_content)
-        if (delta?.content) handlers.onContent?.(delta.content)
+        if (delta?.content) {
+          // The send's own wait is over at its first words (ADR 0086).
+          sawWords(response)
+          handlers.onContent?.(delta.content)
+        }
         if (choice?.finish_reason) finishReason = choice.finish_reason
         if (payload?.usage) {
           usage = {
@@ -1976,7 +1994,9 @@ export async function followEvents(
     signal: options.signal,
   })
   if (!response.body) throw new HermesError("Hermes returned an empty response.")
-  for await (const { event, data } of readSse(response.body, EVENTS_IDLE_MS)) {
+  for await (const { event, data } of readSse(response.body, EVENTS_IDLE_MS, () =>
+    sawFrame(response),
+  )) {
     let payload: unknown
     try {
       payload = JSON.parse(data)
@@ -3982,10 +4002,6 @@ const PLAN_HINT =
   "tool search if it isn't loaded yet), keep exactly one item in progress, and update the list as " +
   "each step is done."
 
-/**
- * Starts a turn on `/v1/runs`. Unlike a chat completion, Hermes doesn't interrupt a run when its
- * event stream drops, so a phone that sleeps mid-reply can pick it up again.
- */
 interface RunOptions {
   /** With a model picked for the chat; without it no model is sent and the host's model runs. */
   model?: string
@@ -4012,11 +4028,17 @@ export function runRequest(config: HermesConfig, options: RunOptions) {
   }
 }
 
+/**
+ * Starts a turn on `/v1/runs`. Unlike a chat completion, Hermes doesn't interrupt a run when its
+ * event stream drops, so a phone that sleeps mid-reply can pick it up again.
+ */
 export async function startRun(
   config: HermesConfig,
   /** `idempotencyKey` makes a retried POST return the run it already started. */
   options: RunOptions & { idempotencyKey: string },
 ) {
+  // A run's first words are measured from this send, across the POST and the stream that answers it.
+  const started = performance.now()
   const response = await request(endpoint(config.baseUrl, "/runs"), {
     method: "POST",
     headers: headers(config, { "Idempotency-Key": options.idempotencyKey }),
@@ -4024,6 +4046,7 @@ export async function startRun(
   })
   const body = await response.json()
   if (typeof body?.run_id !== "string") throw new HermesError("Hermes didn't start the run.")
+  sent(body.run_id, started)
   return body.run_id as string
 }
 
@@ -4058,7 +4081,14 @@ export async function followRun(
 
   // Hermes v2026.9.24 sends no seq: number the calls here, so each gets its own card.
   let calls = 0
-  for await (const { data } of readSse(response.body, RUN_STREAM_IDLE_MS)) {
+  // A stream opened later, by a wake or a reload, starts no wait: only the send's own does.
+  const from = sentFrom(runId)
+  const firstWords = () => {
+    if (from !== undefined) sawWords(response, from)
+  }
+  for await (const { data } of readSse(response.body, RUN_STREAM_IDLE_MS, () =>
+    sawFrame(response),
+  )) {
     let payload: any
     try {
       payload = JSON.parse(data)
@@ -4068,10 +4098,16 @@ export async function followRun(
     const name = String(payload?.event ?? "")
     switch (name) {
       case "message.delta":
-        if (payload.delta) handlers.onContent?.(String(payload.delta))
+        if (payload.delta) {
+          firstWords()
+          handlers.onContent?.(String(payload.delta))
+        }
         break
       case "message.interim":
-        if (payload.text && !payload.already_streamed) handlers.onContent?.(`${payload.text}\n\n`)
+        if (payload.text && !payload.already_streamed) {
+          firstWords()
+          handlers.onContent?.(`${payload.text}\n\n`)
+        }
         break
       case "reasoning.available":
         if (payload.text) handlers.onReasoningBlock?.(String(payload.text))

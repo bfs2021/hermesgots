@@ -2757,3 +2757,36 @@ again — the same silence that made the reported stop need a second press.
   share, and widening its answer is a change across those callers rather than to the stop path alone.
 
 Found by the simplify pass on this branch; neither entry blocks the pull request.
+
+---
+
+# Deferred fixes from the network log
+
+Landed on this branch: the Developer **Network log** switch, its screen (pills, summary strip, table,
+copy and clear), the recorder both transports ask through, and the store behind it (ADR 0086,
+`docs/specs/network-log.md`). The first-words figure the spec asked for on the new chat screen landed
+with the send keyed by its run id, so it is no longer deferred. One thing is recorded here instead.
+
+### 1. No request or response sizes
+
+A row holds how long a request took and never how many bytes came back.
+
+- Cost: a slow answer that is slow because it is a large one reads the same as a slow host.
+- Suggested fix: read `Content-Length` where the host sends one and record it; a compressed
+  streaming body has no honest size to report, so the field would be absent for streams either way.
+- Why it is deferred: the count a person actually wants is the body's, and bodies are consumed
+  directly at every read in the client rather than through one wrapper, so it is a change to every
+  body read rather than a field on the row.
+
+### 2. A saved picture's own fetch is not in the log
+
+`app/src/lib/media-cache.ts` asks a bot's host for the bytes of an image it keeps a copy of, with
+`cache: "force-cache"` — it reads what the browser has just drawn, so most of those asks never touch
+the network — and the guard test allowlists that file by name.
+
+- Cost: a picture the app did re-fetch, on a bot whose images are slow, is missing from the log while
+  everything else about that bot is in it.
+- Suggested fix: send that call through `ask()`, and mark a row taken from the HTTP cache as such —
+  a cached read recorded as network time would be a worse lie than leaving it out.
+- Why it is deferred: `media-cache.ts` predates this branch and nothing in the change touches it; the
+  fix needs a cache-vs-network distinction on the row before it can be honest.

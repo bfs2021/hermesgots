@@ -3,6 +3,7 @@ import { useLiveQuery } from "dexie-react-hooks"
 import { useTheme } from "next-themes"
 import { Navigate, useNavigate, useParams, useSearchParams } from "react-router"
 import {
+  ActivityIcon,
   ArrowLeftIcon,
   AudioLinesIcon,
   BellIcon,
@@ -44,6 +45,7 @@ import type { BotSub } from "@/lib/bot-subs"
 import { botPageOf, botPath, botTabOf, botTabPath, type BotPage } from "@/lib/bot-tabs"
 import { botSubOf, botSubPath } from "@/lib/bot-subs"
 import { Banner } from "@/components/banner"
+import { NetworkLogScreen } from "@/components/network-log"
 import { Bot } from "@/components/bot"
 import { OnlineDot } from "@/components/bot-card"
 import { LinkSheet } from "@/components/link-bots"
@@ -121,6 +123,7 @@ const SECTIONS: Record<string, { title: string; render: () => ReactNode }> = {
   notifications: { title: NOTIFICATION_SETTINGS, render: () => <NotificationTypes /> },
   data: { title: "Local data", render: () => <DataSettings /> },
   developer: { title: "Developer", render: () => <DeveloperSettings /> },
+  network: { title: "Network log", render: () => <DeveloperOnly /> },
 }
 
 /** Which section the menu shows as open, and whether picking one swaps it in place. */
@@ -591,6 +594,14 @@ const LIVE_LABELS: Record<LiveStatus, { label: string; detail: string }> = {
 export function DeveloperSettings() {
   const bots = useLiveQuery(listProfiles, [])
   const settings = useLiveQuery(getSettings, [])
+  // Two counts off the store's own indexes, never the whole table read to filter it in JS.
+  const log = useLiveQuery(async () => {
+    const [count, failed] = await Promise.all([
+      db.netLog.count(),
+      db.netLog.where("ending").notEqual("answered").count(),
+    ])
+    return { count, failed }
+  }, [])
   return (
     <>
       <Group>
@@ -645,6 +656,24 @@ export function DeveloperSettings() {
         <SyncServerRow />
       </Group>
       <Group>
+        <SwitchRow
+          id="network-log"
+          icon={TimerIcon}
+          title="Network log"
+          subtitle="Records this device's requests to each bot"
+          checked={Boolean(settings?.netLog)}
+          onCheckedChange={(checked) => saveSettings({ netLog: checked })}
+        />
+        {(settings?.netLog || Boolean(log?.count)) && (
+          <Row
+            to="network"
+            icon={ActivityIcon}
+            title="View the log"
+            subtitle={
+              log?.count ? `${log.count} requests · ${log.failed} failed` : "Nothing recorded yet"
+            }
+          />
+        )}
         {bots?.map((bot) => (
           <LiveRow key={bot.id} bot={bot} />
         ))}
@@ -652,11 +681,19 @@ export function DeveloperSettings() {
       <Group>
         <DeviceStateRow />
       </Group>
-      <Button variant="outline" onClick={() => saveSettings({ developer: false })}>
+      <Button variant="outline" onClick={() => saveSettings({ developer: false, netLog: false })}>
         Hide developer settings
       </Button>
     </>
   )
+}
+
+/** The log behind Developer's switch: its section is not reachable by URL with the switch off. */
+function DeveloperOnly() {
+  const settings = useLiveQuery(getSettings, [])
+  // Nothing drawn while the device's settings are still being read: a redirect then would be a guess.
+  if (!settings) return null
+  return settings.developer ? <NetworkLogScreen /> : <Navigate to="/settings" replace />
 }
 
 function TestPushRow() {

@@ -1,5 +1,6 @@
 import { pluginRoot, serverRoot } from "../lib/host-url.ts"
 import { READ_TIMEOUT_MS } from "../lib/freshness.ts"
+import { ask, sawFrame, sawWords, sent, sentFrom } from "../lib/net-watch.ts"
 import { promptOf } from "../lib/run-prompt.ts"
 
 import type { Agent } from "./agents"
@@ -100,7 +101,7 @@ export async function readPage(
 ): Promise<Row[]> {
   let response: Response
   try {
-    response = await fetch(
+    response = await ask(
       `${root(connection)}/api/sessions/${encodeURIComponent(session)}/messages?order=latest&limit=${PAGE}&offset=${offset}${archived ? "&include_compacted=true" : ""}`,
       { headers: headers(connection), signal: within(signal) },
     )
@@ -184,9 +185,10 @@ export async function postRun(
   key: string,
   { signal, timeoutMs }: Posting = {},
 ): Promise<string> {
+  const started = performance.now()
   let response: Response
   try {
-    response = await fetch(`${root(connection)}/v1/runs`, {
+    response = await ask(`${root(connection)}/v1/runs`, {
       method: "POST",
       headers: {
         ...headers(connection),
@@ -204,12 +206,13 @@ export async function postRun(
   if (!response.ok) throw new Error((await refusal(response)) ?? answered(response))
   const { run_id } = (await response.json()) as { run_id?: unknown }
   if (typeof run_id !== "string") throw new Error("The host didn't start the run.")
+  sent(run_id, started)
   return run_id
 }
 
 /** Stops a run; the plugin stops the subagents it started (`delegation.sweep_stops`). */
 export async function stopRun(connection: Connection, runId: string) {
-  const response = await fetch(`${root(connection)}/v1/runs/${encodeURIComponent(runId)}/stop`, {
+  const response = await ask(`${root(connection)}/v1/runs/${encodeURIComponent(runId)}/stop`, {
     method: "POST",
     headers: headers(connection),
     signal: within(),
@@ -229,7 +232,7 @@ export async function readLiveRun(
   signal?: AbortSignal,
 ): Promise<string | null | undefined> {
   try {
-    const response = await fetch(`${plugin(connection)}/runs/live`, {
+    const response = await ask(`${plugin(connection)}/runs/live`, {
       headers: headers(connection),
       signal: within(signal),
     })
@@ -253,7 +256,7 @@ export async function readRun(
   signal?: AbortSignal,
 ): Promise<Waiting | undefined> {
   try {
-    const response = await fetch(`${root(connection)}/v1/runs/${encodeURIComponent(runId)}`, {
+    const response = await ask(`${root(connection)}/v1/runs/${encodeURIComponent(runId)}`, {
       headers: headers(connection),
       signal: within(signal),
     })
@@ -276,7 +279,7 @@ export async function clearFailedTurn(
   signal?: AbortSignal,
 ): Promise<number> {
   try {
-    const response = await fetch(
+    const response = await ask(
       `${plugin(connection)}/sessions/${encodeURIComponent(session)}/failed-turn/clear`,
       {
         method: "POST",
@@ -302,7 +305,7 @@ export async function readAgents(
   signal?: AbortSignal,
 ): Promise<Agent[] | undefined> {
   try {
-    const response = await fetch(
+    const response = await ask(
       `${plugin(connection)}/sessions/${encodeURIComponent(session)}/agents`,
       { headers: headers(connection), signal: within(signal) },
     )
@@ -333,7 +336,7 @@ export async function readQueue(
   signal?: AbortSignal,
 ): Promise<{ items: Queued[]; paused: boolean } | undefined> {
   try {
-    const response = await fetch(
+    const response = await ask(
       `${plugin(connection)}/sessions/${encodeURIComponent(session)}/queue`,
       {
         headers: headers(connection),
@@ -374,7 +377,7 @@ export async function actOnQueued(
   id: string,
   action: "remove" | "send",
 ) {
-  const response = await fetch(
+  const response = await ask(
     `${plugin(connection)}/sessions/${encodeURIComponent(session)}/queue/${encodeURIComponent(id)}/${action}`,
     { method: "POST", headers: headers(connection), signal: within() },
   )
@@ -388,7 +391,7 @@ export async function actOnQueued(
  */
 export async function respond(connection: Connection, waiting: Waiting, value: string) {
   const kind = waiting.kind === "approval" ? "approval" : "clarify"
-  const response = await fetch(
+  const response = await ask(
     `${root(connection)}/v1/runs/${encodeURIComponent(waiting.run)}/${kind}`,
     {
       method: "POST",
@@ -412,7 +415,7 @@ export async function followRun(
   onEvent: (event: RunEvent) => void,
   signal?: AbortSignal,
 ) {
-  const response = await fetch(`${root(connection)}/v1/runs/${encodeURIComponent(runId)}/events`, {
+  const response = await ask(`${root(connection)}/v1/runs/${encodeURIComponent(runId)}/events`, {
     headers: headers(connection),
     signal,
   })
@@ -420,7 +423,9 @@ export async function followRun(
   ensure(response)
   if (!response.body) throw new Error("The host sent no stream.")
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+  const from = sentFrom(runId)
   let pending = ""
+  let first = true
   for (;;) {
     const { value, done } = await reader.read()
     if (done) return
@@ -433,7 +438,15 @@ export async function followRun(
         .filter((line) => line.startsWith("data:"))
         .map((line) => line.slice(5).trimStart())
         .join("\n")
-      if (data) onEvent(JSON.parse(data) as RunEvent)
+      if (data) {
+        const event = JSON.parse(data) as RunEvent
+        if (first) {
+          first = false
+          sawFrame(response)
+        }
+        if (from !== undefined && event.event === "message.delta") sawWords(response, from)
+        onEvent(event)
+      }
     }
   }
 }
