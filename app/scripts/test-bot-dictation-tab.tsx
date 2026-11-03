@@ -29,9 +29,14 @@ import {
   add,
   draft,
   seed,
+  seedCache,
+  loading,
+  off,
+  STT,
   switchIn,
 } from "./dictation-page-kit.tsx"
 import { click, find, findAll, mount, text, type, until } from "./component-kit.tsx"
+import { connectionKey } from "@/lib/connection"
 import { db } from "@/lib/db"
 
 test("a host that can hear speech has a Speech-to-text page, its Vocabulary row counting the words", async () => {
@@ -661,6 +666,14 @@ test("a Developer's Hearing prompt switch is written to the host and read back",
       async () => switchIn("hearing-prompt")?.getAttribute("aria-checked") === "true",
       "the switch reading back on",
     )
+    // The host answered the block it now holds, so this device's copy moves with it: the page a user
+    // opens next draws the switch they set rather than the one before it.
+    const profile = await db.profiles.get("bot-1")
+    assert.ok(profile)
+    await until(
+      async () => (await db.speechCache.get(connectionKey(profile)))?.speech.hearing.sent === true,
+      "the write kept on this device",
+    )
   })
 })
 
@@ -669,6 +682,40 @@ test("a host too old to take a level offers the cleanup model alone", async () =
   await mount(editor("/settings/bots/bot-1/speech-to-text"), async () => {
     assert.ok(row("cleanup-model"), "the model's row is still there")
     assert.equal(row("cleanup-level"), null, "and no level the host would refuse to store")
+  })
+})
+
+test("a provider pick is followed by the route it moved to, and Cleanup shuts at once", async () => {
+  const written = STT({
+    values: { "stt.provider": "groq" },
+    provider: { name: "groq", explicit: "groq", reason: null },
+  })
+  await seed(
+    "provider-cloud",
+    ["dictation", "speech_model", "stt_settings", "cleanup_level"],
+    {},
+    {
+      speech: speech({ stt: STT() }),
+      nextStt: written,
+      afterStt: speech({
+        stt: written,
+        provider: { name: "groq", backend: null, cloud: true },
+      }),
+    },
+  )
+  await mount(editor("/settings/bots/bot-1/speech-to-text"), async () => {
+    await until(async () => Boolean(row("cleanup-level")), "the cleanup's card")
+    assert.equal(off(row("cleanup-level")), false, "a local route keeps Cleanup live")
+    await click(row("stt.provider"))
+    const groq = findAll('[data-pick-list="Provider"] > button').find((one) =>
+      (one.textContent ?? "").includes("Groq"),
+    )
+    assert.ok(groq, "the Provider row offers the vendor")
+    await click(groq)
+    // The `stt` block a write answers with carries no route: the page reads again, and the card
+    // shuts on the provider the bot has just moved to rather than on the one it left.
+    await until(async () => off(row("cleanup-level")), "the card shut once the route moved")
+    assert.equal(off(row("cleanup-level")), true, "and its level takes no taps")
   })
 })
 
@@ -698,5 +745,173 @@ test("a host hearing takes on its own model draws no line about it", async () =>
   await mount(editor("/settings/bots/bot-1/speech-to-text"), async () => {
     await until(async () => Boolean(row("speech-model")), "the model row the page always draws")
     assert.equal(row("heard-by"), null, "the model row already says where takes are heard")
+  })
+})
+
+test("the page opens on the last answer this device read, every row muted until a fresh one lands", async () => {
+  const calls = await seed(
+    "cached-page",
+    ["dictation", "speech_model", "stt_settings", "cleanup_level"],
+    {},
+    { speech: speech({ stt: STT() }), stallSpeech: true },
+  )
+  await seedCache({ model: "base", stt: STT() })
+  await mount(editor("/settings/bots/bot-1/speech-to-text"), async () => {
+    await until(async () => Boolean(row("speech-model")), "the rows the cached copy holds")
+    assert.equal(loading(), null, "rows rather than a loader")
+    assert.equal(valueOf(row("speech-model")), "base", "the model this device last read")
+    assert.equal(valueColour(row("speech-model")), "muted", "drawn muted: no fresh read confirms it")
+    for (const name of ["speech-model", "cleanup-level", "cleanup-model"])
+      assert.equal(off(row(name)), true, `${name} takes no taps until the host answers`)
+    await click(row("cleanup-level"))
+    assert.equal(findAll("[data-cleanup-levels]").length, 0, "so a tap on it opens nothing")
+    assert.deepEqual(calls, [], "and nothing is written from a value that may be stale")
+  })
+})
+
+test("a fresh answer replaces the cached copy and unlocks the page", async () => {
+  await seed(
+    "cached-fresh",
+    ["dictation", "speech_model", "stt_settings", "cleanup_level"],
+    {},
+    { speech: speech({ model: "small", stt: STT() }) },
+  )
+  await seedCache({ model: "base", stt: STT() })
+  await mount(editor("/settings/bots/bot-1/speech-to-text"), async () => {
+    await until(async () => valueOf(row("speech-model")) === "small", "the fresh answer")
+    assert.equal(off(row("speech-model")), false, "the row takes taps again")
+    assert.equal(valueColour(row("speech-model")), "accent", "and reads as the value it holds")
+    await click(row("cleanup-level"))
+    await until(async () => Boolean(find("[data-cleanup-levels]")), "the level's own cards")
+  })
+})
+
+test("a bot this device never read shows a loader in place of its rows", async () => {
+  await seed(
+    "cold-page",
+    ["dictation", "speech_model", "stt_settings", "cleanup_level"],
+    {},
+    { speech: speech({ stt: STT() }), stallSpeech: true },
+  )
+  await mount(editor("/settings/bots/bot-1/speech-to-text"), async () => {
+    assert.ok(loading(), "a page-level loader")
+    assert.equal(row("speech-model"), null, "and no rows to read as an answer")
+    assert.equal(row("cleanup-level"), null, "none of them")
+  })
+})
+
+test("a failed read leaves the cached copy muted, under the host's own sentence", async () => {
+  await seed(
+    "cached-failed",
+    ["dictation", "speech_model", "stt_settings"],
+    {},
+    { refuseSpeech: "Speech-to-text is turned off on this host." },
+  )
+  await seedCache({ model: "base", stt: STT() })
+  await mount(editor("/settings/bots/bot-1/speech-to-text"), async () => {
+    await until(async () => Boolean(find('[role="alert"]')), "the host's own sentence")
+    assert.match(
+      find('[role="alert"]')?.textContent ?? "",
+      /turned off on this host/,
+      "the reason the copy may be old",
+    )
+    assert.equal(valueOf(row("speech-model")), "base", "the cached answer stays under it")
+    assert.equal(off(row("speech-model")), true, "muted, not trusted")
+  })
+})
+
+test("a provider's page waits for the host rather than answering for it", async () => {
+  await seed(
+    "cold-provider",
+    ["dictation", "speech_model", "stt_settings"],
+    {},
+    { speech: speech({ stt: STT() }), stallSpeech: true },
+  )
+  await mount(editor("/settings/bots/bot-1/speech-to-text/providers/groq"), async () => {
+    assert.ok(loading(), "the page-level loader, as on the page it came from")
+    assert.equal(
+      find("[data-stt-provider]")?.textContent?.includes("doesn't declare"),
+      false,
+      "and no sentence about the host before it has answered",
+    )
+  })
+})
+
+test("a muted page's rows take no taps, so no measurement starts", async () => {
+  const calls = await seed(
+    "cached-probe",
+    ["dictation", "speech_model", "speech_probe"],
+    {},
+    { speech: unmeasured(), stallSpeech: true },
+  )
+  await seedCache({ probe: unmeasured().probe })
+  await mount(editor("/settings/bots/bot-1/speech-to-text"), async () => {
+    await until(async () => Boolean(row("speech-model")), "the cached rows")
+    await click(row("speech-model"))
+    assert.equal(
+      calls.filter((call) => call.path.endsWith("/speech/probe")).length,
+      0,
+      "a stale block puts the host to no work",
+    )
+  })
+})
+
+test("a bot whose takes leave the host greys Cleanup's rows and says nothing about it", async () => {
+  const calls = await seed(
+    "cleanup-cloud",
+    ["dictation", "speech_model", "cleanup_level", "hearing_prompt"],
+    {},
+    {
+      speech: speech({
+        provider: { name: "groq", backend: null, cloud: true },
+        hearing: { sent: false },
+      }),
+    },
+  )
+  await db.settings.update("settings", { developer: true })
+  await mount(editor("/settings/bots/bot-1/speech-to-text"), async () => {
+    await until(async () => Boolean(row("hearing-prompt")), "the cleanup's card")
+    for (const name of ["cleanup-level", "cleanup-model"])
+      assert.equal(off(row(name)), true, `the card is drawn as shut, ${name} takes no taps`)
+    // The card's own words, read off the rows it draws: the greying is the whole of it.
+    const card = row("cleanup-level")?.closest("[data-settings-group]")
+    assert.equal(
+      /only available|local models/i.test(card?.textContent ?? ""),
+      false,
+      "and no sentence explains the greying",
+    )
+    assert.equal(off(switchIn("hearing-prompt")), true, "nor the Hearing prompt's switch")
+    await click(row("cleanup-level"))
+    assert.equal(findAll("[data-cleanup-levels]").length, 0, "so nothing opens under it")
+    assert.deepEqual(calls, [], "and the row's value is not written")
+  })
+})
+
+test("a bot that hears on its own host keeps Cleanup live", async () => {
+  await seed(
+    "cleanup-local",
+    ["dictation", "speech_model", "cleanup_level"],
+    {},
+    { speech: speech({ provider: { name: "local", backend: "local", cloud: false } }) },
+  )
+  await mount(editor("/settings/bots/bot-1/speech-to-text"), async () => {
+    await until(async () => Boolean(row("cleanup-level")), "the cleanup's card")
+    assert.equal(off(row("cleanup-level")), false, "the level takes taps")
+    assert.equal(off(row("cleanup-model")), false, "and so does the model")
+    await click(row("cleanup-level"))
+    await until(async () => Boolean(find("[data-cleanup-levels]")), "the level's own cards")
+  })
+})
+
+test("a host that carries no level keeps the page it had, cloud route or not", async () => {
+  await seed(
+    "cleanup-old-host",
+    ["dictation", "speech_model"],
+    {},
+    { speech: speech({ provider: { name: "groq", backend: null, cloud: true } }) },
+  )
+  await mount(editor("/settings/bots/bot-1/speech-to-text"), async () => {
+    await until(async () => Boolean(row("cleanup-model")), "the cleanup's card")
+    assert.equal(off(row("cleanup-model")), false, "and the model row stays as it was")
   })
 })

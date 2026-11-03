@@ -16,6 +16,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Spinner } from "@/components/ui/spinner"
 import { Textarea } from "@/components/ui/textarea"
 import { botSubPath, type BotSub } from "@/lib/bot-subs"
 import { botTabPath } from "@/lib/bot-tabs"
@@ -64,11 +65,19 @@ import { MAX_WORD, addWord, cleanWord, readVocabulary, removeWord } from "@/lib/
  * take, both Gots's own, over the bot's own Hermes — the model that hears it, and every setting
  * that decides what a take returns, mirrored from the Dashboard's form one key at a time
  * (ADR 0063). Every row is a value that opens its pick, its form or its page (ADR 0055).
+ *
+ * The page opens on the last answer this device read, every row of it muted and untappable until a
+ * fresh one lands, and a loader where it never read one (ADR 0082).
  */
 export function DictationTab({ profile, sub }: { profile: Profile; sub?: BotSub }) {
   const speech = useSpeech(profile)
   const settings = speech.supported ? speech.settings : undefined
   const block = speech.stt ? settings?.stt : undefined
+  // Nothing fresh has landed: what the page holds is this device's copy of an older answer, so
+  // nothing here may be written from it.
+  const muted = speech.stale
+  // A bot this device never read shows a loader in place of the rows rather than a page of blanks.
+  const loading = speech.loading
   const navigate = useNavigate()
   const words = readVocabulary(profile.vocabulary)
   const info = useModelInfo(profile)
@@ -79,7 +88,8 @@ export function DictationTab({ profile, sub }: { profile: Profile; sub?: BotSub 
   const models = settings ? modelsFor(settings, block) : []
   const otherProviders = block ? providerRows(block) : []
   const heard = settings ? heardLine(settings.provider) : null
-  // The picker is where a measurement is asked for (ADR 0075).
+  // The picker is where a measurement is asked for (ADR 0075); the muted row that cannot open it and
+  // the hook's own guard are what keep a stale page from starting one.
   const openSpeech = () => {
     setPick("speech")
     void speech.measure()
@@ -101,9 +111,20 @@ export function DictationTab({ profile, sub }: { profile: Profile; sub?: BotSub 
     )
   if (sub?.id === "vocabulary") return <VocabularyPage profile={profile} words={words} />
 
+  // A bot this device has never read draws a loader where the rows would be, rather than a page
+  // of blank space while the host answers.
+  if (loading)
+    return (
+      <div className="flex flex-col gap-4" data-bot-dictation>
+        <div className="flex items-center justify-center py-16" data-speech-loading>
+          <Spinner className="size-6 text-primary" />
+        </div>
+      </div>
+    )
   return (
     <div className="flex flex-col gap-4" data-bot-dictation>
-      {/* One notice for every write: the host's own sentence, at the page's head. */}
+      {/* One notice for every write, and the host's own sentence where a read failed: the cached
+          copy under it may be older than it looks. */}
       {speech.problem && (
         <Banner tone="error">
           <span role="alert">{speech.problem}</span>
@@ -116,7 +137,8 @@ export function DictationTab({ profile, sub }: { profile: Profile; sub?: BotSub 
         <Group>
           <SpeechModelRow
             model={settings?.model ?? ""}
-            disabled={!settings || !models.length}
+            muted={muted}
+            disabled={!settings || !models.length || muted}
             onClick={openSpeech}
           />
           <VocabularyRow profile={profile} words={words} />
@@ -130,6 +152,7 @@ export function DictationTab({ profile, sub }: { profile: Profile; sub?: BotSub 
           settings={settings}
           models={models}
           saving={speech.saving}
+          muted={muted}
           onWrite={speech.writeStt}
           onOpen={setOpen}
           onPick={(pick) => (pick === "speech" ? openSpeech() : setPick(pick))}
@@ -160,7 +183,7 @@ export function DictationTab({ profile, sub }: { profile: Profile; sub?: BotSub 
                 title={row.label}
                 purpose={row.model || undefined}
                 value={providerNote(row) ?? undefined}
-                muted={!row.inUse}
+                muted={!row.inUse || muted}
                 onClick={() =>
                   navigate(botSubPath(profile.id, "speech-to-text", "providers", row.name))
                 }
@@ -171,12 +194,13 @@ export function DictationTab({ profile, sub }: { profile: Profile; sub?: BotSub 
         </Card>
       )}
 
-      {/* The cleanup's own card after the host's: its model, and — where the plugin takes them — the
-          level a take is tidied at and, for a Developer, the Hearing prompt of its decode. */}
+      {/* The cleanup's own card after the host's: its model, and — where the plugin takes them —
+          the level a take is tidied at and, for a Developer, the Hearing prompt of its decode. */}
       {settings && (
         <CleanupSection
           settings={settings}
           saving={speech.saving}
+          muted={muted}
           levels={speech.levels}
           hearing={speech.hearing}
           developer={Boolean(developer)}
@@ -263,6 +287,8 @@ type CardProps = {
   settings: SpeechSettings
   models: SpeechModel[]
   saving: boolean
+  /** The page holds this device's cached answer: its rows take no taps until a fresh one lands. */
+  muted: boolean
   onWrite: (key: string, value: SttValue) => Promise<boolean>
   onOpen: (row: SttSetting) => void
   onPick: (pick: "speech" | "cleanup") => void
@@ -308,7 +334,7 @@ function GroupRows({
   rows,
   ...props
 }: CardProps & { group: SttGroup; rows: readonly SttSetting[] }) {
-  const { block, settings, models, saving, onWrite, onOpen, onPick, profile, words } = props
+  const { block, settings, models, saving, muted, onWrite, onOpen, onPick, profile, words } = props
   // Vocabulary goes where the prompt it is appended after sits, and nowhere else.
   const after = rows.findIndex((row) => row.key === "stt.local.initial_prompt") + 1
   const cut = group === "local" && after > 0 ? after : rows.length
@@ -317,17 +343,26 @@ function GroupRows({
       <SpeechModelRow
         key={one.key}
         model={settings.model}
-        disabled={!models.length}
+        muted={muted}
+        disabled={!models.length || muted}
         onClick={() => onPick("speech")}
       />
     ) : one.key === "stt.provider" ? (
-      <ProviderRow key={one.key} row={one} block={block} saving={saving} onOpen={onOpen} />
+      <ProviderRow
+        key={one.key}
+        row={one}
+        block={block}
+        saving={saving}
+        muted={muted}
+        onOpen={onOpen}
+      />
     ) : (
       <HostRow
         key={one.key}
         row={one}
         block={block}
         saving={saving}
+        muted={muted}
         onWrite={onWrite}
         onOpen={onOpen}
       />
@@ -346,11 +381,13 @@ function ProviderRow({
   row,
   block,
   saving,
+  muted,
   onOpen,
 }: {
   row: SttSetting
   block: SttSettings
   saving: boolean
+  muted: boolean
   onOpen: (row: SttSetting) => void
 }) {
   const line = providerLine(block)
@@ -359,8 +396,9 @@ function ProviderRow({
       title={row.label}
       purpose={line.note ?? row.purpose}
       value={line.value}
-      muted={line.muted}
+      muted={line.muted || muted}
       busy={saving}
+      disabled={muted}
       onClick={() => onOpen(row)}
       data-setting={row.key}
     />
@@ -375,12 +413,14 @@ function HostRow({
   row,
   block,
   saving,
+  muted,
   onWrite,
   onOpen,
 }: {
   row: SttSetting
   block: SttSettings
   saving: boolean
+  muted: boolean
   onWrite: (key: string, value: SttValue) => Promise<boolean>
   onOpen: (row: SttSetting) => void
 }) {
@@ -389,7 +429,7 @@ function HostRow({
       id={`stt-${row.key}`}
       title={row.label}
       checked={rowOn(block, row.key)}
-      disabled={saving}
+      disabled={saving || muted}
       onCheckedChange={(next) => void onWrite(row.key, next)}
       data-setting={row.key}
     />
@@ -398,8 +438,9 @@ function HostRow({
       title={row.label}
       purpose={row.purpose}
       value={rowValue(block, row.key)}
-      muted={!explicitly(block, row.key)}
+      muted={!explicitly(block, row.key) || muted}
       busy={saving}
+      disabled={muted}
       onClick={() => onOpen(row)}
       data-setting={row.key}
     />
@@ -414,6 +455,7 @@ function SettingRows({
   rows,
   block,
   saving,
+  muted,
   onWrite,
   open,
   setOpen,
@@ -421,6 +463,7 @@ function SettingRows({
   rows: readonly SttSetting[]
   block: SttSettings
   saving: boolean
+  muted: boolean
   onWrite: (key: string, value: SttValue) => Promise<boolean>
   open: SttSetting | undefined
   setOpen: (row: SttSetting | undefined) => void
@@ -433,6 +476,7 @@ function SettingRows({
           row={row}
           block={block}
           saving={saving}
+          muted={muted}
           onWrite={onWrite}
           onOpen={setOpen}
         />
@@ -451,10 +495,12 @@ function SettingRows({
 /** The speech model's own row: the model the host has in play, opening the models it offers. */
 function SpeechModelRow({
   model,
+  muted,
   disabled,
   onClick,
 }: {
   model: string
+  muted: boolean
   disabled: boolean
   onClick: () => void
 }) {
@@ -463,6 +509,7 @@ function SpeechModelRow({
       title="Speech model"
       purpose="The model that hears this bot's speech-to-text"
       value={model}
+      muted={muted}
       disabled={disabled}
       onClick={onClick}
       data-setting="speech-model"
@@ -678,11 +725,18 @@ function ProviderPage({
   return (
     <div className="flex flex-col gap-4" data-stt-provider={name}>
       <Group>
-        {block && rows.length ? (
+        {/* The address is reachable by hand, so a host that has not answered yet is waited for
+            rather than answered for: nothing here says what this host declares until it has. */}
+        {!block && speech.loading ? (
+          <div className="flex items-center justify-center py-16" data-speech-loading>
+            <Spinner className="size-6 text-primary" />
+          </div>
+        ) : block && rows.length ? (
           <SettingRows
             rows={rows}
             block={block}
             saving={speech.saving}
+            muted={speech.stale}
             onWrite={speech.writeStt}
             open={open}
             setOpen={setOpen}
@@ -730,12 +784,13 @@ function VocabularyRow({ profile, words }: { profile: Profile; words: string[] }
 function CleanupRow({
   tag,
   settings,
-  saving,
+  shut,
   onClick,
 }: {
   tag?: string
   settings: SpeechSettings | undefined
-  saving: boolean
+  /** The card's rows are shut: a write is out, the page is stale, or cleanup cannot run here. */
+  shut: boolean
   onClick: () => void
 }) {
   const pick = settings?.cleanup.model
@@ -748,6 +803,7 @@ function CleanupRow({
         tag={tag}
         purpose={settings?.cleanup.reason ?? "This host doesn't let Gots pick the model."}
         value="Default"
+        muted
         disabled
         data-setting="cleanup-model"
       />
@@ -758,7 +814,8 @@ function CleanupRow({
       tag={tag}
       purpose="The model that tidies a take's finished words"
       value={pick ? fullModel(pick) : "Default"}
-      disabled={saving}
+      muted={shut}
+      disabled={shut}
       onClick={onClick}
       data-setting="cleanup-model"
     />
@@ -769,6 +826,7 @@ function CleanupRow({
 function CleanupSection({
   settings,
   saving,
+  muted,
   levels,
   hearing,
   developer,
@@ -778,6 +836,7 @@ function CleanupSection({
 }: {
   settings: SpeechSettings
   saving: boolean
+  muted: boolean
   levels: boolean
   hearing: boolean
   developer: boolean
@@ -785,8 +844,17 @@ function CleanupSection({
   onHearing: (sent: boolean) => void
   onPick: () => void
 }) {
+  // The take leaves the host: Cleanup never runs on one a vendor transcribed (ADR 0082). A host that
+  // carries no level keeps the page it had: the rule is drawn by the build that knows it, and one
+  // that can't take a level could not explain what it is holding.
+  const unavailable = Boolean(settings.provider?.cloud) && levels
+  // Every row of the card is shut for the same reasons the page is: a write is out, the answer is
+  // this device's cached copy, or cleanup cannot run on a cloud route at all.
+  const shut = saving || muted || unavailable
   return (
     <Card id="cleanup" title="Cleanup">
+      {/* The greying is the whole of it: a row that takes no taps says it is unavailable, and a
+          sentence beside it would explain a rule the reader can see. */}
       <Group>
         {levels && (
           <ValueRow
@@ -794,19 +862,20 @@ function CleanupSection({
             tag="Gots"
             purpose="How much the tidying changes in a take"
             value={levelName(settings.cleanup.level)}
-            disabled={saving}
+            muted={shut}
+            disabled={shut}
             onClick={onLevel}
             data-setting="cleanup-level"
           />
         )}
-        <CleanupRow tag="Gots" settings={settings} saving={saving} onClick={onPick} />
+        <CleanupRow tag="Gots" settings={settings} shut={shut} onClick={onPick} />
         {hearing && developer && (
           <SwitchRow
             id="stt-hearing-prompt"
             title="Hearing prompt"
             subtitle="Whether the speech model is told this bot's names before it listens"
             checked={settings.hearing.sent}
-            disabled={saving}
+            disabled={shut}
             onCheckedChange={onHearing}
             data-setting="hearing-prompt"
           />

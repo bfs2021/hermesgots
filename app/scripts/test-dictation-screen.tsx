@@ -1,16 +1,16 @@
 /**
- * Settings › Dictation over a seeded mirror and faked hosts, as ADR 0060 draws it: three tabs in one
- * screen, History first; its rows newest first, a card of them under each month's caption, each row
- * the words over the bot and the count; a page drawn at a time and more appended at its end; a row
- * opening its sheet with the whole dictation, a Copy that copies it and a Delete that takes it off
- * its host; every bot listed in the list's own order, the ones whose host can't dictate disabled
+ * Settings › AI Dictation over a seeded mirror and faked hosts, as ADR 0060 draws it: three tabs in
+ * one screen, History first; its rows newest first, a card of them under each month's caption, each
+ * row the words over the bot and the count; a page drawn at a time and more appended at its end; a
+ * row opening its sheet with the whole dictation, a Copy that copies it and a Delete that takes it
+ * off its host; every bot listed in the list's own order, the ones whose host can't dictate disabled
  * with the host's reason; the totals pooled over the bots that reported; and opening the screen
  * reconciling a bot whose host has more than the mirror holds, while a host without the routes
  * leaves the mirror and its cached totals alone.
  */
 import assert from "node:assert/strict"
 import test from "node:test"
-import { MemoryRouter } from "react-router"
+import { MemoryRouter, Route, Routes } from "react-router"
 import { act } from "react"
 
 import { DictationSettings, PAGE_ROWS } from "@/components/settings/dictation"
@@ -18,6 +18,9 @@ import { Screen } from "@/components/settings-chrome"
 import { connectionKey } from "@/lib/connection"
 import { monthLabel, orderOf, spelledCount } from "@/lib/dictation-log"
 import { db } from "@/lib/db"
+import { readSpeech } from "@/lib/speech"
+import { SettingsPage } from "@/routes/settings"
+import { speech } from "./dictation-page-kit.tsx"
 import {
   botProfile,
   click,
@@ -75,7 +78,7 @@ type Bot = {
   dictation?: { ready: boolean; reason: string | null }
   /** The speech model its host reports, read by the bots tab's own refresh. */
   model?: string
-  /** The model already on the bot, as an earlier read left it. */
+  /** The speech answer this device already holds for the bot, drawn before the read lands. */
   known?: string
   /** A host that never answers, so the row is caught mid-read. */
   stalls?: boolean
@@ -165,14 +168,20 @@ async function seed(bots: Bot[]) {
   await db.profiles.clear()
   await db.dictationLog.clear()
   await db.dictationStats.clear()
+  await db.speechCache.clear()
   for (const bot of bots) {
     const profile = botProfile(bot.name, {
       id: bot.name,
       name: bot.label ?? bot.name,
-      speechModel: bot.known,
       apiKey,
     })
     await db.profiles.put(profile)
+    // The last answer this device read, where a case starts from a bot it has opened before.
+    if (bot.known)
+      await db.speechCache.put({
+        key: connectionKey(profile),
+        speech: readSpeech(speech({ model: bot.known })),
+      })
     for (const row of bot.rows ?? [])
       await db.dictationLog.put({
         ...row,
@@ -248,6 +257,32 @@ Object.defineProperty(globalThis.navigator, "clipboard", {
       copied.push(text)
     },
   },
+})
+
+/** The Settings screen itself, at the address its section opens. */
+const settingsAt = (entry: string) => (
+  <MemoryRouter initialEntries={[entry]}>
+    <Routes>
+      <Route path="/settings/:section?" element={<SettingsPage />} />
+    </Routes>
+  </MemoryRouter>
+)
+
+test("the menu's row and the screen it opens are called AI Dictation", async () => {
+  await seed([{ name: "a", features: ["dictations"] }])
+  await mount(settingsAt("/settings/dictation"), async () => {
+    assert.equal(
+      find("h1")?.textContent?.trim(),
+      "AI Dictation",
+      "the screen says the words were machine-written",
+    )
+  })
+  await mount(settingsAt("/settings"), async () => {
+    const row = findAll("a, button").find((one) =>
+      (one.textContent ?? "").trim().startsWith("AI Dictation"),
+    )
+    assert.ok(row, "and the menu's way into it says the same")
+  })
 })
 
 test("the screen draws three tabs in one address, History first", async () => {
@@ -366,7 +401,7 @@ test("a row opens its dictation whole, a Copy that copies it", async () => {
   })
 })
 
-test("a dictation draws the words as heard over the tidied ones, and Copy takes the tidied", async () => {
+test("a dictation draws the words as transcribed over the tidied ones, and Copy takes the tidied", async () => {
   copied = []
   const heard = "um, draft the reply to haseeb um keep it to two lines"
   const tidied = "Draft the reply to Haseeb, keep it to two lines."
@@ -383,8 +418,8 @@ test("a dictation draws the words as heard over the tidied ones, and Copy takes 
     await click(rows()[0] ?? null)
     await until(async () => Boolean(sheet()), "the dictation's sheet")
     assert.ok(
-      blockText(heardBlock()).startsWith("Heard") && blockText(heardBlock()).endsWith(heard),
-      "the words the host heard, under their own heading",
+      blockText(heardBlock()).startsWith("Transcribed") && blockText(heardBlock()).endsWith(heard),
+      "the words the machine wrote down, under their own heading",
     )
     assert.ok(
       blockText(sheet()).startsWith("Cleaned up") && blockText(sheet()).endsWith(tidied),
@@ -480,7 +515,7 @@ test("a row whose cleanup was never recorded says nothing about it", async () =>
   })
 })
 
-test("a take the cleanup left alone reads as one block, named Heard", async () => {
+test("a take the cleanup left alone reads as one block, named Transcribed", async () => {
   copied = []
   const words = "Send it as it is."
   await seed([
@@ -495,7 +530,7 @@ test("a take the cleanup left alone reads as one block, named Heard", async () =
     await until(async () => rows().length === 1, "the dictation")
     await click(rows()[0] ?? null)
     await until(async () => Boolean(heardBlock()), "the dictation's sheet")
-    assert.ok(blockText(heardBlock()).startsWith("Heard"), "the one block says what it is")
+    assert.ok(blockText(heardBlock()).startsWith("Transcribed"), "the one block says what it is")
     assert.equal(
       sheet(),
       null,
@@ -646,12 +681,36 @@ test("a bot whose speech read failed says so, not nothing", async () => {
   })
 })
 
-test("opening the Bots tab fills the model its host reports onto the bot", async () => {
+test("the model a host reports is kept on this device for the next open", async () => {
   await seed([{ name: "a", label: "Aria", features: ["dictation", "dictations"], model: "base.en" }])
   await mount(screen(), async () => {
     await openTab("Bots")
-    await until(async () => (await db.profiles.get("a"))?.speechModel === "base.en", "the model kept")
+    const profile = await db.profiles.get("a")
+    assert.ok(profile)
+    await until(
+      async () => (await db.speechCache.get(connectionKey(profile)))?.speech.model === "base.en",
+      "the answer kept per connection",
+    )
     await until(async () => /On · base\.en/.test(botRow("a")?.textContent ?? ""), "the row's line")
+  })
+})
+
+test("a bot whose host is away still names the model this device last read", async () => {
+  await seed([
+    {
+      name: "a",
+      label: "Aria",
+      features: ["dictation", "dictations"],
+      known: "base.en",
+      fails: true,
+    },
+  ])
+  await mount(screen(), async () => {
+    await openTab("Bots")
+    await until(
+      async () => /On · base\.en/.test(botRow("a")?.textContent ?? ""),
+      "the cached model, not the failure",
+    )
   })
 })
 

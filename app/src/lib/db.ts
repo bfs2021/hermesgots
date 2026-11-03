@@ -10,6 +10,7 @@ import { forgetRead } from "@/lib/read-marks"
 import type { Compaction, ModelChange, Move, ProviderUsage, Skill, Tidied } from "@/lib/hermes"
 import type { SessionPipeline } from "@/lib/pipeline"
 import type { PromptEntry } from "@/lib/prompt-library"
+import type { SpeechSettings } from "@/lib/speech"
 import type { ReasoningRun } from "@/lib/thinking"
 import { randomId } from "@/lib/utils"
 
@@ -127,8 +128,6 @@ export interface Profile {
   pluginVersion?: string
   /** The host's main model as last read by any device, shown while it's read again. */
   hostModel?: ModelChoice
-  /** The speech model its host last reported, shown while it's read again. Local only. */
-  speechModel?: string
   /** The provider's account-usage windows, local only; read from the Gots plugin. */
   providerUsage?: ProviderUsage
   /** A dismissed limit-notice key (provider + window label + reset), local only. */
@@ -708,6 +707,19 @@ export interface DictationStats {
 }
 
 /**
+ * The last speech payload this device read from a bot's host, kept per connection so the
+ * Speech-to-text page draws its rows before a fresh answer lands and the Bots tab's line names the
+ * model that host last reported (ADR 0082). It is this device's own copy: nothing syncs it, and one
+ * bot's answer is only ever drawn on that bot's screens.
+ */
+export interface SpeechCacheRow {
+  /** The `connectionKey` of the bot whose host answered. */
+  key: string
+  /** The host's speech settings, as `readSpeech` read them at the time. */
+  speech: SpeechSettings
+}
+
+/**
  * A meeting being recorded in the app, kept on the device as it records (a chunk every few
  * seconds), so a page closed mid-meeting loses at most the last few seconds. It goes once the host
  * has the recording, or when the user discards it.
@@ -890,6 +902,7 @@ export const db = new Dexie("memento") as Dexie & {
   sessionStates: SessionDb["sessionStates"]
   sentFiles: SessionDb["sentFiles"]
   mediaCache: EntityTable<MediaCacheRow, "key">
+  speechCache: EntityTable<SpeechCacheRow, "key">
 }
 
 db.version(1).stores({
@@ -1176,6 +1189,21 @@ db.version(29).stores({ sentFiles: SESSION_STORES.sentFiles })
 // v30: what a thread has drawn, kept on the device — a photo's bytes and a clip's first frame —
 // so a page opened again, or left open past the URL it holds, draws them without the host (ADR 0075).
 db.version(30).stores({ mediaCache: "key, at" })
+// v31: the last speech answer each bot's host gave this device, so the Speech-to-text page draws its
+// rows at once rather than a page of blank space, and the Bots line names the model it last read
+// (ADR 0082). A new table: nothing older has to be moved into it. The speech model a bot used to
+// carry was that answer's only remembered part, and it is deleted rather than left behind: `botValue`
+// syncs every field it isn't told to keep, so a dead one would travel to the account document.
+db.version(31)
+  .stores({ speechCache: "key" })
+  .upgrade((tx) =>
+    tx
+      .table<Profile & { speechModel?: string }>("profiles")
+      .toCollection()
+      .modify((profile) => {
+        delete profile.speechModel
+      }),
+  )
 
 db.on("populate", (tx) => seedProfile(tx))
 
@@ -1305,6 +1333,7 @@ export async function deleteProfile(id: string, { remote = false, last = false }
     db.skills,
     db.meetingRecordings,
     db.mediaCache,
+    db.speechCache,
   ]
   return db.transaction("rw", tables, async () => {
     const alone = (await db.profiles.count()) <= 1
@@ -1327,6 +1356,7 @@ export async function deleteProfile(id: string, { remote = false, last = false }
       await db.dictationLog.where("connection").equals(key).delete()
       await db.dictationStats.delete(key)
       await db.mediaCache.where("key").startsWith(mediaKeyPrefix(profile.baseUrl)).delete()
+      await db.speechCache.delete(key)
     }
     await db.conversations.bulkDelete(ids)
     await db.profiles.delete(id)
@@ -1474,6 +1504,7 @@ export async function clearAllData() {
     db.sessionStates,
     db.sentFiles,
     db.mediaCache,
+    db.speechCache,
   ]
   await db.transaction("rw", tables, async () => {
     await Promise.all(tables.map((table) => table.clear()))

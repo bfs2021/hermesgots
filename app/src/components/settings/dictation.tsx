@@ -36,7 +36,7 @@ import {
 } from "@/lib/dictations"
 import { formatDuration } from "@/lib/format"
 import { levelName, namedLevel } from "@/lib/speech"
-import { useSpeech, type SpeechCheck } from "@/lib/host-speech"
+import { READ_FAILED, useSpeech, type SpeechCheck } from "@/lib/host-speech"
 import { cn } from "@/lib/utils"
 
 /** The rows the History tab draws before the reader reaches the end of them. */
@@ -257,7 +257,12 @@ function tidiedLine(row: DictationRecord): string | null {
   return parts.length ? parts.join(" · ") : null
 }
 
-/** One dictation, whole: its words, what it was, a Copy and a way to delete it. */
+/**
+ * One dictation, whole: its words, what it was, a Copy and a way to delete it. The machine's words
+ * are **Transcribed** and the words that landed are **Cleaned up** — the words say what the text is
+ * rather than who did what, and a take the cleanup left alone draws one **Transcribed** block
+ * (ADR 0082).
+ */
 function EntrySheet({
   row,
   bot,
@@ -287,7 +292,7 @@ function EntrySheet({
           <PopupTitle>{clockOf(row.at)}</PopupTitle>
         </PopupHeader>
         <div className="flex min-h-0 flex-col gap-4 overflow-y-auto px-4 pb-4">
-          {heard && <Words label="Heard" text={heard} data-dictation-heard />}
+          {heard && <Words label="Transcribed" text={heard} data-dictation-heard />}
           {tidied && <Words label={heard ? "Cleaned up" : null} text={tidied} data-dictation-text />}
           <p className="text-sm text-muted-foreground">
             {[bot, wordsLabel(row.words), spokenLabel(row.ms)].filter(Boolean).join(" · ")}
@@ -343,6 +348,7 @@ function BotsTab({ profiles }: { profiles: Profile[] }) {
 /**
  * What a bot's host is doing about speech: the host's own sentence where it can't dictate, else the
  * model it last reported, "Checking…" until it reports one, and a word where the read itself failed.
+ * The model is the last answer this device read, kept until a fresh one confirms it (ADR 0082).
  */
 function speechLine({
   model,
@@ -355,7 +361,7 @@ function speechLine({
 }) {
   if (reason) return reason
   if (model) return `On · ${model}`
-  if (check === "failed") return "Couldn't read this bot's host."
+  if (check === "failed") return READ_FAILED
   if (check === "checking") return "Checking…"
   return "Off"
 }
