@@ -2848,4 +2848,3 @@ identically at `69d71f67` with none of this branch's commits, so it is not a reg
 suite has been red on main since 30 October. The rules that flow was going to cover (a bounded tick, a
 closed row) are asserted in `app/scripts/test-prs-batch.tsx`, which runs on every PR; the flow needs its
 own repair, in the session list that stops listing a seeded row after a reload.
-

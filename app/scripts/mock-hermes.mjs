@@ -3243,6 +3243,12 @@ const PLUGIN_VERSION = process.env.MOCK_PLUGIN_VERSION || "0.29.1"
 // enough for it (the new chat screen needs 0.22.5). A host older than that answers with its own;
 // the mock models one host and says so.
 const HERMES_VERSION = "0.25.0"
+const MAX_OPENER = 2000
+
+function oneLine(text, max = Number.POSITIVE_INFINITY) {
+  const flat = String(text).replace(/\s+/g, " ").trim()
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`
+}
 const DICTATION = process.env.MOCK_DICTATION ?? "on"
 let DICTATION_TIDY = process.env.MOCK_DICTATION_TIDY ?? "ok"
 function tidyWhole(text) {
@@ -5819,7 +5825,7 @@ http
     const triageRoute = /^\/api\/plugins\/memento\/sessions\/([^/]+)\/triage$/.exec(url.pathname)
     if (PLUGIN && !profile && TRIAGE !== "off" && req.method === "POST" && triageRoute) {
       const id = decodeURIComponent(triageRoute[1])
-      const { id: askId, text, attachments, body } = await readBody(req)
+      const { id: askId, text, attachments, body, at } = await readBody(req)
       if (TRIAGE === "fail") return json(res, 500, { error: { message: "Triage failed." } })
       if (TRIAGE === "slow") await new Promise((resolve) => setTimeout(resolve, 10_000))
       const entries = [...(pluginChatLists.get(pluginProfile ?? "") ?? pluginChats).entries()]
@@ -5836,6 +5842,7 @@ http
         return json(res, 200, { object: "memento.triage", decision: "main" })
       if (TRIAGE === "thread" && !thread)
         return json(res, 200, { object: "memento.triage", decision: "main" })
+      const sentAt = Number.isInteger(at) && at > 0 ? at : Date.now()
       let made
       if (TRIAGE === "new") {
         const chatId = randomUUID()
@@ -5850,6 +5857,7 @@ http
             createdAt: now,
             updatedAt: now,
             changedAt: now,
+            ...(text ? { opener: oneLine(text, MAX_OPENER), openerAt: sentAt } : {}),
           },
         }
         ;(pluginChatLists.get(pluginProfile ?? "") ?? pluginChats).set(chatId, {
@@ -5878,7 +5886,7 @@ http
           id: String(askId ?? randomUUID()),
           text: String(text ?? ""),
           thread: made ? made.id : thread[0],
-          at: Date.now(),
+          at: sentAt,
           undone: false,
           // As plugin/moves.py records it: the host opened this thread for the message.
           new: Boolean(made),

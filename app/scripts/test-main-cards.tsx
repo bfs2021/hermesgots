@@ -61,7 +61,7 @@ async function seed({ without = [] }: { without?: string[] } = {}) {
     msg("m3", mainId, "user", MAIN_MESSAGES[2], at(0, 9)),
   ])
   await db.conversations.bulkPut(
-    THREADS.map(({ id, title, createdAt, muted }) => ({
+    THREADS.map(({ id, title, createdAt, muted, opener }) => ({
       id,
       profileId: bot.id,
       title,
@@ -70,6 +70,8 @@ async function seed({ without = [] }: { without?: string[] } = {}) {
       updatedAt: createdAt,
       changedAt: 0,
       muted,
+      opener,
+      openerAt: createdAt,
     })),
   )
   await db.messages.bulkPut(
@@ -192,12 +194,42 @@ test("a card keeps its message in the bubble and its name on the card, with no a
   })
 })
 
-test("a thread whose transcript isn't here draws no bubble, and its name on the card", async () => {
+test("a card stands where its opener was sent, not where the record was made", async () => {
+  await seed()
+  await db.conversations.update("t-d", { createdAt: at(0, 8), openerAt: at(-2, 13) })
+  globalThis.fetch = async () => json({})
+  await mount(chatScreen(mainThreadId(bot.id)), async () => {
+    await drawn()
+    const order = flow()
+    const card = order.indexOf("card:t-d")
+    assert.ok(card > order.indexOf(`message:${MAIN_MESSAGES[1]}`), "after the message before it")
+    assert.ok(card < order.indexOf(`message:${MAIN_MESSAGES[2]}`), "and before the one after")
+  })
+})
+
+test("a thread whose transcript isn't here draws the opener the host recorded", async () => {
   await seed({ without: ["t-a"] })
   globalThis.fetch = async () => json({})
   await mount(chatScreen(mainThreadId(bot.id)), async () => {
     await drawn()
     assert.equal(cards().length, THREADS.length, "the card keeps its place among the others")
+    const one = card("t-a")
+    assert.ok(one, "the thread's card is still drawn")
+    assert.equal(
+      one.querySelector('[data-slot="bubble-content"]')?.textContent,
+      "Something about a plan",
+      "the message the host says began it, in its bubble",
+    )
+    assert.ok(one.textContent?.includes("Thread a"), "and the card still says its name")
+  })
+})
+
+test("a thread nothing names an opener for draws no bubble, only its name", async () => {
+  await seed({ without: ["t-a"] })
+  await db.conversations.update("t-a", { opener: undefined, openerAt: undefined })
+  globalThis.fetch = async () => json({})
+  await mount(chatScreen(mainThreadId(bot.id)), async () => {
+    await drawn()
     const one = card("t-a")
     assert.ok(one, "the thread's card is still drawn")
     assert.equal(one.querySelector('[data-slot="bubble"]'), null, "with no message to show")

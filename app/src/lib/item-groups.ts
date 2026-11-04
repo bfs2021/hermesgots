@@ -1,6 +1,7 @@
 import type { SessionState } from "@/lib/session-work"
 import type { CodeSort } from "@/lib/db"
 import { byName } from "./compare.ts"
+import { withDir, type Sort } from "./sort.ts"
 
 /** What an item needs, which puts it ahead of the dated groups (or, closed, after them). */
 export type ItemNeed = "waiting" | "working" | "closed" | undefined
@@ -31,10 +32,12 @@ function groupsOf<T, K extends string>(
   order?: (a: T, b: T) => number,
 ) {
   const placed = items.map((item) => ({ item, key: keyOf(item) }))
-  return (Object.keys(labels) as K[]).map((key) => {
-    const members = placed.filter((p) => p.key === key).map((p) => p.item)
-    return { key, label: labels[key], items: order ? members.sort(order) : members }
-  }).filter((group) => group.items.length)
+  return (Object.keys(labels) as K[])
+    .map((key) => {
+      const members = placed.filter((p) => p.key === key).map((p) => p.item)
+      return { key, label: labels[key], items: order ? members.sort(order) : members }
+    })
+    .filter((group) => group.items.length)
 }
 
 /**
@@ -95,22 +98,25 @@ export function codeGroups<T>(
 }
 
 /**
- * The sort-by dropdown's three orders over a group's rows (ADR 0046): created, newest first by
- * default; last activity, newest first; or the title A–Z. Every group runs on the same one, and a
- * filtered list runs it flat.
+ * The sort-by dropdown's orders over a group's rows: created, last activity or title, each in the
+ * arrow the reader picked (ADR 0091). Every group runs on the same one, and a filtered list runs it
+ * flat.
  */
 export function codeOrder<T>(
-  sort: CodeSort,
+  sort: Sort<CodeSort>,
   fields: {
     created: (item: T) => number
     activity: (item: T) => number
     title: (item: T) => string
   },
 ): (a: T, b: T) => number {
-  if (sort === "title") return (a, b) => byName(fields.title(a), fields.title(b))
-  const newest: Record<Exclude<CodeSort, "title">, (item: T) => number> = {
+  const of: Record<Exclude<CodeSort, "title">, (item: T) => number> = {
     created: fields.created,
     activity: fields.activity,
   }
-  return (a, b) => newest[sort](b) - newest[sort](a)
+  const rank = (a: T, b: T) =>
+    sort.key === "title"
+      ? byName(fields.title(a), fields.title(b))
+      : of[sort.key](a) - of[sort.key](b)
+  return (a, b) => withDir(rank(a, b), sort.dir)
 }

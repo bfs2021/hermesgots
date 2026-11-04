@@ -2,7 +2,6 @@ import { useMemo, useRef, useState, type ReactNode } from "react"
 import { BrainIcon, EyeIcon, type LucideIcon } from "lucide-react"
 import {
   ArrowLeftIcon,
-  ArrowUpDownIcon,
   CheckIcon,
   ChevronDownIcon,
   ChevronRightIcon,
@@ -13,17 +12,12 @@ import {
 import { toast } from "sonner"
 
 import { MODEL_SORTS, sortByFacts, type ModelSort } from "@/components/chat/model-sort"
+import { SortMenu } from "@/components/sort-menu"
+import { defaultSort, type Sort } from "@/lib/sort"
 import { Banner } from "@/components/banner"
 import { Popup, PopupContent, PopupHeader, PopupTitle } from "@/components/popup"
 import { usePopupForm } from "@/lib/popup-form"
 import { Button } from "@/components/ui/button"
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field"
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group"
 import { Spinner } from "@/components/ui/spinner"
@@ -65,7 +59,7 @@ export function ModelPicker({
 }) {
   const [query, setQuery] = useState("")
   const [openSlug, setOpenSlug] = useState<string>()
-  const [sort, setSort] = useState<ModelSort>("name")
+  const [sort, setSort] = useState<Sort<ModelSort>>(() => defaultSort(MODEL_SORTS))
   // The cached models.dev catalog, live: each row's facts repaint when a refresh lands.
   const catalog = useModelCatalog()
   // The cached BenchLM overall rankings, live: each row's score repaints when a refresh lands.
@@ -93,7 +87,7 @@ export function ModelPicker({
             (m) => ({
               ...modelFacts(catalog, { provider: p.slug, model: m }),
               benchlm:
-                sort === "benchlm"
+                sort.key === "benchlm"
                   ? overallScoreOf(rankings, { provider: p.slug, model: m })
                   : undefined,
             }),
@@ -146,7 +140,7 @@ export function ModelPicker({
               </InputGroup>
             )}
             {/* Only a flat list sorts: the providers list stays A to Z, so it shows no menu. */}
-            {flat && <SortMenu sort={sort} onSort={setSort} />}
+            {flat && <ModelSortMenu sort={sort} onSort={setSort} />}
           </div>
         )}
         {top && (
@@ -252,7 +246,7 @@ function ProviderModels({
   onBack?: () => void
 }) {
   const [query, setQuery] = useState("")
-  const [sort, setSort] = useState<ModelSort>("name")
+  const [sort, setSort] = useState<Sort<ModelSort>>(() => defaultSort(MODEL_SORTS))
   const models = useMemo(() => {
     const words = query.toLowerCase().split(/\s+/).filter(Boolean)
     const haystack = (m: string) => `${provider.name} ${provider.slug} ${m}`.toLowerCase()
@@ -295,7 +289,7 @@ function ProviderModels({
               aria-label={`Search ${provider.name}`}
             />
           </InputGroup>
-          <SortMenu sort={sort} onSort={setSort} />
+          <ModelSortMenu sort={sort} onSort={setSort} />
         </div>
         {models.length ? (
           <ModelList>
@@ -317,32 +311,9 @@ function ProviderModels({
   )
 }
 
-/** The sort menu's icon button, a radio menu of the flat lists' orders. */
-function SortMenu({ sort, onSort }: { sort: ModelSort; onSort: (sort: ModelSort) => void }) {
+function ModelSortMenu({ sort, onSort }: { sort: Sort<ModelSort>; onSort: (sort: Sort<ModelSort>) => void }) {
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        render={
-          <Button
-            variant="ghost"
-            size="icon-lg"
-            className="size-11 shrink-0 rounded-full text-muted-foreground"
-            aria-label={`Sort models by ${MODEL_SORTS[sort]}`}
-          />
-        }
-      >
-        <ArrowUpDownIcon />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-40">
-        <DropdownMenuRadioGroup value={sort} onValueChange={(value) => onSort(value as ModelSort)}>
-          {(Object.keys(MODEL_SORTS) as ModelSort[]).map((option) => (
-            <DropdownMenuRadioItem key={option} value={option} className="min-h-11" closeOnClick>
-              {MODEL_SORTS[option]}
-            </DropdownMenuRadioItem>
-          ))}
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <SortMenu by="models" options={MODEL_SORTS} value={sort} onSort={onSort} compact />
   )
 }
 

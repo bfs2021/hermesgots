@@ -1,19 +1,22 @@
-import { ArrowDownUpIcon } from "lucide-react"
+import { ArrowDownNarrowWideIcon, ArrowUpNarrowWideIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuGroup,
+  DropdownMenuItem,
   DropdownMenuLabel,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { dirWord, toggleSort, type Sort, type SortKey } from "@/lib/sort"
 
 /**
- * The one sort control: an icon button naming the current order, a menu of every choice in
- * `options`, the chosen one marked. Code's sessions, the sidebar's bots and the Library tree all
- * drew their own copy of this; each keeps its own `by` and `label` wording, the control is one.
+ * The one sort control: a button reading the list's order as one sign and one name, and a menu of
+ * every key it can rank by. The sign is the direction arrow alone — up for A→Z and oldest-first,
+ * down for newest-first — and it stands at the button's start, ahead of the name, so the control is a
+ * sign and a word rather than three icons in a row. The row that is the list's order carries the same
+ * arrow, and picking that row again turns it round while picking another row takes that key's own
+ * direction (ADR 0091, amended by 0095).
  */
 export function SortMenu<K extends string>({
   by,
@@ -21,44 +24,61 @@ export function SortMenu<K extends string>({
   options,
   value,
   onSort,
+  compact = false,
 }: {
   /** What is being sorted, named: the trigger reads "Sort <by> by <choice>". */
   by: string
   /** The menu's own heading, where a list words it its own way. */
   label?: string
-  options: Record<K, string>
-  value: K
-  onSort: (sort: K) => void
+  options: readonly SortKey<K>[]
+  value: Sort<K>
+  onSort: (sort: Sort<K>) => void
+  /** A surface with no room for a word — a sheet's header — wears the sign alone. */
+  compact?: boolean
 }) {
+  const chosen = options.find((option) => option.key === value.key) ?? options[0]
+  const Arrow = value.dir === "asc" ? ArrowUpNarrowWideIcon : ArrowDownNarrowWideIcon
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
         render={
           <Button
             variant="ghost"
-            className="h-11 shrink-0 gap-1.5 rounded-full px-3 text-xs text-muted-foreground"
-            aria-label={`Sort ${by} by ${options[value]}`}
+            className={
+              compact
+                ? "size-11 shrink-0 rounded-full text-muted-foreground"
+                : "h-11 shrink-0 gap-1.5 rounded-full px-3 text-xs text-muted-foreground"
+            }
+            aria-label={`Sort ${by} by ${chosen.label}, ${dirWord(value.dir)}`}
           />
         }
       >
-        <ArrowDownUpIcon />
-        {options[value]}
+        <Arrow className="size-4" aria-hidden />
+        {!compact && chosen.label}
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-40">
+      <DropdownMenuContent align="end" className="min-w-44">
         <DropdownMenuGroup>
           <DropdownMenuLabel>{label}</DropdownMenuLabel>
-          <DropdownMenuRadioGroup value={value} onValueChange={(next) => onSort(next as K)}>
-            {(Object.keys(options) as K[]).map((option) => (
-              <DropdownMenuRadioItem
-                key={option}
-                value={option}
-                className="min-h-11"
-                closeOnClick
+          {options.map((option) => {
+            const picked = option.key === value.key
+            return (
+              <DropdownMenuItem
+                key={option.key}
+                className="min-h-11 justify-between gap-3"
+                onClick={() => onSort(toggleSort(value, option.key, options))}
+                data-sort-key={option.key}
+                data-sort-dir={picked ? value.dir : undefined}
               >
-                {options[option]}
-              </DropdownMenuRadioItem>
-            ))}
-          </DropdownMenuRadioGroup>
+                {option.label}
+                <span className="flex size-4 shrink-0 items-center justify-center">
+                  {picked && <Arrow className="size-4" aria-hidden />}
+                </span>
+                {picked && (
+                  <span className="sr-only">{dirWord(value.dir)}, tap again to flip</span>
+                )}
+              </DropdownMenuItem>
+            )
+          })}
         </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>

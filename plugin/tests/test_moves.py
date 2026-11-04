@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -34,6 +35,20 @@ class MovesTests(unittest.TestCase):
         moves.record(self.path, "m3", "other-main", "elsewhere", "t3")
         self.assertEqual([m["id"] for m in moves.read(self.path, "main-s")], ["m1", "m2"])
         self.assertEqual([m["id"] for m in moves.read(self.path, "other-main")], ["m3"])
+
+    def test_a_move_stands_at_the_time_the_reader_sent_it(self):
+        moves.record(self.path, "m1", "main-s", "nine o'clock", "t1", at=1_700_000_000_123)
+        self.assertEqual(moves.read(self.path, "main-s")[0]["at"], 1_700_000_000_123)
+        moves.record(self.path, "m2", "main-s", "no time given", "t2", at=None)
+        self.assertGreater(moves.read(self.path, "main-s")[1]["at"], 1_700_000_000_123)
+
+    def test_a_move_from_a_slow_clock_keeps_its_body(self):
+        late = int(time.time() * 1000) - moves.KEEP_SENT_MS - 60_000
+        moves.record(self.path, "m1", "main-s", "sent by a slow clock", "t1", body={"text": "hi"}, at=late)
+        moves.record(self.path, "m2", "main-s", "the next message", "t2")
+        kept = moves.read(self.path, "main-s")[0]
+        self.assertTrue(kept["body"], "the body is still there to undo with")
+        self.assertEqual(kept["at"], late, "and the marker still stands where the reader sent it")
 
     def test_a_repeated_ask_is_one_move(self):
         for _ in range(2):
@@ -187,7 +202,7 @@ class UndoTests(unittest.TestCase):
         self.assertIs(listed["body"], True)
         self.assertEqual(listed["files"], [])
         conn = connect(self.path)
-        conn.execute("UPDATE main_moves SET at = 1")
+        conn.execute("UPDATE main_moves SET recorded_at = 1")
         conn.close()
         moves.record(self.path, "m2", "main-s", "fresh", "t2", thread_session="s", item="q", body=self.body)
         self.assertIsNone(moves.get(self.path, "main-s", "m1")["body"])

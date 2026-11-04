@@ -110,6 +110,7 @@ await flow("thinking-line", async ({ page, send, lastReply, until, shot }) => {
           count: count?.textContent?.trim() ?? "",
           countColour: count ? getComputedStyle(count).color : "",
           countLoaders: count?.querySelectorAll("[data-slot=spinner]").length ?? 0,
+          countPulses: Boolean(count?.hasAttribute("data-working")),
           // The count rides the end of the words, never the head of them.
           after:
             span && count
@@ -166,8 +167,7 @@ await flow("thinking-line", async ({ page, send, lastReply, until, shot }) => {
               label: control?.textContent?.trim() ?? null,
               expanded: control?.getAttribute("aria-expanded") ?? null,
               spins: Boolean(spinner),
-              // The row's own colour, and the loader's: a working row says so by its loader, never
-              // by the accent, and both read muted (ADR 0070).
+              pulses: Boolean(control?.hasAttribute("data-working")),
               colour: control ? getComputedStyle(control).color : "",
               loaderColour: spinner ? getComputedStyle(spinner).color : "",
             }
@@ -409,18 +409,18 @@ await flow("thinking-line", async ({ page, send, lastReply, until, shot }) => {
     5_000,
     "the thinking to reach the row",
   )
-  assert.equal(streaming.rows[0].spins, true, "the row spins: it is still thinking")
+  assert.equal(streaming.rows[0].spins, false, "no sign stands ahead of the row's words")
+  assert.equal(streaming.rows[0].pulses, true, "its own words pulse: it is still thinking")
   assert.equal(
     streaming.rows[0].label,
     "Thinking",
     "saying its own word, in sentence case, never one of the status line's rotating ones",
   )
   assert.equal(streaming.rows[0].colour, tone.muted, "in the row's own muted colour")
-  assert.equal(streaming.rows[0].loaderColour, tone.muted, "its loader too")
   assert.notEqual(
-    streaming.rows[0].loaderColour,
+    streaming.rows[0].colour,
     tone.accent,
-    "never the accent: a working row says so by its loader",
+    "never the accent: a working row says so by its own words pulsing",
   )
   assert.equal(streaming.rows[0].expanded, "false", "and its words are shut in the sheet")
   assert.equal(streaming.sheet, null, "with no sheet open")
@@ -461,7 +461,7 @@ await flow("thinking-line", async ({ page, send, lastReply, until, shot }) => {
     saysThinking(latched.rows[0].label),
     "the row reads the turn's thinking while the stretch after the call arrives",
   )
-  assert.equal(latched.rows[0].spins, true, "its spinner turning while that stretch streams")
+  assert.equal(latched.rows[0].pulses, true, "its words pulsing while that stretch streams")
   assert.deepEqual(
     latched.order.map((one) => one.kind),
     ["thinking", "tool"],
@@ -577,12 +577,12 @@ await flow("thinking-line", async ({ page, send, lastReply, until, shot }) => {
   }
   assert.ok(total > spans[0], "the sum carries the stretches after the first call as well")
   assert.ok(
-    frozen.rows.every((one) => one.spins === false),
-    "with nothing spinning in the row the turn thought in",
+    frozen.rows.every((one) => !one.spins && !one.pulses),
+    "with nothing pulsing in the row the turn thought in",
   )
   assert.ok(
     frozen.groupSpins.length > 0 && frozen.groupSpins.every((spinning) => !spinning),
-    "nor in the calls' row under it, once both have landed",
+    "nor a sign on the calls' row under it, once both have landed",
   )
   assert.equal(frozen.sheet, null, "the answer closes no sheet: none was open")
 
@@ -695,7 +695,7 @@ await flow("thinking-line", async ({ page, send, lastReply, until, shot }) => {
     10_000,
     "the long run's row",
   )
-  assert.equal(opening.rows[0].spins, true, "whose spinner turns while its run streams")
+  assert.equal(opening.rows[0].pulses, true, "whose words pulse while its run streams")
   await inThread(LONG_FIRST, "with a long run streaming")
   await uncapped("with a long run streaming")
 
@@ -975,10 +975,14 @@ await flow("thinking-line", async ({ page, send, lastReply, until, shot }) => {
       "the count to stand alone on the line",
     )
     assert.equal(alone.separator, 0, "with no words of the line's to be set off from")
-    assert.equal(alone.countLoaders, 1, "its own loader turns now: it alone keeps the line live")
-    assert.equal(alone.loaders, 1, "the line's one loader, which is the count's")
+    assert.equal(
+      alone.countLoaders,
+      0,
+      "and no sign beside it: the count is a work row, and its own words pulse (ADR 0092)",
+    )
+    assert.equal(alone.loaders, 0, "so the line carries no spinner at all here")
+    assert.equal(alone.countPulses, true, "its own words pulse instead: it alone keeps the line live")
     assert.equal(alone.countColour, tone.info, "the count reads in the info blue")
-    assert.equal(alone.loaderColour, tone.info, "and its loader turns in that same blue")
     assert.equal(alone.colour, tone.muted, "the line it stands on still muted")
     // What settles into a reply is drawn above its line, never under it (ADR 0075): the reply ends
     // on the row that can still change, so a thread could one day draw that row as its own.

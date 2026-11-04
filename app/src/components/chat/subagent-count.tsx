@@ -1,4 +1,4 @@
-import { WorkLabel, WorkRow, WorkSign } from "@/components/chat/work-row"
+import { WorkLabel, WorkRow } from "@/components/chat/work-row"
 import { subagentCountLabel } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -31,8 +31,8 @@ export function SubagentCount({
   if (place !== "suffix")
     return (
       <WorkRow
-        before={place === "alone-loading" ? <WorkSign /> : null}
         onClick={onOpen}
+        working={place === "alone-loading"}
         className={cn("w-auto max-w-full self-start text-info hover:underline", className)}
       >
         <WorkLabel>{subagentCountLabel(count)}</WorkLabel>

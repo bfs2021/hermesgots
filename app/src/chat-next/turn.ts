@@ -170,7 +170,10 @@ export async function triageTurn(
     const sent = attachments.length
       ? await uploadAttachments(config, conversation.hermesSessionId, attachments, true)
       : attachments
-    const moved = await askTriage({ conversation, profile, config }, { content, sent, steer })
+    const moved = await askTriage(
+      { conversation, profile, config },
+      { content, sent, steer, at: Date.now() },
+    )
     if (!moved) return sent
     void announceMove(moved)
     return undefined

@@ -46,7 +46,7 @@ import { attachmentsText, splitAttachments } from "@/lib/attachment-text"
 import { progressReminderNote, progressRemindersShown } from "@/lib/progress-reminder"
 import { measureReply } from "@/lib/reply-stats"
 import { wireContent } from "@/lib/attachments"
-import { NOT_SENT } from "@/lib/words"
+import { NOT_SENT, oneLine } from "@/lib/words"
 import { refreshContext } from "@/lib/context"
 import { refreshChatProviderUsage } from "@/lib/provider-usage"
 import {
@@ -60,7 +60,6 @@ import {
 } from "@/lib/history"
 import { unknownLastTurn } from "@/lib/model-changes"
 import { modelOf, pickOf, wantsPin } from "@/lib/model-pick"
-import { movesFloor } from "@/lib/move-marks"
 import { askTriage, canTriage, triaging } from "@/lib/triage"
 import { takeHostTitle } from "@/lib/title"
 import { onTodoTool, refreshTodos } from "@/lib/todos"
@@ -915,10 +914,7 @@ export async function requeueSteer(conversationId: string, text: string) {
     content,
     ...(attachments.length ? { attachments } : {}),
     status: "queued",
-    createdAt: movesFloor(
-      (await hostOf(conversationId))?.conversation.moves,
-      queued ? queued.createdAt - 1 : Date.now(),
-    ),
+    createdAt: queued ? queued.createdAt - 1 : Date.now(),
   })
 }
 
@@ -1075,12 +1071,15 @@ async function followTurnRun(turn: Turn, runId: string) {
 }
 
 /** Queued rows are skipped: sending one re-stamps it. */
-function nextAt(conversation: Pick<Conversation, "moves">, messages: readonly Message[]) {
+function nextAt(messages: readonly Message[]) {
   return messages.reduce(
     (at, m) => (m.status === "queued" ? at : Math.max(at, m.createdAt + 1)),
-    movesFloor(conversation.moves, Date.now()),
+    Date.now(),
   )
 }
+
+/** The host's cap (`_line`'s limit in `plugin/triage.py`): a record over its byte cap fails the whole chat merge. */
+const OPENER_CHARS = 2000
 
 /** Writes the user's message and the empty reply, before the turn opens. */
 async function prepareSend(
@@ -1096,7 +1095,7 @@ async function prepareSend(
   // The first send is what fixes the chat's model; every send after it reads the pick it left.
   const { conversation: pinned, release } = await pinModel(conversation, profile)
   const history = await getMessages(conversationId)
-  const now = nextAt(pinned, history)
+  const now = nextAt(history)
   // The pick in effect, not the profile's advertised default name, which isn't a model id.
   const sent = pickOf(pinned, profile)
   const userMessage: Message = {
@@ -1129,6 +1128,9 @@ async function prepareSend(
         updatedAt: now,
         ...(history.length === 0 && !conversation.titleEdited
           ? { title: titleFrom(content || attachments[0].name) }
+          : {}),
+        ...(history.length === 0 && !pinned.main && !pinned.opener && content
+          ? { opener: oneLine(content, OPENER_CHARS), openerAt: now }
           : {}),
       })
     })
@@ -1476,7 +1478,7 @@ export async function sendFromMain(
       content,
       ...(sent.length ? { attachments: sent } : {}),
       status: "triaging",
-      createdAt: nextAt(host.conversation, await getMessages(conversationId)),
+      createdAt: nextAt(await getMessages(conversationId)),
     }
     heldId = held.id
     await db.messages.add(held)
@@ -1485,6 +1487,7 @@ export async function sendFromMain(
       sent,
       steer: options.steer,
       id: held.id,
+      at: held.createdAt,
     })
     if (moved) return moved
     triaging.delete(conversationId)
@@ -1549,7 +1552,7 @@ export async function queueMessage(
     content,
     ...(attachments.length ? { attachments } : {}),
     status: "queued",
-    createdAt: movesFloor(host?.conversation.moves, Date.now()),
+    createdAt: Date.now(),
   }
   if (host && (await hostQueue(host.config))) {
     try {
@@ -1609,7 +1612,7 @@ async function syncQueue(conversationId: string) {
   const startedIds = new Set(sent.map((item) => item.id))
   let finished = false
   const follow: Message[] = []
-  let at = nextAt(host.conversation, local)
+  let at = nextAt(local)
   await db.transaction("rw", db.messages, async () => {
     for (const m of local) {
       if (m.hostQueued && m.status === "queued" && !waiting.has(m.id) && !startedIds.has(m.id))

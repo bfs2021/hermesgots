@@ -38,6 +38,15 @@ const OLDER_THREAD = "Keep the gate open"
 
 const count = (page, selector) => page.locator(selector).count()
 
+/**
+ * A card's way into its thread. The link's words are "View thread" but its accessible name is what
+ * it names — `View <thread title>`, which is what a reader hears — so a card is asked for by that
+ * name as a string: a title is data, and one holding a bracket would turn a pattern into a different
+ * question.
+ */
+const viewLink = (card, title) =>
+  card.getByRole("link", { name: title ? `View ${title}` : /^View / })
+
 function sequence(page) {
   return page.evaluate(
     (messages) => {
@@ -75,6 +84,11 @@ function seed(
     async ({ threads, messages, hour, day, long, note }) => {
       const { db, ensureMainThread, mainThreadId } = await import("/src/lib/db.ts")
       const profile = (await db.profiles.toArray())[0]
+      // Whatever this device merged from its host before the seed is not part of what the flow
+      // asserts: a chat that arrived from the host would stand beside the seeded threads and make
+      // "exactly these" untrue, on a run that happens to sync first.
+      await db.messages.clear()
+      await db.conversations.clear()
       await ensureMainThread(profile.id)
       const mainId = mainThreadId(profile.id)
       const now = Date.now()
@@ -205,6 +219,7 @@ function watchFrames(page, { lanes }) {
               ? Math.round(mine.at(-1)?.getBoundingClientRect().bottom ?? 0)
               : 0,
           count: mine.length,
+          height: content ? Math.round(content.getBoundingClientRect().height) : 0,
         }
       }
       const same = (one, other) =>
@@ -318,11 +333,14 @@ function assertSwitchFrames(frames, { what }) {
       .map((frame) => `${frame.scrollTop} of ${frame.count}`)
       .join(", ")})`,
   )
-  const bottoms = after.map((frame) => frame.bottom)
+  const settledHeight = after.at(-1)?.height
+  const steady = after.filter((frame) => frame.height === settledHeight)
+  assert.ok(steady.length > 1, `${what}: the settled chat was sampled more than once`)
+  const bottoms = steady.map((frame) => frame.bottom)
   const drift = Math.max(...bottoms) - Math.min(...bottoms)
   assert.ok(
     drift <= 1,
-    `${what}: the scroller's position never moves after the first content frame (last item at ${bottoms.join(" → ")})`,
+    `${what}: the settled chat never moves (last item at ${bottoms.join(" → ")})`,
   )
   return { scrollTop: after[0].scrollTop, frames: frames.length }
 }
@@ -387,11 +405,24 @@ async function sampleSwitch(page, { chats, pane = "route", act, what, also = [] 
     { pane, says: chats[1].says },
     { timeout: 15_000 },
   )
+  for (const lane of also)
+    await page.waitForFunction(
+      ({ pane, title }) =>
+        document
+          .querySelector(`[data-pane="${pane}"]`)
+          ?.querySelector('[data-slot="header-title"]')
+          ?.textContent?.trim() === title,
+      { pane: lane.pane, title: lane.chats[1].title },
+      { timeout: 15_000 },
+    )
   await settled(page)
   await page.waitForFunction((tail) => window.__quiet >= tail, SETTLED_FRAMES, {
     timeout: 15_000,
     polling: "raf",
   })
+  await page.evaluate(
+    () => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))),
+  )
   const frames = await stopFrames(page)
   assertSwitchFrames(frames[pane], { what })
   for (const lane of also)
@@ -547,7 +578,7 @@ await flow(
         { title: THREADS[0].title, says: LONG_NOTE },
       ],
       what: "a card's thread opens",
-      act: () => card.getByRole("link", { name: /View thread/ }).click(),
+      act: () => viewLink(card, THREADS[0].title).click(),
     })
     await page.waitForURL(`**/c/${THREADS[0].id}`, { timeout: 15_000 })
     await page.getByText(THREADS[0].opener).first().waitFor({ timeout: 15_000 })
@@ -642,13 +673,44 @@ await flow(
     )
     assert.equal(
       await page.getByText(/Moved to/).count(),
+      0,
+      "nothing says where the message went: the card standing where it was is that sentence",
+    )
+    const last = page.locator('[data-slot="thread-card"]').last()
+    assert.equal(
+      await last.getByText(/View thread/).count(),
       1,
-      "one line says where the message went: the card's own",
+      "a thread triage opened reads like a /thread card, with the ordinary way in",
     )
     assert.equal(
-      await page.locator('[data-slot="thread-card"]').last().getByText(/Moved to/).count(),
+      await last.evaluate((card) => {
+        const body = card.querySelector('[data-slot="thread-card-body"]')
+        const undo = card.querySelector('button[aria-label="Undo"]')
+        return Boolean(body && undo) && !body.contains(undo)
+      }),
+      true,
+      "and its Undo stands outside the card, at the end of the row",
+    )
+    const widths = await page.evaluate(() =>
+      [...document.querySelectorAll('[data-slot="thread-card-body"]')].map((body) =>
+        Math.round(body.getBoundingClientRect().width),
+      ),
+    )
+    assert.ok(widths.length > 1, "more than one card is drawn")
+    const gap = await page.evaluate(() => {
+      const card = [...document.querySelectorAll('[data-slot="thread-card"]')].find((one) =>
+        one.querySelector('button[aria-label="Undo"]'),
+      )
+      const body = card?.querySelector('[data-slot="thread-card-body"]')
+      const undo = card?.querySelector('button[aria-label="Undo"]')
+      if (!body || !undo) return null
+      return Math.round(undo.getBoundingClientRect().left - body.getBoundingClientRect().right)
+    })
+    assert.ok(gap !== null && gap >= 0 && gap <= 8, `Undo stands at the card's edge (${gap}px away)`)
+    assert.equal(
+      new Set(widths).size,
       1,
-      "and it is the card that carries it, not a marker beside it",
+      `every card is the same width, with or without Undo (found ${widths.join(", ")})`,
     )
     await until(
       async () => (await page.locator("[data-sonner-toast]").count()) === 0,
@@ -790,7 +852,7 @@ await flow(
     )
     // The started thread's card, in the Main that stays on screen beside whatever the pane holds.
     const startedCard = cardOf(page, threadId)
-    await startedCard.getByRole("link", { name: /View thread/ }).click()
+    await viewLink(startedCard).click()
     await page.waitForURL(`**/c/${threadId}`, { timeout: 15_000 })
     await until(
       async () => (await count(page, '[data-pane="thread"] [data-slot="header-title"]')) === 1,
@@ -813,7 +875,7 @@ await flow(
     const held = await page.locator('[data-slot="header-row"]').nth(1).elementHandle()
     // Naming the same thread from its card again — which is what a tap on a thread that is already
     // the screen does — must draw no new pane: redrawing it is what made the thread flicker.
-    await startedCard.getByRole("link", { name: /View thread/ }).click()
+    await viewLink(startedCard).click()
     await settled(page)
     assert.equal(
       new URL(page.url()).pathname,

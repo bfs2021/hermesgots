@@ -9,13 +9,15 @@ import {
   listEnabledProfiles,
   mainThreadId,
   mainThreadProfile,
-  saveSettings,
   type BotSort,
   type Conversation,
   type Profile,
 } from "@/lib/db"
 import { useXLarge } from "@/lib/media"
 import { byName } from "@/lib/compare"
+import { oneLine } from "@/lib/words"
+import { withDir, type Sort, type SortKey } from "@/lib/sort"
+import { useStoredSort } from "@/lib/use-sort"
 import { threadState, type ThreadState } from "@/lib/session-work"
 import {
   useAllLiveRuns,
@@ -57,7 +59,7 @@ export interface Thread {
   reason?: WaitingReason
 }
 
-const line = (text?: string) => text?.replace(/\s+/g, " ").trim() || undefined
+const line = (text?: string) => (text === undefined ? undefined : oneLine(text))
 
 async function latestLine(conversationId: string) {
   const newest = await db.messages
@@ -123,7 +125,7 @@ export function useThreads(profileId: string | undefined): Thread[] | undefined 
               : undefined
         return {
           chat,
-          opener: line(opener?.content),
+          opener: line(opener?.content) ?? line(chat.opener),
           last: line(last?.content),
           replies,
           streaming: latest?.status === "streaming",
@@ -167,38 +169,43 @@ export interface BotSummary {
   /** Its Main thread, once this device has opened it. */
   main?: Conversation
   preview?: string
+  /** The newest thread's latest message, cut to a line, for a bot with nothing said in Main. */
+  threadLine?: string
   /** Threads waiting on the user. */
   waiting: number
 }
 
-export const BOT_SORTS: Record<BotSort, string> = {
-  recent: "Recent",
-  waiting: "Waiting",
-  name: "Name",
-  added: "Added",
-}
+/** The keys the sidebar's bots rank by, each with the way it reads best (ADR 0091). */
+export const BOT_SORTS: readonly SortKey<BotSort>[] = [
+  { key: "recent", label: "Recent", dir: "desc" },
+  { key: "waiting", label: "Waiting", dir: "desc" },
+  { key: "name", label: "Name", dir: "asc" },
+  { key: "added", label: "Added", dir: "asc" },
+]
 
 /** The sidebar's bot order, kept on this device. */
-export function useBotSort(): [BotSort, (sort: BotSort) => void] {
-  const sort = useLiveQuery(async () => (await getSettings()).botSort, []) ?? "recent"
-  return [sort, (botSort) => void saveSettings({ botSort })]
+export function useBotSort(): [Sort<BotSort>, (sort: Sort<BotSort>) => void] {
+  return useStoredSort(BOT_SORTS, ["botSort", "botSortDir"])
 }
 
 const active = (summary: BotSummary) => (summary.main ?? summary.latest)?.updatedAt ?? -Infinity
-const byRecent = (a: BotSummary, b: BotSummary) => active(b) - active(a)
+const byRecent = (a: BotSummary, b: BotSummary) => active(a) - active(b)
+const byAdded = (a: BotSummary, b: BotSummary) => a.bot.createdAt - b.bot.createdAt
 const byBotName = (a: BotSummary, b: BotSummary) => byName(a.bot.name, b.bot.name)
 
 /**
  * `recent`: the newest thread first, bots without one last. `waiting`: the most threads waiting on
- * the user first, then recent. `name`: A to Z. `added`: the order the bots were linked in.
+ * the user first, then recent. `name`: A to Z. `added`: the order the bots were linked in. The arrow
+ * turns the result round, and each key keeps its own tie-break, which the arrow turns with it.
  */
-export function sortBots(bots: BotSummary[], sort: BotSort): BotSummary[] {
-  const sorted = [...bots]
-  if (sort === "recent") sorted.sort((a, b) => byRecent(a, b) || byBotName(a, b))
-  if (sort === "waiting")
-    sorted.sort((a, b) => b.waiting - a.waiting || byRecent(a, b) || byBotName(a, b))
-  if (sort === "name") sorted.sort(byBotName)
-  return sorted
+export function sortBots(bots: BotSummary[], sort: Sort<BotSort>): BotSummary[] {
+  const rank = (a: BotSummary, b: BotSummary) => {
+    if (sort.key === "recent") return byRecent(a, b) || byBotName(a, b)
+    if (sort.key === "waiting") return a.waiting - b.waiting || byRecent(a, b) || byBotName(a, b)
+    if (sort.key === "name") return byBotName(a, b)
+    return byAdded(a, b)
+  }
+  return [...bots].sort((a, b) => withDir(rank(a, b), sort.dir))
 }
 
 /**
@@ -238,15 +245,29 @@ export function useBotSummaries(): BotSummary[] | undefined {
             .map((m) => m!.conversationId),
         )
         const main = await db.conversations.get(mainThreadId(bot.id))
-        return { bot, chats, local, main, preview: main ? await latestLine(main.id) : undefined }
+        // What the row previews: Main's last words, and where Main has none, its newest thread's —
+        // a name says what a thread is called, not what the bot last said (ADR 0090). Main is not
+        // one of those threads: it sits in the same table, so an empty Main would answer with its
+        // own title, "Main", where the newest thread had words to show.
+        const threads = chats.filter((chat) => chat.id !== main?.id)
+        const newestThread = threads[0]
+        return {
+          bot,
+          chats,
+          local,
+          main,
+          preview: main ? await latestLine(main.id) : undefined,
+          threadLine: newestThread ? await latestLine(newestThread.id) : undefined,
+        }
       }),
     )
   }, [])
-  return rows?.map(({ bot, chats, local, main, preview }) => ({
+  return rows?.map(({ bot, chats, local, main, preview, threadLine }) => ({
     bot,
-    latest: chats[0],
+    latest: chats[0] && chats[0].id !== main?.id ? chats[0] : chats.find((c) => c.id !== main?.id),
     main,
     preview,
+    threadLine,
     waiting: chats.filter((c) => local.has(c.id) || live[c.hermesSessionId]).length,
   }))
 }

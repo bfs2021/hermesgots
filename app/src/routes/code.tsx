@@ -1,5 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react"
-import { useLiveQuery } from "dexie-react-hooks"
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import {
   ArchiveXIcon,
   CheckIcon,
@@ -10,12 +9,14 @@ import {
   LockIcon,
   MenuIcon,
   PlusIcon,
+  SearchIcon,
+  XIcon,
 } from "lucide-react"
 import { Navigate, useNavigate } from "react-router"
 
 import { prLabel, prLook } from "@/components/chat/pr-look"
 import { useOpenDrawer } from "@/components/drawer-context"
-import { ItemGroup, ItemRow, ItemSearch } from "@/components/item-list"
+import { ItemGroup, ItemRow, SearchField } from "@/components/item-list"
 import { NewSessionPopup, type SessionTarget } from "@/components/new-session"
 import { SortMenu } from "@/components/sort-menu"
 import { Badge } from "@/components/ui/badge"
@@ -31,9 +32,7 @@ import {
 import { connectionKey } from "@/lib/connection"
 import {
   createConversation,
-  getSettings,
   prIsLive,
-  saveSettings,
   type CodeSort,
   type Conversation,
   type Profile,
@@ -66,6 +65,10 @@ import {
   type SessionState,
 } from "@/lib/session-work"
 import { useReadMarks } from "@/lib/read-marks"
+import { cn } from "@/lib/utils"
+import { filterByFuzzy } from "@/lib/fuzzy"
+import { type Sort, type SortKey } from "@/lib/sort"
+import { useStoredSort } from "@/lib/use-sort"
 
 const DAY_MS = 86_400_000
 const LAST_PROJECT = "memento:last-session-project"
@@ -127,19 +130,16 @@ interface Row extends SessionClaim {
   key: string
 }
 
-const CODE_SORTS: Record<CodeSort, string> = {
-  created: "Created",
-  activity: "Last activity",
-  title: "Title A–Z",
-}
+/** The keys the list ranks by, each with the way it reads best (ADR 0091). */
+const CODE_SORTS: readonly SortKey<CodeSort>[] = [
+  { key: "created", label: "Created", dir: "desc" },
+  { key: "activity", label: "Last activity", dir: "desc" },
+  { key: "title", label: "Title", dir: "asc" },
+]
 
-/** The Code list's order over each group, kept on this device (unset: created). */
-function useCodeSort(): [CodeSort, (sort: CodeSort) => void] {
-  const sort = useLiveQuery(async () => (await getSettings()).codeSort, []) ?? "created"
-  return [
-    sort,
-    (codeSort) => void saveSettings({ codeSort }).catch(quietly("Saving the sort order")),
-  ]
+/** The Code list's order over each group, kept on this device (unset: created, newest first). */
+function useCodeSort(): [Sort<CodeSort>, (sort: Sort<CodeSort>) => void] {
+  return useStoredSort(CODE_SORTS, ["codeSort", "codeSortDir"])
 }
 
 function CodeList({ pane }: { pane?: FeaturePane }) {
@@ -155,6 +155,10 @@ function CodeList({ pane }: { pane?: FeaturePane }) {
   const changes = useAnyChange("projects")
   const marks = useReadMarks()
   const [query, setQuery] = useState("")
+  const [searching, setSearching] = useState(false)
+  const field = useRef<HTMLInputElement>(null)
+  const chipRow = useRef<HTMLDivElement>(null)
+  const dock = useRef<HTMLDivElement>(null)
   const [chip, setChip] = useState<string>()
   const [starting, setStarting] = useState(false)
   const [sort, setSort] = useCodeSort()
@@ -219,17 +223,39 @@ function CodeList({ pane }: { pane?: FeaturePane }) {
   const chips = [...projects.entries()]
     .filter(([key, { project }]) => !project.archived || rows.some((r) => r.key === key))
     .sort((a, b) => a[1].project.name.localeCompare(b[1].project.name))
-  const shown = rows.filter((r) => (!chip || r.key === chip) && matches(r, query))
+  useLayoutEffect(() => {
+    const row = chipRow.current
+    const sort = dock.current
+    if (!row || !sort) return
+    const fit = () => row.style.setProperty("--dock", `${sort.offsetWidth}px`)
+    fit()
+    const observer = new ResizeObserver(fit)
+    observer.observe(sort)
+    return () => observer.disconnect()
+  }, [chips.length, sort.key])
+
+  const order = useMemo(
+    () =>
+      codeOrder<Row>(sort, {
+        created: (row) => row.c.createdAt,
+        activity: (row) => lastActivityAt(row.c),
+        title: (row) => row.c.title,
+      }),
+    [sort.key, sort.dir],
+  )
   const filtering = Boolean(query.trim() || chip)
-  const order = codeOrder<Row>(sort, {
-    created: (row) => row.c.createdAt,
-    activity: (row) => lastActivityAt(row.c),
-    title: (row) => row.c.title,
-  })
+  const shown = useMemo(() => {
+    const inProject = rows.filter((r) => !chip || r.key === chip)
+    return filterByFuzzy([...inProject].sort(order), query, (r) => [
+      r.c.title,
+      r.project?.name,
+      r.c.worktree?.branch,
+    ])
+  }, [rows, chip, query, order])
   // What waits on the user first, then working, idle and closed — deterministic, not a live
   // timestamp chasing itself.
   const grouped = filtering ? undefined : codeGroups(shown, (r) => codeGroupOf(r.state), order)
-  const flat = filtering ? [...shown].sort(order) : undefined
+  const flat = filtering ? shown : undefined
 
   const targets: SessionTarget[] = [...projects.entries()]
     // A project with no repository has nowhere for a session to work, so it isn't offered.
@@ -244,6 +270,15 @@ function CodeList({ pane }: { pane?: FeaturePane }) {
   const initial = chip ?? lastProject()
 
   useEffect(() => newSessionAsked.subscribe(() => setStarting(true)), [])
+
+  const openSearch = () => {
+    setSearching(true)
+    window.requestAnimationFrame(() => field.current?.focus())
+  }
+  const closeSearch = () => {
+    setSearching(false)
+    setQuery("")
+  }
 
   const start = async ({ key, profile, project }: SessionTarget) => {
     const conversation = await createConversation(profile.id, {
@@ -288,7 +323,7 @@ function CodeList({ pane }: { pane?: FeaturePane }) {
       }
     >
       <header className="sticky top-0 z-10 bg-background/80 px-4 pt-[var(--list-header-pt)] pb-3 backdrop-blur">
-        <div className="mx-auto flex max-w-2xl items-center gap-3">
+        <div className="mx-auto flex max-w-2xl items-center gap-2">
           <Button
             variant="outline"
             size="icon-lg"
@@ -298,17 +333,56 @@ function CodeList({ pane }: { pane?: FeaturePane }) {
           >
             <MenuIcon />
           </Button>
-          <h1 className="flex-1 text-xl font-semibold tracking-tight">Code</h1>
-          <SortMenu by="sessions" options={CODE_SORTS} value={sort} onSort={setSort} />
+          <div className="relative flex min-w-0 flex-1 items-center">
+            <h1
+              className={cn(
+                "min-w-0 flex-1 truncate text-xl font-semibold tracking-tight transition-opacity duration-200 motion-reduce:transition-none",
+                searching && "opacity-0",
+              )}
+            >
+              Code
+            </h1>
+            <div
+              className={cn(
+                "absolute inset-0 flex items-center transition-all duration-200 motion-reduce:transition-none",
+                searching
+                  ? "translate-x-0 opacity-100"
+                  : "pointer-events-none translate-x-3 opacity-0",
+              )}
+              aria-hidden={!searching}
+            >
+              <SearchField
+                value={query}
+                onChange={(next) => (next ? setQuery(next) : closeSearch())}
+                label="Search sessions"
+                inputRef={field}
+                tabIndex={searching ? undefined : -1}
+                className={searching ? undefined : "pointer-events-none"}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") closeSearch()
+                }}
+              />
+            </div>
+          </div>
+          <Button
+            variant="ghost"
+            size="icon-lg"
+            className="size-11 rounded-full text-muted-foreground"
+            onClick={() => (searching ? closeSearch() : openSearch())}
+            aria-label={searching ? "Close search" : "Search"}
+            aria-expanded={searching}
+            data-search-toggle
+          >
+            {searching ? <XIcon /> : <SearchIcon />}
+          </Button>
         </div>
       </header>
 
       <div className="mx-auto flex w-full max-w-2xl flex-col gap-6 px-4 pt-2 pb-[max(2rem,env(safe-area-inset-bottom))]">
-        {(rows.length > 0 || chips.length > 1) && (
-          <div className="flex flex-col gap-3">
-            <ItemSearch value={query} onChange={setQuery} label="Search sessions" />
+        {rows.length > 0 && (
+          <div ref={chipRow} className="relative flex min-h-11 items-center">
             {chips.length > 1 && (
-              <ChipRow label="Projects">
+              <ChipRow label="Projects" className="min-w-0 flex-1 pr-[var(--dock,7rem)]">
                 <Chip active={!chip} onClick={() => setChip(undefined)}>
                   All
                 </Chip>
@@ -324,6 +398,15 @@ function CodeList({ pane }: { pane?: FeaturePane }) {
                 ))}
               </ChipRow>
             )}
+            <div ref={dock} data-slot="sort-dock" className="absolute inset-y-0 right-0 flex">
+              <div
+                aria-hidden
+                className="pointer-events-none w-10 bg-gradient-to-r from-transparent to-background"
+              />
+              <div className="flex items-center bg-background">
+                <SortMenu by="sessions" options={CODE_SORTS} value={sort} onSort={setSort} />
+              </div>
+            </div>
           </div>
         )}
 
@@ -338,7 +421,7 @@ function CodeList({ pane }: { pane?: FeaturePane }) {
                 variant="outline"
                 className="h-11 rounded-full"
                 onClick={() => {
-                  setQuery("")
+                  closeSearch()
                   setChip(undefined)
                 }}
               >
@@ -359,7 +442,7 @@ function CodeList({ pane }: { pane?: FeaturePane }) {
         )}
       </div>
 
-      <div className="pointer-events-none sticky bottom-0 mt-auto px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
+      <div className="pointer-events-none sticky bottom-0 z-20 mt-auto bg-gradient-to-t from-background via-background/90 to-transparent px-4 pt-6 pb-[max(1rem,env(safe-area-inset-bottom))]">
         <div className="mx-auto flex w-full max-w-2xl justify-end">
           <Button
             data-toast-above
@@ -392,13 +475,6 @@ function lastProject() {
   } catch {
     return undefined
   }
-}
-
-function matches({ c, project }: Row, query: string) {
-  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
-  if (!words.length) return true
-  const text = [c.title, project?.name, c.worktree?.branch].join(" ").toLowerCase()
-  return words.every((word) => text.includes(word))
 }
 
 const names = new Intl.ListFormat(undefined, { type: "conjunction" })

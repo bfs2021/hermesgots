@@ -19,15 +19,28 @@ test("the line under Main's title counts the bot's threads, and says so when the
   assert.equal(threadsLine(11), "11 threads")
 })
 
-test("the row previews Main's latest line, not its newest thread's title", () => {
+test("the row previews Main's words, else the newest thread's, else its name, else its host's state", () => {
   assert.equal(
     previewLine({ main: true, line: "What was said in Main", latest: "A newer thread" }),
     "What was said in Main",
   )
   assert.equal(
+    previewLine({ main: true, line: undefined, thread: "What the thread said", latest: "A newer thread" }),
+    "What the thread said",
+    "nothing said in Main yet, so the newest thread's own words stand in",
+  )
+  assert.equal(
     previewLine({ main: true, line: undefined, latest: "A newer thread" }),
-    "No threads yet",
+    "A newer thread",
+    "and its name where the thread holds no words",
+  )
+  assert.equal(
+    previewLine({ main: true, line: undefined, thread: undefined, latest: "Main" }),
+    "Main",
+    "an empty Main with nothing under it yet still names the row",
   )
   assert.equal(previewLine({ main: false, latest: "Its newest thread" }), "Its newest thread")
-  assert.equal(previewLine({ main: false }), "No threads yet")
+  assert.equal(previewLine({ main: false, online: true }), "Online")
+  assert.equal(previewLine({ main: true, line: undefined, online: false }), "Offline")
+  assert.equal(previewLine({ main: false }), undefined, "and nothing at all where it can't tell")
 })

@@ -19,6 +19,14 @@ import type { Thread } from "@/lib/threads"
 import { cn } from "@/lib/utils"
 import { reasonText } from "@/lib/waiting"
 
+/**
+ * Undo's own box: its mark and the 44px target, shared by the live control and the hidden mark that
+ * holds the room where a card has nothing to undo. The mark carries the word for a screen reader and
+ * nothing on the glass, so the control is one icon wide and the card beside it gets the rest — and
+ * because the same box is in the layout either way, nothing is measured and nothing guesses (ADR 0094).
+ */
+const UNDO = "flex size-11 shrink-0 items-center justify-center rounded-full text-info"
+
 export function StateIcon({ state }: { state: Thread["state"] }) {
   if (state === "waiting") return <CircleAlertIcon className="size-5 text-warning" />
   if (state === "failed") return <CircleXIcon className="size-5 text-destructive" />
@@ -32,11 +40,14 @@ export function StateIcon({ state }: { state: Thread["state"] }) {
  * words are the message's and the card's line is the thread's name, never the other way round; no
  * avatar, because a card is not a turn (ADR 0082, amending 0034).
  *
- * The way in is the thread's one system line, whichever mark holds it (ADR 0087): "Moved to “…”"
- * where a move opened the thread, as the moved marker says it, and "View thread" only where none
- * did — with Undo riding that same line rather than a second control inside the card. The message
- * above is drawn whole: the card's whole job is to show the message that opened the thread, so a
- * preview clamped to four lines would hide the words it exists to repeat.
+ * A card says the same thing whichever way its thread was opened (ADR 0094): the way in is the
+ * thread's one system line, reading "View thread" whether the reader typed `/thread` or triage moved
+ * a message, because the bubble above the card and the card's place in the flow already say that a
+ * message left Main. The one thing a thread triage opened carries is Undo, and it stands outside the
+ * card at the end of its row, level with the card's middle, so the card keeps one shape and the
+ * control keeps its full 44px target without crowding the thread's name. The message above is drawn
+ * whole: the card's whole job is to show the message that opened the thread, so a preview clamped to
+ * four lines would hide the words it exists to repeat.
  */
 export function ThreadCard({
   thread,
@@ -59,8 +70,6 @@ export function ThreadCard({
   const face = useCodeFace()
   const label = thread.reason ? reasonText(thread.reason) : undefined
   const opener = openerWords(thread, move)
-  // A move that opened this thread is what the card's way in says; without one it is a card to view.
-  const moved = Boolean(move)
   const title = thread.chat.title || "a thread"
   return (
     <div
@@ -75,10 +84,11 @@ export function ThreadCard({
           </BubbleContent>
         </Bubble>
       )}
-      <div className="mt-1.5 flex w-full max-w-[85%] items-end">
+      <div className="mt-1.5 grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-1">
         <div
+          data-slot="thread-card-body"
           className={cn(
-            "flex min-h-14 min-w-0 flex-1 items-center gap-3 rounded-2xl border bg-card px-4 py-2",
+            "flex min-h-14 min-w-0 items-center gap-3 rounded-2xl border bg-card px-4 py-2",
             open && "border-foreground/20 bg-muted",
           )}
         >
@@ -91,54 +101,37 @@ export function ThreadCard({
             <BellOffIcon className="size-4 shrink-0 text-muted-foreground" aria-label="Muted" />
           )}
         </div>
-      </div>
-      <SystemLine className="-mt-3 ml-1.5 w-full">
-        {moved ? (
-          <>
-            Moved to{" “"}
-            <SystemLink
-              icon={MessagesSquareIcon}
-              to={`/c/${thread.chat.id}`}
-              replace={beside}
-              state={{ bot: profileId }}
-              current={open}
-              onClick={stayHere(current)}
-              label={title}
-            >
-              {title}
-            </SystemLink>
-            {"”"}
-          </>
-        ) : (
-          <SystemLink
-            icon={MessagesSquareIcon}
-            to={`/c/${thread.chat.id}`}
-            replace={beside}
-            state={{ bot: profileId }}
-            current={open}
-            onClick={stayHere(current)}
-            label={`View ${title}`}
-          >
-            View thread
-          </SystemLink>
-        )}
-        {thread.replies > 0 && (
-          <span>
-            · {thread.replies} {thread.replies === 1 ? "reply" : "replies"}
-          </span>
-        )}
-        {move?.undoable && onUndo && (
-          // On its own line as a block, so nothing sits between it and the sentence above. The
-          // padding and matching negative margin keep the target 44px tall without adding any space.
+        {move?.undoable && onUndo ? (
           <button
             type="button"
             onClick={() => onUndo(move)}
             aria-label="Undo"
-            className="relative z-10 -my-3 flex w-fit items-center gap-1 py-3 font-medium text-info underline-offset-2 outline-none hover:underline focus-visible:underline"
+            className={cn(UNDO, "outline-none hover:bg-muted focus-visible:bg-muted")}
           >
-            <Undo2Icon className="size-3.5" />
-            Undo
+            <Undo2Icon className="size-4" />
           </button>
+        ) : (
+          <span aria-hidden className={cn(UNDO, "invisible")}>
+            <Undo2Icon className="size-4" />
+          </span>
+        )}
+      </div>
+      <SystemLine className="-mt-3 ml-1.5 w-full">
+        <SystemLink
+          icon={MessagesSquareIcon}
+          to={`/c/${thread.chat.id}`}
+          replace={beside}
+          state={{ bot: profileId }}
+          current={open}
+          onClick={stayHere(current)}
+          label={`View ${title}`}
+        >
+          View thread
+        </SystemLink>
+        {thread.replies > 0 && (
+          <span>
+            · {thread.replies} {thread.replies === 1 ? "reply" : "replies"}
+          </span>
         )}
       </SystemLine>
     </div>

@@ -124,7 +124,26 @@
   --chart-5: oklch(0.76 0.11 195);
 }
 
+@keyframes work-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* A work row at work breathes its own words and nothing else — the chevron beside them holds still,
+   so the row's shape reads the same whether it runs or is finished (ADR 0092). */
+@media (prefers-reduced-motion: no-preference) {
+  [data-working] [data-slot="work-label"] {
+    animation: work-pulse 1.8s ease-in-out infinite;
+  }
+}
+
 @theme inline {
+  --animate-work-pulse: work-pulse 1.8s ease-in-out infinite;
   --font-sans: "Figtree Variable", ui-sans-serif, system-ui, sans-serif;
   --font-heading: var(--font-sans);
   /* What a project session is said in (`CODE_FACE`). */
