@@ -46,9 +46,8 @@ import { compactionMarks } from "@/lib/compactions"
 import { questionAt, questionsIn } from "@/lib/clarify"
 import { db, type ApprovalChoice, type ClarifyQuestion, type Message } from "@/lib/db"
 import type { DelegatedAgent } from "@/lib/hermes"
-import { usePluginFeatureOn } from "@/lib/features"
 import { describeActivity } from "@/lib/format"
-import { COLUMN_BOX, REPLY_INSET } from "@/lib/layout"
+import { COLUMN_BOX, REPLY_EDGE } from "@/lib/layout"
 import { modelChanges } from "@/lib/model-changes"
 import { useDraws } from "@/lib/openui-draws"
 import type { RepoRef } from "@/lib/workspace"
@@ -56,7 +55,6 @@ import { carriesCount, replyFacts, threadLineOf } from "@/lib/thinking"
 import { cn } from "@/lib/utils"
 
 import { delegated } from "./agents"
-import { clearFailedTurn } from "./api"
 import { messagesOf, heldMessage, replyId } from "./messages"
 import { ChatNextThread, type PromptProps, type ThreadViewProps } from "./page"
 import type { Waiting } from "./state"
@@ -130,25 +128,24 @@ export function AppThreadView({
     latestSend.current = send
   })
   const ask = useCallback((text: string) => latestSend.current(text, []), [])
-  // A turn the host gave up on can be sent again from where it stands: the host drops the failure
-  // from its transcript where it can, and the thread hides it once the request is asked again.
-  const hostClears = usePluginFeatureOn(
-    { baseUrl: server.server, apiKey: server.key },
-    "failed_turn_clear",
-  )
+  // Retry only sends the request again: the half that failed may hold work the next turn needs —
+  // calls that ran, files they wrote — so none of it comes out of the host's transcript, and only
+  // the drawing drops it once its request is asked again.
   const [retrying, setRetrying] = useState(false)
-  // A turn whose request is in a page not read yet has nothing to send again.
-  const failedTurn =
-    turns.at(-1)?.failed && !turns.at(-1)?.cut && !streaming && !waiting ? turns.at(-1) : undefined
+  // A turn whose request is in a page not read yet has nothing to send again, and neither has a
+  // wake turn the host gave up on: it answers no message of the user's, so Retry would send nothing.
+  const tip = turns.at(-1)
+  const resendable = tip?.failed && (tip.user.trim() || tip.files?.length)
+  const failedTurn = resendable && !tip.cut && !streaming && !waiting ? tip : undefined
   const retryId = failedTurn && replyId(chatId, origin + turns.length - 1)
   async function retry() {
     if (!failedTurn?.failed || retrying) return
     setRetrying(true)
     try {
-      if (hostClears) await clearFailedTurn(server, session, failedTurn.failed.row)
-      // The files are on the host already, so the message names their paths; a photo goes as a
-      // file, since the transcript keeps no copy of the image part to send again.
-      const files = (failedTurn.files ?? []).map((file) => ({
+      // The files are on the host already, so the message names their paths; a photo the host holds
+      // goes as a file too — one the row's own hint named is the host's, which a send leaves out of
+      // its markers unless it is made the message's own again.
+      const files = (failedTurn.files ?? []).map(({ host: _host, ...file }) => ({
         ...file,
         id: file.path ?? file.name,
         image: false,
@@ -317,11 +314,15 @@ export function AppThreadView({
                             line={message.id === lastId && holds ? line : undefined}
                           />
                           {message.id === retryId && (
-                            <div className={cn(COLUMN_BOX, REPLY_INSET)}>
+                            // Under the failure, on the reply's edge: the icon on the column's
+                            // inset, the button's own left padding cancelled, and the words and gap
+                            // at the error's, so the two read as one column, not a stray row.
+                            <div className={cn(REPLY_EDGE, "pt-2")}>
                               <Button
                                 data-retry
                                 variant="ghost"
                                 size="sm"
+                                className="-ml-2 gap-2 border-0 text-[15px] font-normal"
                                 disabled={retrying}
                                 onClick={() => void retry()}
                               >

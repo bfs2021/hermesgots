@@ -84,7 +84,7 @@ export interface Turn {
   /** The host has written the reply's last row: an assistant row that makes no more calls and says why it stopped. */
   done: boolean
   /** The host gave up on the turn (`failed_turn`) and says so in its own words; it is over. */
-  failed?: { text: string; row: number }
+  failed?: { text: string }
   /** A reply the host started when a subagent finished: it answers no message of the user's. */
   wake?: boolean
   /** A routine's message: the bot said it while working, a turn of its own (ADR 0081). */
@@ -308,7 +308,7 @@ export function foldTurns(rows: Row[], partial = false, showReminders = false): 
     // A failed turn ends in a row of its own, with no finish reason: it is over, not still writing.
     if (row.display_kind === "failed_turn") {
       turn.done = true
-      turn.failed = { text: row.content || "Hermes couldn't finish this reply.", row: row.id }
+      turn.failed = { text: row.content || "Hermes couldn't finish this reply." }
       continue
     }
     // After a compaction Hermes writes the work it carried forward again, under the ids it had: a
@@ -472,7 +472,8 @@ const sameRequest = (a: Turn, b: Turn) =>
 
 /**
  * The turns without a failed one the next turn asks again: the user sent the message once more, so
- * the failure is behind them and the thread reads as if only the second send happened. A failed turn
+ * the failure is behind them and the thread reads as if only the second send happened. Only the
+ * drawing drops it — the host keeps the failed turn and whatever work it did — and a failed turn
  * nothing repeats stays, with the host's words.
  */
 export function withoutRepeatedFailures(turns: Turn[]): Turn[] {

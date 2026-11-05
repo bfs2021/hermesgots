@@ -207,7 +207,7 @@ export function fakeHost(
     health: 0,
     stops: 0,
     agentStops: 0,
-    failedClears: 0,
+    failedTurnClears: 0,
     info: 0,
   }
   /** The offset of each transcript page asked for, in the order the asks came. */
@@ -681,7 +681,6 @@ export function fakeHost(
           "triage",
           "moves",
           "subagents_stop_all",
-          "failed_turn_clear",
         ],
       })
     }
@@ -802,23 +801,6 @@ export function fakeHost(
           : {},
       })
     }
-    // The plugin takes a failed turn, from its request to the failure, out of the transcript.
-    if (
-      plugin &&
-      path === `/api/plugins/memento/sessions/${session}/failed-turn/clear` &&
-      init?.method === "POST"
-    ) {
-      asked.failedClears++
-      const { row } = JSON.parse(String(init.body)) as { row: number }
-      const failed = rows.find((one) => one.id === row && one.display_kind === "failed_turn")
-      const request = rows.findLast(
-        (one) => one.id < row && one.role === "user" && !one.display_kind?.match(/steer|hidden/),
-      )
-      if (!failed || !request) return reply({ removed: 0 })
-      const before = rows.length
-      rows.splice(0, rows.length, ...rows.filter((one) => one.id < request.id || one.id > row))
-      return reply({ object: "memento.failed_turn.cleared", removed: before - rows.length })
-    }
     // The plugin's list of the children a session delegated to.
     if (plugin && path === `/api/plugins/memento/sessions/${session}/todos`) {
       todos.reads++
@@ -899,6 +881,9 @@ export function fakeHost(
         pending_controls: state.waiting ? [state.waiting] : [],
       })
     }
+    // A route that no longer exists still counts its calls: a screen that asks the host to delete a
+    // failed turn would 404 here and its read would find the rows untouched either way.
+    if (/\/failed-turn\//.test(path)) asked.failedTurnClears += 1
     return reply({ error: { message: `no route ${path}` } }, 404)
   }
 
