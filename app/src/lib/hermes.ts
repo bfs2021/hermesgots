@@ -20,6 +20,7 @@ import { MAX_TODO_DEPTH } from "@/lib/db"
 import type { Doc } from "@/lib/merge"
 import { pickFields } from "@/lib/model-pick"
 import type { ModelUsage } from "@/lib/pricing"
+import type { PendingInput, PendingQueue } from "@/lib/pending"
 import { parsePipeline, parseStage, type AfkStage, type SessionPipeline } from "@/lib/pipeline"
 import {
   parseWorkflowEntry,
@@ -1673,6 +1674,14 @@ function queueItem(raw: Record<string, unknown>): QueueItem {
   }
 }
 
+function objects<T>(value: unknown, row: (raw: Record<string, unknown>) => T): T[] {
+  return Array.isArray(value)
+    ? value
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+        .map(row)
+    : []
+}
+
 function queueRoot(config: HermesConfig, sessionId: string) {
   return `${pluginRoot(config.baseUrl)}/sessions/${encodeURIComponent(sessionId)}/queue`
 }
@@ -1681,11 +1690,11 @@ function queueRoot(config: HermesConfig, sessionId: string) {
 export async function getQueue(config: HermesConfig, sessionId: string) {
   const response = await request(queueRoot(config, sessionId), { headers: headers(config) })
   const body = await response.json()
-  const list = (value: unknown) =>
-    Array.isArray(value)
-      ? value.filter((item) => item && typeof item === "object").map(queueItem)
-      : []
-  return { items: list(body?.items), sent: list(body?.sent), paused: Boolean(body?.paused) }
+  return {
+    items: objects(body?.items, queueItem),
+    sent: objects(body?.sent, queueItem),
+    paused: Boolean(body?.paused),
+  }
 }
 
 /** Queues a turn on the plugin, which starts it with `run` once the session's run is over. */
@@ -1821,6 +1830,49 @@ export async function queueAction(
     { method: "POST", headers: headers(config) },
   )
   return (await response.json()) as Record<string, unknown>
+}
+
+function pendingRoot(config: HermesConfig, sessionId: string) {
+  return `${pluginRoot(config.baseUrl)}/sessions/${encodeURIComponent(sessionId)}/pending`
+}
+
+function pendingInput(raw: Record<string, unknown>): PendingInput {
+  return { id: String(raw.id), text: typeof raw.text === "string" ? raw.text : "" }
+}
+
+function pendingQueue(body: unknown): PendingQueue {
+  const held = (body ?? {}) as Record<string, unknown>
+  return {
+    items: objects(held.items, pendingInput),
+    lost: typeof held.lost === "string" ? held.lost : null,
+    running: held.running === true,
+  }
+}
+
+/** The queue Hermes itself keeps for a session (`plugin/pending.py`): what waits in it, and which row
+ * a restart left unfinishable. Bounded like every other read on the screen. */
+export async function getPending(config: HermesConfig, sessionId: string) {
+  const response = await request(pendingRoot(config, sessionId), {
+    headers: headers(config),
+    signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+  })
+  return pendingQueue(await response.json())
+}
+
+/**
+ * Acknowledges a lost turn so the messages queued behind it run, and answers what the host holds
+ * afterwards. The lost input is not replayed: it stays in the transcript, to be sent again.
+ */
+export async function discardPending(
+  config: HermesConfig,
+  sessionId: string,
+  admissionId: string,
+) {
+  const response = await request(
+    `${pendingRoot(config, sessionId)}/${encodeURIComponent(admissionId)}/discard`,
+    { method: "POST", headers: headers(config), signal: AbortSignal.timeout(WRITE_TIMEOUT_MS) },
+  )
+  return pendingQueue(await response.json())
 }
 
 function researchRoot(config: HermesConfig, id?: string) {

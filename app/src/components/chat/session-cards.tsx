@@ -7,6 +7,7 @@ import {
   MessageCircleQuestionIcon,
   PencilLineIcon,
   RotateCcwIcon,
+  TimerOffIcon,
   ZapIcon,
 } from "lucide-react"
 import { toast } from "sonner"
@@ -20,6 +21,16 @@ import { clarifyRead } from "@/lib/clarify"
 import type { ToolEvent } from "@/lib/db"
 import { WAITING_FOR_ANSWER } from "@/lib/format"
 import { COLUMN_BOX } from "@/lib/layout"
+import {
+  DISCARD_LABEL,
+  PAUSED_BODY,
+  PAUSED_NOTE,
+  PAUSED_TITLE,
+  ROW_LABEL,
+  STALE_NOTE,
+  rowLine,
+  type PendingRow,
+} from "@/lib/pending"
 import { cn } from "@/lib/utils"
 
 /**
@@ -116,16 +127,45 @@ export function PlanReadyCard({
   )
 }
 
+/**
+ * The head of a notice in the composer's slot. One place for the icon's size and the words' voice,
+ * so the cards in that slot can't drift; a card draws it at the top of its content and keeps its
+ * own layout under it.
+ */
+function NoticeHead({
+  icon,
+  title,
+  body,
+  action,
+}: {
+  icon: ReactNode
+  title: string
+  body?: string
+  action?: ReactNode
+}) {
+  return (
+    <div className="flex min-h-11 items-center gap-3">
+      <span className="shrink-0 [&>svg]:size-6">{icon}</span>
+      <div className="min-w-0 flex-1 text-sm">
+        <p className="font-medium">{title}</p>
+        {body && <p className="text-muted-foreground">{body}</p>}
+      </div>
+      {action}
+    </div>
+  )
+}
+
+/** The tap target every notice in this slot uses, so one restyle reaches all of them. */
 /** In place of the composer when the session can't go on: a repo it worked in left the project. */
 export function BlockedCard({ reason }: { reason: string }) {
   return (
     <Card size="sm" className={CARD}>
-      <CardContent className="flex items-center gap-3">
-        <LockIcon className="size-6 shrink-0 text-muted-foreground" />
-        <div className="min-w-0 flex-1 text-sm">
-          <p className="font-medium">This session is read-only.</p>
-          <p className="text-muted-foreground">{reason}</p>
-        </div>
+      <CardContent>
+        <NoticeHead
+          icon={<LockIcon className="text-muted-foreground" />}
+          title="This session is read-only."
+          body={reason}
+        />
       </CardContent>
     </Card>
   )
@@ -135,15 +175,61 @@ export function BlockedCard({ reason }: { reason: string }) {
 export function ResolvedCard({ onReopen }: { onReopen: () => void }) {
   return (
     <Card size="sm" className={CARD}>
-      <CardContent className="flex items-center gap-3">
-        <CheckCircle2Icon className="size-6 shrink-0 text-success" />
-        <div className="min-w-0 flex-1 text-sm">
-          <p className="font-medium">This session is resolved.</p>
-          <p className="text-muted-foreground">Reopen it to send more messages.</p>
+      <CardContent>
+        <NoticeHead
+          icon={<CheckCircle2Icon className="text-success" />}
+          title="This session is resolved."
+          body="Reopen it to send more messages."
+          action={
+            <Button variant="outline" className="h-11 rounded-full px-4" onClick={onReopen}>
+              Reopen
+            </Button>
+          }
+        />
+      </CardContent>
+    </Card>
+  )
+}
+
+/**
+ * In place of the composer while Hermes holds this session's queue behind a turn a restart lost
+ * (`pending.ts`, `plugin/pending.py`): what is waiting is named, and one button acknowledges the lost
+ * turn so the messages behind it run — the TUI's `/discard`, which the app otherwise needs a
+ * terminal for. The composer is not drawn beside it, because everything typed there would queue
+ * behind the same lost turn and never start.
+ */
+export function QueuePausedCard({
+  rows,
+  discarding,
+  stale = false,
+  onDiscard,
+}: {
+  rows: PendingRow[]
+  discarding: boolean
+  /** The host stopped answering: the queue may still be held, so the card stays, saying why it can't act. */
+  stale?: boolean
+  onDiscard: () => void
+}) {
+  return (
+    <Card size="sm" className={CARD}>
+      <CardContent className="space-y-3">
+        <NoticeHead icon={<TimerOffIcon className="text-warning" />} title={PAUSED_TITLE} body={PAUSED_BODY} />
+        <ul className="space-y-1.5">
+          {rows.map((row) => (
+            <li key={row.id} className="rounded-2xl bg-muted/50 px-3 py-2 text-sm">
+              <p className={cn("break-words", row.state === "lost" && "text-muted-foreground")}>
+                {rowLine(row.text)}
+              </p>
+              <p className="mt-0.5 text-xs text-muted-foreground">{ROW_LABEL[row.state]}</p>
+            </li>
+          ))}
+        </ul>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <p className="text-xs text-muted-foreground">{stale ? STALE_NOTE : PAUSED_NOTE}</p>
+          <Button className="h-11 rounded-full px-4" onClick={onDiscard} disabled={discarding || stale} data-discard-lost>
+            {DISCARD_LABEL}
+          </Button>
         </div>
-        <Button variant="outline" className="h-11 rounded-full px-4" onClick={onReopen}>
-          Reopen
-        </Button>
       </CardContent>
     </Card>
   )
@@ -153,9 +239,11 @@ export function ResolvedCard({ onReopen }: { onReopen: () => void }) {
 export function DiscardedCard() {
   return (
     <Card size="sm" className={CARD}>
-      <CardContent className="flex min-h-11 items-center gap-3">
-        <ArchiveXIcon className="size-6 shrink-0 text-muted-foreground" />
-        <p className="min-w-0 flex-1 text-sm font-medium">This session is discarded.</p>
+      <CardContent>
+        <NoticeHead
+          icon={<ArchiveXIcon className="text-muted-foreground" />}
+          title="This session is discarded."
+        />
       </CardContent>
     </Card>
   )
