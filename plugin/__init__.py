@@ -3285,7 +3285,61 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
     app.router.add_post(f"{PREFIX}/research/{{mission_id}}/rewrite", research_rewrite)
     app.router.add_post(f"{PREFIX}/research/{{mission_id}}/retry", research_retry)
     app.router.add_post(f"{PREFIX}/research/{{mission_id}}/remove", remove_research)
+    async def apps_write(request: "web.Request", work, key: str, status: int, *, body: bool):
+        """One apps write: the key checked, a JSON body read where it takes one, and the host's
+        refusal answered with its own status."""
+        denied = unauthorized(request)
+        if denied is not None:
+            return denied
+        sent = None
+        if body:
+            sent = await json_body(request)
+            if sent is None:
+                return _error(web, "Body must be a JSON object", 400)
+        try:
+            made = await asyncio.to_thread(work, store_path(), sent)
+        except apps.AppsError as error:
+            return _error(web, str(error), error.status)
+        label = "memento.app" if key == "app" else "memento.app.page"
+        return web.json_response({"object": label, key: made}, status=status)
+
+    async def create_app(request: "web.Request") -> "web.Response":
+        return await apps_write(
+            request,
+            lambda path, sent: apps.create(
+                path, sent.get("title"), sent.get("source"), sent.get("library_version")
+            ),
+            "app",
+            201,
+            body=True,
+        )
+
+    async def write_app_page(request: "web.Request") -> "web.Response":
+        info = request.match_info
+        return await apps_write(
+            request,
+            lambda path, sent: apps.write(
+                path, info["app_id"], info["page_id"], sent.get("source")
+            ),
+            "page",
+            200,
+            body=True,
+        )
+
+    async def undo_app_page(request: "web.Request") -> "web.Response":
+        info = request.match_info
+        return await apps_write(
+            request,
+            lambda path, _: apps.undo(path, info["app_id"], info["page_id"]),
+            "page",
+            200,
+            body=False,
+        )
+
     app.router.add_get(f"{PREFIX}/apps", list_apps)
+    app.router.add_post(f"{PREFIX}/apps", create_app)
+    app.router.add_post(f"{PREFIX}/apps/{{app_id}}/pages/{{page_id}}", write_app_page)
+    app.router.add_post(f"{PREFIX}/apps/{{app_id}}/pages/{{page_id}}/undo", undo_app_page)
     app.router.add_get(f"{PREFIX}/apps/{{app_id}}/pages/{{page_id}}", get_app_page)
     mirror_for_profiles(app, web)
     logger.info("memento: serving %s on the API server", PREFIX)

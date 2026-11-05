@@ -4476,3 +4476,72 @@ export async function clearDictations(
   })
   return dictationTotals((await response.json())?.stats)
 }
+
+function appsRoot(config: HermesConfig) {
+  return `${pluginRoot(config.baseUrl)}/apps`
+}
+
+function appPageRoot(config: HermesConfig, appId: string, pageId: string) {
+  return `${appsRoot(config)}/${encodeURIComponent(appId)}/pages/${encodeURIComponent(pageId)}`
+}
+
+/** An app the bot keeps (`apps.py`): its title and its page ids, the root first, never a source. */
+export interface HostApp {
+  id: string
+  title: string
+  libraryVersion: string
+  pages: string[]
+}
+
+export interface HostAppPage {
+  id: string
+  appId: string
+  source: string
+  undoable: boolean
+}
+
+function toHostApp(raw: Record<string, unknown>): HostApp {
+  return {
+    id: String(raw.id),
+    title: String(raw.title ?? ""),
+    libraryVersion: String(raw.library_version ?? ""),
+    pages: Array.isArray(raw.pages) ? raw.pages.map(String) : [],
+  }
+}
+
+function toHostAppPage(raw: Record<string, unknown>): HostAppPage {
+  return {
+    id: String(raw.id),
+    appId: String(raw.app_id),
+    source: String(raw.source ?? ""),
+    undoable: raw.undoable === true,
+  }
+}
+
+export async function listApps(config: HermesConfig, signal?: AbortSignal) {
+  const response = await request(appsRoot(config), { headers: headers(config), signal })
+  return objects((await response.json())?.apps, toHostApp)
+}
+
+/** One page of an app. A page or app that isn't there is a 404 `HermesError`. */
+export async function getAppPage(
+  config: HermesConfig,
+  appId: string,
+  pageId: string,
+  signal?: AbortSignal,
+) {
+  const response = await request(appPageRoot(config, appId, pageId), {
+    headers: headers(config),
+    signal,
+  })
+  return toHostAppPage((await response.json())?.page as Record<string, unknown>)
+}
+
+export async function undoAppPage(config: HermesConfig, appId: string, pageId: string) {
+  const response = await request(`${appPageRoot(config, appId, pageId)}/undo`, {
+    method: "POST",
+    headers: headers(config),
+    body: "{}",
+  })
+  return toHostAppPage((await response.json())?.page as Record<string, unknown>)
+}
