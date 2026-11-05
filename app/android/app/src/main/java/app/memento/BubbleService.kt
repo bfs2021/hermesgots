@@ -210,14 +210,16 @@ class BubbleService : Service() {
 
     private fun add() {
         val layout = WindowManager.LayoutParams(
-            px(56),
-            px(56),
+            px(BubbleView.MARK_DP),
+            px(BubbleView.MARK_DP),
             overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = metrics().widthPixels - px(72)
+            // Docked where a thumb reaches and where the app underneath still reads around it: the
+            // same gap the mark keeps when a drag snaps it back to this edge.
+            x = metrics().widthPixels - px(BubbleView.MARK_DP + BubbleView.EDGE_DP)
             y = metrics().heightPixels / 2
         }
         val view = BubbleView(this).apply {
@@ -347,7 +349,11 @@ class BubbleService : Service() {
 
     private fun snap(layout: WindowManager.LayoutParams) {
         val screen = metrics()
-        layout.x = if (layout.x + px(28) < screen.widthPixels / 2) px(8) else screen.widthPixels - px(64)
+        // The edge gap is the same one the mark is given when it first appears, on either side, so a
+        // drag never leaves it sitting closer to the glass than a restart would.
+        layout.x =
+            if (layout.x + px(BubbleView.MARK_DP / 2) < screen.widthPixels / 2) px(BubbleView.EDGE_DP)
+            else screen.widthPixels - px(BubbleView.MARK_DP + BubbleView.EDGE_DP)
         layout.y = layout.y.coerceIn(px(24), screen.heightPixels - px(96))
         push(layout)
     }
@@ -485,24 +491,44 @@ class BubbleService : Service() {
         forget()
     }
 
-    /** Words that landed say nothing: the field they landed in is the confirmation. */
+    /**
+     * A finished take, twice over: its words into the field in front where there is one, and the take
+     * into its bot's log either way.
+     *
+     * The log is the app's record of what a bot heard, and a take heard from another app's field is
+     * one of them. Nothing else can write that row: the app posts a row when a take lands in its own
+     * composer, which a Bubble take never touches.
+     */
     private fun land(answer: BubbleNet.Answer) {
+        val client = net ?: return
+        val id = UUID.randomUUID().toString()
         val landed = MementoAccessibilityService.live?.land(answer.text)
-        if (landed?.landed == true) return
-        keep(answer)
+        if (landed?.landed == true) {
+            // Nothing is said: the words are in the field, and the row is written behind them. On a
+            // thread of its own, because a host slow to take the row must not hold the first Piece of
+            // the next take — the upload queue is the take's, not the log's.
+            Thread(
+                { if (!client.record(id, answer)) keep(client.bot, id, answer) },
+                "memento-bubble-log",
+            ).start()
+            return
+        }
+        keep(client.bot, id, answer)
         // The phone's own reason where there is one — no field, a field that refused, no service —
         // and then where the words went instead.
         toast("${landed?.why ?: NO_TYPING} This take is saved in Gots.")
     }
 
-    /** The words go to the app when the phone has nowhere to put them, so a take is never lost. */
-    private fun keep(answer: BubbleNet.Answer) {
-        val chosen = net?.bot ?: return
+    /**
+     * The take is held for the page, which writes it — under this same id, so a row the host already
+     * has is not written twice — the next time the app is open.
+     */
+    private fun keep(bot: BubbleConfig.Bot, id: String, answer: BubbleNet.Answer) {
         BubbleConfig.keep(
             this,
             BubbleConfig.Kept(
                 at = System.currentTimeMillis(),
-                profileId = chosen.profileId,
+                profileId = bot.profileId,
                 text = answer.text,
                 heard = answer.heard,
                 ms = answer.ms,
@@ -510,7 +536,7 @@ class BubbleService : Service() {
                 cleaned = answer.cleaned,
                 provider = answer.provider,
                 model = answer.model,
-                id = UUID.randomUUID().toString(),
+                id = id,
             ),
         )
     }
@@ -612,14 +638,14 @@ class BubbleService : Service() {
 
     private fun resize(width: Int) {
         val layout = params ?: return
-        if (layout.width == width && layout.height == px(56)) return
+        if (layout.width == width && layout.height == px(BubbleView.MARK_DP)) return
         val screen = metrics()
         // The mark keeps the edge it is docked to: a pill on the right grows leftwards, so what
         // collapses back is the mark's own corner rather than a piece of the middle of the screen.
         val fromRight = layout.x + layout.width / 2 > screen.widthPixels / 2
         val right = layout.x + layout.width
         layout.width = width
-        layout.height = px(56)
+        layout.height = px(BubbleView.MARK_DP)
         layout.x = if (fromRight) right - width else layout.x
         layout.x = layout.x.coerceIn(0, (screen.widthPixels - width).coerceAtLeast(0))
         push(layout)
