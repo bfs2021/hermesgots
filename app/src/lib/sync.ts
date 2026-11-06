@@ -181,7 +181,31 @@ async function ensureInbox(dataKey: CryptoKey) {
     if (vault.inbox) {
       const stored = await inboxKey()
       if (stored?.keyId === vault.inbox.keyId) return
-      const key = await openInbox(dataKey, vault.inbox, inboxAad())
+      let key: CryptoKey
+      try {
+        key = await openInbox(dataKey, vault.inbox, inboxAad())
+      } catch (error) {
+        // The vault's own inbox won't open with this key. Only a key an unlock just proved is the
+        // vault's may replace it (hosts re-seal to the new one at their next check-in); any other
+        // could be a stale copy, and writing then would break the devices whose key is right.
+        if (!sessionKey) {
+          throw new Error(
+            "This device's key doesn't open the sync vault. Sign in again and unlock with the recovery code.",
+            { cause: error },
+          )
+        }
+        const next = await newInbox(dataKey, inboxAad())
+        if (await putDoc("vault", { ...vault, inbox: next.inbox }, etag)) {
+          await db.vault.put({
+            id: "inbox",
+            userId: id,
+            key: next.privateKey,
+            keyId: next.inbox.keyId,
+          })
+        }
+        await refreshVault()
+        continue
+      }
       await db.vault.put({ id: "inbox", userId: id, key, keyId: vault.inbox.keyId })
       return
     }
