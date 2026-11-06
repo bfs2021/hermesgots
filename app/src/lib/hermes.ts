@@ -4481,6 +4481,23 @@ function appsRoot(config: HermesConfig) {
   return `${pluginRoot(config.baseUrl)}/apps`
 }
 
+/**
+ * What a page's `Query` reads of the host: one of the four shapes the plugin's query route answers. A refusal is a
+ * `HermesError` carrying the host's own words and status.
+ */
+export async function queryApp(
+  config: HermesConfig,
+  shape: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const response = await request(`${appsRoot(config)}/query`, {
+    method: "POST",
+    headers: headers(config),
+    body: JSON.stringify({ shape, args }),
+  })
+  return (await response.json())?.value
+}
+
 function appPageRoot(config: HermesConfig, appId: string, pageId: string) {
   return `${appsRoot(config)}/${encodeURIComponent(appId)}/pages/${encodeURIComponent(pageId)}`
 }

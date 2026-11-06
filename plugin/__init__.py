@@ -1147,13 +1147,7 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
         # An empty list for a chat with none, never a 404: the app draws no chip and asks nothing more.
         return web.json_response({"object": platform_gots.OBJECT, "routines": found})
 
-    async def account_usage(request: "web.Request") -> "web.Response":
-        denied = unauthorized(request)
-        if denied is not None:
-            return denied
-        provider = (request.query.get("provider") or "").strip().lower()
-        if not provider:
-            return _error(web, "Missing provider", 400)
+    async def read_usage(provider: str) -> Dict[str, Any]:
         scope = profile_scope()
 
         def run():
@@ -1161,8 +1155,16 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
                 return usage.fetch(provider)
 
         result = await asyncio.to_thread(run)
-        if result is None:
-            result = {"provider": provider, "plan": None, "windows": []}
+        return result if result is not None else {"provider": provider, "plan": None, "windows": []}
+
+    async def account_usage(request: "web.Request") -> "web.Response":
+        denied = unauthorized(request)
+        if denied is not None:
+            return denied
+        provider = (request.query.get("provider") or "").strip().lower()
+        if not provider:
+            return _error(web, "Missing provider", 400)
+        result = await read_usage(provider)
         return web.json_response({"object": "memento.usage", **result})
 
     async def session_agents(request: "web.Request") -> "web.Response":
@@ -1238,10 +1240,7 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
             projects_db, session_db, clones.pending(home), repos.pending(home), projects.pins(home)
         )
 
-    async def list_projects(request: "web.Request") -> "web.Response":
-        denied = unauthorized(request)
-        if denied is not None:
-            return denied
+    async def read_projects() -> List[Dict[str, Any]]:
         from hermes_constants import get_hermes_home
 
         # Resolved here for the same reason as store_path().
@@ -1249,8 +1248,14 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
         projects_db = home / "projects.db"
         open_db = getattr(adapter, "_ensure_session_db_async", None)
         session_db = await open_db() if callable(open_db) else None
+        return await asyncio.to_thread(list_with_clones, home, projects_db, session_db)
+
+    async def list_projects(request: "web.Request") -> "web.Response":
+        denied = unauthorized(request)
+        if denied is not None:
+            return denied
         try:
-            rows = await asyncio.to_thread(list_with_clones, home, projects_db, session_db)
+            rows = await read_projects()
         except ImportError:
             return _error(web, "This Hermes version has no Projects.", 501)
         return web.json_response({"object": "memento.projects", "projects": rows})
@@ -3245,6 +3250,55 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
         rows = await asyncio.to_thread(apps.listing, store_path())
         return web.json_response({"object": "memento.apps", "apps": rows})
 
+    async def query_usage(args: Dict[str, Any]) -> Dict[str, Any]:
+        provider = str(args.get("provider") or "").strip().lower()
+        if not provider:
+            raise ValueError("usage needs a provider")
+        return await read_usage(provider)
+
+    async def query_projects(args: Dict[str, Any]) -> Dict[str, Any]:
+        return {"projects": await read_projects()}
+
+    async def query_routines(args: Dict[str, Any]) -> Dict[str, Any]:
+        return {"jobs": await asyncio.to_thread(_runs_by_job, None, DEFAULT_PER_JOB)}
+
+    async def query_sessions(args: Dict[str, Any]) -> Dict[str, Any]:
+        return {"sessions": await asyncio.to_thread(chats.read, store_path())}
+
+    async def query_app(request: "web.Request") -> "web.Response":
+        """A page's `Query` answered from the host's own reads (ADR 0102). Only a host shape is
+        answered; any other name is refused, so the route is never a way into another tool."""
+        denied = unauthorized(request)
+        if denied is not None:
+            return denied
+        sent = await json_body(request)
+        if sent is None:
+            return _error(web, "Body must be a JSON object", 400)
+        shape = sent.get("shape")
+        read = app_queries.get(shape) if isinstance(shape, str) else None
+        if read is None:
+            return _error(
+                web,
+                f"{shape!r} is not something the bot can read. Ask for one of: "
+                + ", ".join(app_queries),
+                400,
+            )
+        args = sent.get("args")
+        try:
+            value = await read(args if isinstance(args, dict) else {})
+        except ValueError as error:
+            return _error(web, str(error), 400)
+        except ImportError:
+            return _error(web, f"This Hermes version cannot answer {shape}.", 501)
+        return web.json_response({"object": "memento.app.query", "shape": shape, "value": value})
+
+    app_queries = {
+        "usage": query_usage,
+        "routines": query_routines,
+        "projects": query_projects,
+        "sessions": query_sessions,
+    }
+
     async def get_app_page(request: "web.Request") -> "web.Response":
         denied = unauthorized(request)
         if denied is not None:
@@ -3356,6 +3410,7 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
         )
 
     app.router.add_get(f"{PREFIX}/apps", list_apps)
+    app.router.add_post(f"{PREFIX}/apps/query", query_app)
     app.router.add_post(f"{PREFIX}/apps", create_app)
     app.router.add_post(f"{PREFIX}/apps/builds", mark_app_build)
     app.router.add_post(f"{PREFIX}/apps/{{app_id}}/pages/{{page_id}}", write_app_page)
