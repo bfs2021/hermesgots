@@ -5,6 +5,7 @@ import { changeOf, changePrompt, pagesOf, streamedSource } from "@/lib/app-build
 import { connectionKey } from "@/lib/connection"
 import { db, getActiveProfile, type Profile } from "@/lib/db"
 import {
+  agreeAppTools,
   createApp,
   followRun,
   getAppPage,
@@ -17,6 +18,8 @@ import {
   writeAppPage,
   type HostApp,
   type HostAppPage,
+  type HostAppTools,
+  toTools,
 } from "@/lib/hermes"
 import { usePoll } from "@/lib/poll"
 import { createStore } from "@/lib/store"
@@ -61,6 +64,13 @@ const keepList = (profile: Profile, apps: HostApp[]) => {
     .catch(warn("cache the apps"))
 }
 
+/** An app kept by a build that didn't know tools: nothing agreed and nothing to ask. */
+const withTools = (app: HostApp): HostApp => ({
+  ...app,
+  tools: toTools(app.tools),
+  pending: toTools(app.pending),
+})
+
 const listed = createStore<Listed | undefined>(undefined)
 const reading = new Map<string, Promise<void>>()
 
@@ -71,10 +81,13 @@ export const useActiveProfile = () =>
 const wordsOf = (error: unknown) =>
   error instanceof Error ? error.message : "Couldn't reach the bot."
 
-/** Reads the bot's apps once however many screens ask at the same time. */
-function refreshApps(profile: Profile) {
+/**
+ * Reads the bot's apps once however many screens ask at the same time. A read already under way may
+ * have left before a page was written, so `after` a write asks again once it lands.
+ */
+function refreshApps(profile: Profile, after = false): Promise<void> {
   const joined = reading.get(profile.id)
-  if (joined) return joined
+  if (joined) return after ? joined.then(() => refreshApps(profile)) : joined
   const read = listApps(profile)
     .then((apps) => {
       keepList(profile, apps)
@@ -83,7 +96,7 @@ function refreshApps(profile: Profile) {
     .catch(async (failure) => {
       const kept = listed.get()
       const held = kept?.profileId === profile.id ? kept.apps : undefined
-      const apps = held ?? (await db.appCache.get(listKey(profile)))?.apps
+      const apps = held ?? (await db.appCache.get(listKey(profile)))?.apps?.map(withTools)
       listed.set({ profileId: profile.id, apps, error: wordsOf(failure), offline: Boolean(apps) })
     })
     .finally(() => reading.delete(profile.id))
@@ -184,6 +197,12 @@ export async function saveApp(profile: Profile, title: string, pages: string[]) 
   return app
 }
 
+/** Agrees to what an app's pages now name beyond its list, then reads the apps again so the ask goes away. */
+export async function agreeToTools(profile: Profile, appId: string, tools: HostAppTools) {
+  await agreeAppTools(profile, appId, tools)
+  await refreshApps(profile)
+}
+
 /** The active bot's apps, newest first, read from its host and kept fresh while a screen holds them. */
 export function useApps() {
   const profile = useActiveProfile()
@@ -194,11 +213,12 @@ export function useApps() {
 }
 
 /**
- * The tools a page's `Query` calls, answered by the host's query route. A read the host refused or
+ * The tools a page's `Query` calls, answered by the host's query route for this app, which refuses
+ * any tool the app was never agreed to. A read the host refused or
  * failed answers `{ error }`, which the page draws; a host that cannot be reached throws, so the
  * page keeps the defaults it declared.
  */
-export function appTools(profile: Profile, read: typeof queryApp = queryApp) {
+export function appTools(profile: Profile, appId: string, read: typeof queryApp = queryApp) {
   return {
     async callTool({
       name,
@@ -208,7 +228,10 @@ export function appTools(profile: Profile, read: typeof queryApp = queryApp) {
       arguments?: Record<string, unknown>
     }) {
       try {
-        return { content: [], structuredContent: (await read(profile, name, args ?? {})) ?? null }
+        return {
+          content: [],
+          structuredContent: (await read(profile, appId, name, args ?? {})) ?? null,
+        }
       } catch (failure) {
         if (failure instanceof HermesError && failure.status !== undefined)
           return { content: [], structuredContent: { error: failure.message } }
@@ -255,6 +278,7 @@ export function useAppPage(appId: string, pageId: string | undefined) {
     const page = await undoAppPage(profile, appId, pageId)
     keepPage(profile, appId, page)
     setRead({ key, page })
+    void refreshApps(profile, true)
   }, [profile, appId, pageId, key])
   const [draft, setDraft] = useState<string>()
   const change = useCallback(
@@ -264,6 +288,7 @@ export function useAppPage(appId: string, pageId: string | undefined) {
         const page = await changePage(profile, appId, pageId, source, request, setDraft, signal)
         keepPage(profile, appId, page)
         setRead({ key, page })
+        void refreshApps(profile, true)
       } finally {
         setDraft(undefined)
       }
