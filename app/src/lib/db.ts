@@ -7,7 +7,16 @@ import { BOTS, LEGACY_BOT_IDS } from "@/components/bots"
 import { connectionKey, hasServer } from "@/lib/connection"
 import { mediaKeyPrefix } from "@/lib/media-key"
 import { forgetRead } from "@/lib/read-marks"
-import type { Compaction, ModelChange, Move, ProviderUsage, Skill, Tidied } from "@/lib/hermes"
+import type {
+  Compaction,
+  HostApp,
+  HostAppPage,
+  ModelChange,
+  Move,
+  ProviderUsage,
+  Skill,
+  Tidied,
+} from "@/lib/hermes"
 import type { SessionPipeline } from "@/lib/pipeline"
 import type { PromptEntry } from "@/lib/prompt-library"
 import type { SpeechSettings } from "@/lib/speech"
@@ -753,6 +762,18 @@ export interface SpeechCacheRow {
 }
 
 /**
+ * What this device last read of a bot's apps, so an app opens with the host away: one row for the
+ * list and one for each page read. It is this device's own copy: nothing syncs it.
+ */
+export interface AppCacheRow {
+  /** `<connectionKey>\napps` for the list, `<connectionKey>\n<appId>/<pageId>` for a page. */
+  key: string
+  connection: string
+  apps?: HostApp[]
+  page?: HostAppPage
+}
+
+/**
  * A meeting being recorded in the app, kept on the device as it records (a chunk every few
  * seconds), so a page closed mid-meeting loses at most the last few seconds. It goes once the host
  * has the recording, or when the user discards it.
@@ -964,6 +985,7 @@ export const db = new Dexie("memento") as Dexie & {
   mediaCache: EntityTable<MediaCacheRow, "key">
   speechCache: EntityTable<SpeechCacheRow, "key">
   netLog: EntityTable<NetRequest, "id">
+  appCache: EntityTable<AppCacheRow, "key">
 }
 
 db.version(1).stores({
@@ -1283,6 +1305,10 @@ db.version(33).upgrade((tx) =>
     }),
 )
 
+// v34: the apps a bot's host listed and the pages read from it, kept on the device so an app opens
+// with the host away. A new table: nothing older has to be moved into it.
+db.version(34).stores({ appCache: "key, connection" })
+
 db.on("populate", (tx) => seedProfile(tx))
 
 /**
@@ -1431,6 +1457,7 @@ export async function deleteProfile(id: string, { remote = false, last = false }
     db.meetingRecordings,
     db.mediaCache,
     db.speechCache,
+    db.appCache,
     db.netLog,
   ]
   return db.transaction("rw", tables, async () => {
@@ -1455,6 +1482,7 @@ export async function deleteProfile(id: string, { remote = false, last = false }
       await db.dictationStats.delete(key)
       await db.mediaCache.where("key").startsWith(mediaKeyPrefix(profile.baseUrl)).delete()
       await db.speechCache.delete(key)
+      await db.appCache.where("connection").equals(key).delete()
       // Its requests go with it: every row that names this bot, including the ones a twin on the same
       // server shares with it.
       await db.netLog.where("bots").equals(id).delete()
@@ -1606,6 +1634,7 @@ export async function clearAllData() {
     db.sentFiles,
     db.mediaCache,
     db.speechCache,
+    db.appCache,
     db.netLog,
   ]
   await db.transaction("rw", tables, async () => {

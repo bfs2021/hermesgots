@@ -1,8 +1,9 @@
 import { useCallback, useState } from "react"
 import { useLiveQuery } from "dexie-react-hooks"
 
-import { getActiveProfile, type Profile } from "@/lib/db"
 import { changeOf, changePrompt, pagesOf, streamedSource } from "@/lib/app-build"
+import { connectionKey } from "@/lib/connection"
+import { db, getActiveProfile, type Profile } from "@/lib/db"
 import {
   createApp,
   followRun,
@@ -22,7 +23,42 @@ import { createStore } from "@/lib/store"
 /** How often a screen holding apps reads them again, so a page written elsewhere draws. */
 const LIST_MS = 30_000
 
-type Listed = { profileId: string; apps?: HostApp[]; error?: string }
+type Listed = { profileId: string; apps?: HostApp[]; error?: string; offline?: boolean }
+
+const listKey = (profile: Profile) => `${connectionKey(profile)}\napps`
+const pageKey = (profile: Profile, appId: string, pageId: string) =>
+  `${connectionKey(profile)}\n${appId}/${pageId}`
+
+const warn = (what: string) => (failure: unknown) =>
+  console.warn(`[memento] Couldn't ${what}:`, failure)
+
+/** Keeps a page the host answered; a device whose storage refuses it still draws what it just read. */
+const keepPage = (profile: Profile, appId: string, page: HostAppPage) =>
+  void db.appCache
+    .put({ key: pageKey(profile, appId, page.id), connection: connectionKey(profile), page })
+    .catch(warn("cache the page"))
+
+/**
+ * Keeps the list the host answered, and drops the cached pages it no longer names, so an app or
+ * page deleted on the host isn't drawn offline from this device's copy.
+ */
+const keepList = (profile: Profile, apps: HostApp[]) => {
+  const connection = connectionKey(profile)
+  const named = new Set([
+    listKey(profile),
+    ...apps.flatMap((app) => app.pages.map((page) => pageKey(profile, app.id, page))),
+  ])
+  void db
+    .transaction("rw", db.appCache, async () => {
+      await db.appCache.put({ key: listKey(profile), connection, apps })
+      await db.appCache
+        .where("connection")
+        .equals(connection)
+        .filter((row) => !named.has(row.key))
+        .delete()
+    })
+    .catch(warn("cache the apps"))
+}
 
 const listed = createStore<Listed | undefined>(undefined)
 const reading = new Map<string, Promise<void>>()
@@ -38,11 +74,15 @@ function refreshApps(profile: Profile) {
   const joined = reading.get(profile.id)
   if (joined) return joined
   const read = listApps(profile)
-    .then((apps) => listed.set({ profileId: profile.id, apps }))
-    .catch((failure) => {
+    .then((apps) => {
+      keepList(profile, apps)
+      listed.set({ profileId: profile.id, apps })
+    })
+    .catch(async (failure) => {
       const kept = listed.get()
-      const apps = kept?.profileId === profile.id ? kept.apps : undefined
-      listed.set({ profileId: profile.id, apps, error: wordsOf(failure) })
+      const held = kept?.profileId === profile.id ? kept.apps : undefined
+      const apps = held ?? (await db.appCache.get(listKey(profile)))?.apps
+      listed.set({ profileId: profile.id, apps, error: wordsOf(failure), offline: Boolean(apps) })
     })
     .finally(() => reading.delete(profile.id))
   reading.set(profile.id, read)
@@ -136,7 +176,9 @@ export async function saveApp(profile: Profile, title: string, pages: string[]) 
   const app = await createApp(profile, title, pages)
   const kept = listed.get()
   const apps = kept?.profileId === profile.id ? (kept.apps ?? []) : []
-  listed.set({ profileId: profile.id, apps: [app, ...apps.filter((one) => one.id !== app.id)] })
+  const next = [app, ...apps.filter((one) => one.id !== app.id)]
+  keepList(profile, next)
+  listed.set({ profileId: profile.id, apps: next })
   return app
 }
 
@@ -146,7 +188,7 @@ export function useApps() {
   const state = listed.use()
   usePoll(() => profile && void refreshApps(profile), LIST_MS, [profile?.id])
   const mine = state && state.profileId === profile?.id ? state : undefined
-  return { apps: mine?.apps, error: mine?.error, loaded: Boolean(mine) }
+  return { apps: mine?.apps, error: mine?.error, offline: mine?.offline, loaded: Boolean(mine) }
 }
 
 export function useAppPage(appId: string, pageId: string | undefined) {
@@ -157,16 +199,24 @@ export function useAppPage(appId: string, pageId: string | undefined) {
     page?: HostAppPage
     error?: string
     missing?: boolean
+    offline?: boolean
   }>()
   usePoll(
     (signal) => {
       if (!profile || !pageId) return
       getAppPage(profile, appId, pageId, signal)
-        .then((page) => setRead({ key, page }))
-        .catch((failure) => {
+        .then((page) => {
+          keepPage(profile, appId, page)
+          setRead({ key, page })
+        })
+        .catch(async (failure) => {
           if (signal.aborted) return
           const missing = failure instanceof HermesError && failure.status === 404
-          setRead({ key, error: wordsOf(failure), missing })
+          const cached = pageKey(profile, appId, pageId)
+          if (missing) void db.appCache.delete(cached).catch(warn("forget the page"))
+          const page = missing ? undefined : (await db.appCache.get(cached))?.page
+          if (signal.aborted) return
+          setRead({ key, page, offline: Boolean(page), error: wordsOf(failure), missing })
         })
     },
     LIST_MS,
@@ -175,7 +225,9 @@ export function useAppPage(appId: string, pageId: string | undefined) {
   const current = read?.key === key ? read : undefined
   const undo = useCallback(async () => {
     if (!profile || !pageId) return
-    setRead({ key, page: await undoAppPage(profile, appId, pageId) })
+    const page = await undoAppPage(profile, appId, pageId)
+    keepPage(profile, appId, page)
+    setRead({ key, page })
   }, [profile, appId, pageId, key])
   const [draft, setDraft] = useState<string>()
   const change = useCallback(
@@ -183,6 +235,7 @@ export function useAppPage(appId: string, pageId: string | undefined) {
       if (!profile || !pageId) return
       try {
         const page = await changePage(profile, appId, pageId, source, request, setDraft, signal)
+        keepPage(profile, appId, page)
         setRead({ key, page })
       } finally {
         setDraft(undefined)
@@ -194,6 +247,7 @@ export function useAppPage(appId: string, pageId: string | undefined) {
     page: current?.page,
     error: current?.error,
     missing: current?.missing,
+    offline: current?.offline,
     undo,
     change,
     draft,
