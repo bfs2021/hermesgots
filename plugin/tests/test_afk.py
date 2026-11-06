@@ -53,6 +53,7 @@ from plugin.afk import (
 from plugin.store import connect, db_path, get_setting, put_setting
 from plugin.tasks import CLAIM_LABEL, READY_LABEL
 from plugin.tests._helpers import (
+    hermes_secret_scope,
     issue_row,
     placed,
     preset,
@@ -2413,6 +2414,8 @@ class SessionTests(unittest.TestCase):
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
+        # The home's key reaches the plugin through Hermes's secret scope, never its own read.
+        hermes_secret_scope(self)
         self.home.joinpath("projects.db").write_text("")
         (self.home / "checkout" / ".git").mkdir(parents=True)
         self.task = {
