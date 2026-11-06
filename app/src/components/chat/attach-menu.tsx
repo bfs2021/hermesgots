@@ -147,7 +147,6 @@ export function AttachMenu({
               <h3 className="px-1 text-sm text-muted-foreground">Mode</h3>
               <ModeOptions
                 mode={session.mode}
-                autoAvailable={session.autoAvailable}
                 onPick={pickMode}
               />
             </section>
