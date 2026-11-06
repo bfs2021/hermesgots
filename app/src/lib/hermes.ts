@@ -1173,18 +1173,20 @@ const pickOf = (value: unknown) => picks([value])[0] ?? null
 
 /**
  * The model a bot's delegated tasks run on, from its host's `delegation` section (Hermes's own
- * `delegation.model`); `null` when a child inherits the bot's own model. Newer plugin only; a host
+ * `delegation.model`); `null` when a child inherits the bot's own model, with `custom` set when
+ * that is because the section points at an endpoint written by hand. Newer plugin only; a host
  * without the route answers 404.
  */
 export async function getDelegationModel(
   config: HermesConfig,
   signal?: AbortSignal,
-): Promise<ModelChoice | null> {
+): Promise<{ pick: ModelChoice | null; custom: boolean }> {
   const response = await request(`${pluginRoot(config.baseUrl)}/delegation`, {
     headers: headers(config),
     signal,
   })
-  return pickOf((await response.json())?.delegation)
+  const body = await response.json()
+  return { pick: pickOf(body?.delegation), custom: body?.custom === true }
 }
 
 /** Makes `pick` the model the bot's delegated tasks run on; `null` clears it, so a child inherits
@@ -1337,17 +1339,31 @@ export async function setSttSetting(
   return readStt(((await response.json())?.stt ?? null) as unknown)
 }
 
-/**
- * The settings on this bot's own Hermes that its Dashboard's Config > General tab shows
- * (`general.py`): the keys, the kinds, the values the file holds and the host's default for each.
- * The app draws the rows it is given; `general-settings.ts` is the shape.
- */
-export async function getGeneralSettings(config: HermesConfig, signal?: AbortSignal) {
-  const response = await request(`${pluginRoot(config.baseUrl)}/general`, {
+// `/delegation` is the subagent model's own route, so the tab's path is separate.
+export const GENERAL_ROUTES = {
+  general: { path: "general", field: "general", label: "General" },
+  delegation: { path: "delegation-settings", field: "delegation", label: "Delegation" },
+} as const satisfies Record<string, { path: string; field: string; label: string }>
+
+export type GeneralTab = keyof typeof GENERAL_ROUTES
+
+export const isGeneralTab = (tab: string): tab is GeneralTab => tab in GENERAL_ROUTES
+
+async function generalBlock(
+  config: HermesConfig,
+  tab: GeneralTab,
+  init: Omit<RequestInit, "headers">,
+) {
+  const { path, field } = GENERAL_ROUTES[tab]
+  const response = await request(`${pluginRoot(config.baseUrl)}/${path}`, {
+    ...init,
     headers: headers(config),
-    signal,
   })
-  return readGeneral(((await response.json())?.general ?? null) as unknown)
+  return readGeneral(((await response.json())?.[field] ?? null) as unknown)
+}
+
+export function getGeneralSettings(config: HermesConfig, tab: GeneralTab, signal?: AbortSignal) {
+  return generalBlock(config, tab, { signal })
 }
 
 /**
@@ -1355,19 +1371,14 @@ export async function getGeneralSettings(config: HermesConfig, signal?: AbortSig
  * takes, or `null` to clear it back to the host's default — and answers the host's fresh block. The
  * host refuses a key the page may not write, and its own sentence is what the page shows.
  */
-export async function setGeneralSetting(
+export function setGeneralSetting(
   config: HermesConfig,
+  tab: GeneralTab,
   key: string,
   value: unknown,
   signal?: AbortSignal,
 ) {
-  const response = await request(`${pluginRoot(config.baseUrl)}/general`, {
-    method: "POST",
-    headers: headers(config),
-    body: JSON.stringify({ key, value }),
-    signal,
-  })
-  return readGeneral(((await response.json())?.general ?? null) as unknown)
+  return generalBlock(config, tab, { method: "POST", body: JSON.stringify({ key, value }), signal })
 }
 
 /**

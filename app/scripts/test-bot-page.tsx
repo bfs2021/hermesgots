@@ -36,6 +36,51 @@ import {
 /** General draws the host's Subagent model only where its plugin advertises the override. */
 const FEATURES = ["delegation_model"]
 
+const DELEGATION = {
+  fields: [
+    { key: "delegation.backend", kind: "string" as const, section: "" },
+    { key: "delegation.compression_threshold_tokens", kind: "number" as const, section: "" },
+    { key: "delegation.inherit_mcp_toolsets", kind: "boolean" as const, section: "" },
+    { key: "delegation.max_iterations", kind: "number" as const, section: "" },
+    { key: "delegation.max_summary_chars", kind: "number" as const, section: "" },
+    { key: "delegation.child_timeout_seconds", kind: "number" as const, section: "" },
+    {
+      key: "delegation.reasoning_effort",
+      kind: "select" as const,
+      section: "",
+      options: ["", "low", "high"],
+    },
+    { key: "delegation.max_concurrent_children", kind: "number" as const, section: "" },
+    { key: "delegation.independent_completions", kind: "boolean" as const, section: "" },
+    { key: "delegation.max_spawn_depth", kind: "number" as const, section: "" },
+    { key: "delegation.orchestrator_enabled", kind: "boolean" as const, section: "" },
+    { key: "delegation.oneshot_max_children", kind: "number" as const, section: "" },
+    { key: "delegation.subagent_auto_approve", kind: "boolean" as const, section: "" },
+    {
+      key: "delegation.surface_child_process_notifications",
+      kind: "boolean" as const,
+      section: "",
+    },
+  ],
+  values: {},
+  defaults: {
+    "delegation.backend": "default",
+    "delegation.compression_threshold_tokens": 0,
+    "delegation.inherit_mcp_toolsets": true,
+    "delegation.max_iterations": 250,
+    "delegation.max_summary_chars": 24000,
+    "delegation.child_timeout_seconds": 0,
+    "delegation.reasoning_effort": "",
+    "delegation.max_concurrent_children": 10,
+    "delegation.independent_completions": false,
+    "delegation.max_spawn_depth": 1,
+    "delegation.orchestrator_enabled": true,
+    "delegation.oneshot_max_children": 2,
+    "delegation.subagent_auto_approve": false,
+    "delegation.surface_child_process_notifications": false,
+  },
+}
+
 function LivePage() {
   const { tab, sub } = useParams()
   const profile = useLiveQuery(() => db.profiles.get("bot-1"), [])
@@ -78,6 +123,8 @@ function host({
   away = false,
   level = "normal" as string | null,
   refuse,
+  noDelegation = false,
+  customDelegation = false,
 }: {
   features?: string[]
   version?: string | null
@@ -90,6 +137,10 @@ function host({
   level?: string | null
   /** A level this host won't take, as a plugin from before the four names won't take Quiet. */
   refuse?: string
+  /** A host whose schema carries no delegation category, so its page can't be read. */
+  noDelegation?: boolean
+  /** A host whose delegation section points at an endpoint written by hand. */
+  customDelegation?: boolean
 } = {}) {
   const calls: Sent[] = []
   const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -101,8 +152,15 @@ function host({
       return away
         ? json({ error: { message: "Not home." } }, 503)
         : json({ name: "memento", version, features })
+    if (url.pathname.endsWith("/plugins/memento/delegation-settings"))
+      return noDelegation
+        ? json({ error: { message: "No delegation category." } }, 501)
+        : json({ object: "memento.delegation_settings", delegation: DELEGATION })
     if (url.pathname.endsWith("/plugins/memento/delegation"))
-      return json({ delegation: body ? body.delegation : null })
+      return json({
+        delegation: body ? body.delegation : null,
+        ...(customDelegation && !body ? { custom: true } : {}),
+      })
     if (url.pathname.endsWith("/api/model/options"))
       return json({
         model: "own-model",
@@ -226,11 +284,9 @@ test("General is the bot's own switches, then Bot Profile over its card, then it
       ["name", "image", "reminders"],
       "what the bot is called, how it looks, and how often it says what it is doing",
     )
-    assert.equal(caption("Hermes")?.textContent?.trim(), "Hermes", "then its Hermes's caption")
-    assert.deepEqual(
-      rowsIn("Hermes"),
-      ["subagent-model"],
-      "a linked bot has only the model every subagent runs on",
+    assert.ok(
+      !caption("Hermes"),
+      "a linked bot's server is the host's, and the subagent model is on the Delegation page",
     )
     assert.ok(
       !caption("Gots Specific Settings"),
@@ -244,8 +300,6 @@ test("General is the bot's own switches, then Bot Profile over its card, then it
       "Bot Profile",
       "Name",
       "Image",
-      "Hermes",
-      "Subagent model",
     ]
     assert.ok(
       order.every((one) => at(one) >= 0),
@@ -286,10 +340,7 @@ test("every setting is a title over the line saying what it is for, and the valu
       rowText("test").startsWith("Test connectionAsk this bot's server how it is"),
       "Test connection says what the button does",
     )
-    assert.ok(
-      rowText("subagent-model").startsWith("Subagent modelThe model every subagent runs on"),
-      "Subagent model says which model it picks",
-    )
+    absent('[data-setting="subagent-model"]', "the subagent model is not on the bot's page")
     assert.ok(
       rowText("server-key").startsWith("Server keyThe key this app sends to that server"),
       "Server key says what the key is for",
@@ -333,16 +384,15 @@ test("an unlinked bot is asked for its Hermes's address and key, and a linked on
     absent('[data-setting="base-url"]', "the host knows its address")
     absent('[data-setting="server-key"]', "and holds the key")
     assert.ok(find("#enabled"), "while the bot can still be switched on and off")
-    assert.ok(!caption("Hermes"), "a Hermes card with no row draws no caption at all")
+    assert.ok(!caption("Hermes"), "a linked bot has no Hermes card at all")
     assert.ok(caption("Bot Profile"), "and the rest of General is still there")
   })
 })
 
-test("the Hermes card is there once it has a row, linked or not", async () => {
+test("the Hermes card is the unlinked bot's own address and key, and a linked bot has none", async () => {
   await seed("general-delegation", { hostId: "host-1" })
   await mount(general(), async () => {
-    assert.ok(caption("Hermes"), "the delegation row earns its caption")
-    assert.deepEqual(rowsIn("Hermes"), ["subagent-model"], "and the row it holds")
+    assert.ok(!caption("Hermes"), "a linked bot has no row for one, with or without the feature")
   })
 
   await seed("general-address", {}, [])
@@ -454,9 +504,41 @@ test("the Image row opens the bot characters as a sheet, and a pick is written",
   })
 })
 
-test("the Subagent model row opens the host's models, and a pick is written to the host", async () => {
-  const calls = await seed("general-subagent-pick", { hostId: "host-1" })
-  await mount(general(), async () => {
+test("a host that refuses the Delegation page says so, and draws no Subagent row", async () => {
+  await seed("general-no-delegation", { hostId: "host-1" }, [...FEATURES, "delegation_page"], {
+    noDelegation: true,
+  })
+  await mount(general("/settings/bots/bot-1/delegation"), async () => {
+    await until(async () => Boolean(find('[role="alert"]')), "the refusal to be said")
+    assert.equal(find('[role="alert"]')?.textContent, "No delegation category.")
+    absent('[data-setting="subagent-model"]', "and no row is drawn over a page that can't be read")
+  })
+})
+
+test("a delegation section pointing at a hand-written endpoint reads Custom", async () => {
+  await seed("general-custom-delegation", { hostId: "host-1" }, [...FEATURES, "delegation_page"], {
+    customDelegation: true,
+  })
+  await mount(general("/settings/bots/bot-1/delegation"), async () => {
+    await until(async () => Boolean(row("subagent-model")), "the Delegation page's first row")
+    assert.equal(accent("subagent-model"), "Custom", "an endpoint the host runs on says Custom")
+  })
+})
+
+test("the Delegation page's Subagent model row opens the host's models, and a pick is written to the host", async () => {
+  const calls = await seed("general-subagent-pick", { hostId: "host-1" }, [
+    ...FEATURES,
+    "delegation_page",
+  ])
+  await mount(general("/settings/bots/bot-1/delegation"), async () => {
+    await until(async () => Boolean(row("subagent-model")), "the Delegation page's first row")
+    assert.deepEqual(
+      [...(find("[data-bot-delegation]")?.querySelectorAll("[data-setting]") ?? [])].map((one) =>
+        one.getAttribute("data-setting"),
+      ),
+      ["subagent-model", ...DELEGATION.fields.map((field) => field.key)],
+      "the model leads, then the host's own keys, with no caption between",
+    )
     assert.equal(accent("subagent-model"), "Default model", "nothing set says Default model")
 
     await openPick("subagent-model")

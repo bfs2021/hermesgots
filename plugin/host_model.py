@@ -221,7 +221,7 @@ def set_delegation(config_path: Path, pick: Optional[Dict[str, str]]) -> Optiona
         atomic_roundtrip_yaml_update(config_path, DELEGATION_SECTION, rest or None)
         return None
     stored = _named(section)
-    if stored["provider"] and stored["model"] and stored == pick:
+    if stored["provider"] and stored["model"] and stored == pick and not _pins_endpoint(section):
         # Hermes resolved it when it went in, so there is nothing left to check, and checking again
         # would spend a live provider probe on a pick that hasn't moved.
         return stored
@@ -238,6 +238,14 @@ def read_delegation(config_path: Path) -> Optional[Dict[str, str]]:
     from gateway.run import _load_gateway_config
 
     return _delegation_of(_load_gateway_config(config_path=config_path) or {})
+
+
+def delegation_is_custom(config_path: Path) -> bool:
+    """Whether the delegation section points at an endpoint written by hand, which is why
+    ``read_delegation`` has no pick to give: the bot's settings say Custom rather than a model."""
+    from gateway.run import _load_gateway_config
+
+    return _pins_endpoint(_section_of(_load_gateway_config(config_path=config_path) or {}))
 
 
 def read_main(config_path: Path) -> Optional[Dict[str, str]]:
@@ -266,6 +274,11 @@ def read_main(config_path: Path) -> Optional[Dict[str, str]]:
     return {"provider": main["provider"], "model": main["model"]}
 
 
+def _pins_endpoint(section: Dict[str, Any]) -> bool:
+    # A blank value pins nothing.
+    return any(str(section.get(key) or "").strip() for key in ENDPOINT_KEYS)
+
+
 def _delegation_of(cfg: Dict[str, Any]) -> Optional[Dict[str, str]]:
     """The section's pick, as the bot's settings name it. Hermes fills a half-written section from
     the bot's own route — a model alone runs where the bot's credentials point, a provider alone
@@ -274,7 +287,7 @@ def _delegation_of(cfg: Dict[str, Any]) -> Optional[Dict[str, str]]:
     section runs somewhere no provider and model here would describe.
     """
     section = _section_of(cfg)
-    if any(key in section for key in ENDPOINT_KEYS):
+    if _pins_endpoint(section):
         return None
     written = _named(section)
     if not written["provider"] and not written["model"]:

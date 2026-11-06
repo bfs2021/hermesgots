@@ -3571,6 +3571,40 @@ const GENERAL_DEFAULTS = {
   "updates.check": true,
   "updates.pre_update_backup": "quick",
 }
+const DELEGATION_FIELDS = [
+  { key: "delegation.backend", kind: "string", section: "" },
+  { key: "delegation.compression_threshold_tokens", kind: "number", section: "" },
+  { key: "delegation.inherit_mcp_toolsets", kind: "boolean", section: "" },
+  { key: "delegation.max_iterations", kind: "number", section: "" },
+  { key: "delegation.max_summary_chars", kind: "number", section: "" },
+  { key: "delegation.child_timeout_seconds", kind: "number", section: "" },
+  { key: "delegation.reasoning_effort", kind: "select", section: "", options: ["", "low", "medium", "high"], note: "Reasoning effort for delegated subagents" },
+  { key: "delegation.max_concurrent_children", kind: "number", section: "" },
+  { key: "delegation.independent_completions", kind: "boolean", section: "" },
+  { key: "delegation.max_spawn_depth", kind: "number", section: "" },
+  { key: "delegation.orchestrator_enabled", kind: "boolean", section: "" },
+  { key: "delegation.oneshot_max_children", kind: "number", section: "" },
+  { key: "delegation.subagent_auto_approve", kind: "boolean", section: "" },
+  { key: "delegation.surface_child_process_notifications", kind: "boolean", section: "" },
+]
+const DELEGATION_DEFAULTS = {
+  "delegation.backend": "default",
+  "delegation.compression_threshold_tokens": 0,
+  "delegation.inherit_mcp_toolsets": true,
+  "delegation.max_iterations": 250,
+  "delegation.max_summary_chars": 24000,
+  "delegation.child_timeout_seconds": 0,
+  "delegation.reasoning_effort": "",
+  "delegation.max_concurrent_children": 10,
+  "delegation.independent_completions": false,
+  "delegation.max_spawn_depth": 1,
+  "delegation.orchestrator_enabled": true,
+  "delegation.oneshot_max_children": 2,
+  "delegation.subagent_auto_approve": false,
+  "delegation.surface_child_process_notifications": false,
+}
+const delegationValues = new Map()
+
 const GENERAL_FIELDS = [
   {
     key: "model_context_length",
@@ -4193,6 +4227,7 @@ http
           "host_model",
           "fallbacks",
           "delegation_model",
+          "delegation_page",
           ...(TRIAGE !== "off" ? ["triage_model"] : []),
           ...(SKILLS ? ["skills", "skills_write", "skills_remove", "skills_view"] : []),
           "queue",
@@ -4835,6 +4870,28 @@ http
             model_context_length: 200000,
           },
           defaults: GENERAL_DEFAULTS,
+        },
+      })
+    }
+    if (PLUGIN && !profile && url.pathname === "/api/plugins/memento/delegation-settings") {
+      const key = pluginProfile ?? ""
+      if (req.method === "POST") {
+        const body = await readBody(req)
+        if (!body || !DELEGATION_FIELDS.some((field) => field.key === body.key))
+          return json(res, 400, {
+            error: { message: `${body?.key} isn't a setting this page can write.` },
+          })
+        const held = { ...(delegationValues.get(key) ?? {}) }
+        if (body.value === null) delete held[body.key]
+        else held[body.key] = body.value
+        delegationValues.set(key, held)
+      }
+      return json(res, 200, {
+        object: "memento.delegation_settings",
+        delegation: {
+          fields: DELEGATION_FIELDS,
+          values: delegationValues.get(key) ?? {},
+          defaults: DELEGATION_DEFAULTS,
         },
       })
     }
