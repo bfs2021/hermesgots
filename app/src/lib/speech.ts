@@ -331,13 +331,19 @@ export function marked(row: SpeechModel): string | null {
   return null
 }
 
+/** An answer to a write or a probe, keeping the held `stt` block where the host left it out. */
+export function keepStt(fresh: SpeechSettings, held?: SpeechSettings): SpeechSettings {
+  if (fresh.stt || !held?.stt) return fresh
+  return { ...fresh, stt: held.stt }
+}
+
 /**
  * The line under the picker's rows: what this host measured, what it is doing about having none,
  * or another machine's measurement named rather than drawn as this one's.
  */
 export function probeNote(probe: SpeechProbe | undefined, measuring = false): string | null {
   if (!probe) return null
-  if (measuring) return "Measuring this host's hearing…"
+  if (measuring) return "Timing this host's speech models…"
   // A host that owes nothing has already said it: every row carries its own measurement, so the
   // sheet says nothing under them rather than captioning numbers as this host's.
   if (!probe.owed) return null
