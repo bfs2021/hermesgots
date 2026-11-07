@@ -18,6 +18,7 @@ from plugin.store import db_path
 from plugin.tests._host import Result, hermes
 
 MAIN = "main-bot"
+THREAD_RULE = json.loads((Path(__file__).parent / "thread-rule-cases.json").read_text())
 
 
 def chat(**value):
@@ -203,6 +204,16 @@ class CandidateTests(unittest.TestCase):
             }
         )
         self.assertEqual([c["id"] for c in found], ["ok"])
+
+    def test_plain_thread_follows_the_shared_table(self):
+        for case in THREAD_RULE["cases"]:
+            with self.subTest(case["name"]):
+                self.assertEqual(triage.is_plain_thread(dict(case["chat"])), case["plugin"])
+
+    def test_the_table_marks_every_difference_from_the_app(self):
+        for case in THREAD_RULE["cases"]:
+            with self.subTest(case["name"]):
+                self.assertEqual(case["app"] == case["plugin"], "differs" not in case)
 
     def test_capped_at_fifteen_most_recent(self):
         records = {MAIN: chat(main=True, hermesSessionId="m")}
