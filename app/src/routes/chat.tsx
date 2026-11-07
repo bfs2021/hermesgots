@@ -12,6 +12,7 @@ import {
   type ReactNode,
 } from "react"
 import { useLiveQuery } from "dexie-react-hooks"
+import { XIcon } from "lucide-react"
 import { matchPath, useLocation, useNavigate, useParams } from "react-router"
 import { toast } from "sonner"
 
@@ -248,6 +249,12 @@ interface ChatPageProps {
   chatId?: string
   paneThread?: string
   slot: HoldSlot
+  /**
+   * Puts the thread beside Main away, wherever the lane holds one: the thread's header draws it as
+   * the close cross, and where the address names that thread it comes back to Main instead.
+   * Absent where closing can't take effect.
+   */
+  closeThread?: () => void
 }
 
 /**
@@ -284,6 +291,7 @@ export function ChatPage(props: ChatPageProps) {
         slot={props.slot}
         pinned={Boolean(props.chatId)}
         paneThread={props.paneThread}
+        closeThread={props.closeThread}
       />
     ) : kind === "current" ? (
       <CurrentChatPage {...props} />
@@ -311,12 +319,14 @@ function NextChat({
   slot,
   pinned,
   paneThread,
+  closeThread,
 }: {
   id: string
   slot: HoldSlot
   /** This instance draws a chat the address may not name: a Main beside its thread. */
   pinned: boolean
   paneThread?: string
+  closeThread?: () => void
 }) {
   const chat = useLiveQuery(() => db.conversations.get(id), [id])
   // A live query hands back a fresh array on every run, so what the thread keeps is keyed on the ids
@@ -481,9 +491,20 @@ function NextChat({
               showBot={!session && !besideMain}
               actions={actions}
               leading={
-                // Beside Main the bot is on screen with the thread; below `xl` the thread leads back.
-                // A session leads back to Code, unless it is drawn beside Code's list.
-                mainPath && !besideMain ? (
+                // Beside Main the bot is already on screen with the thread, so the way out is the
+                // one that puts this pane away, in the slot a phone's Back takes. Below `xl` the
+                // thread is a screen of its own and leads back; a session leads back to Code,
+                // unless it is drawn beside Code's list.
+                besideMain ? (
+                  closeThread && (
+                    <BackButton
+                      label="Close thread"
+                      onClick={closeThread}
+                      floating
+                      icon={<XIcon />}
+                    />
+                  )
+                ) : mainPath ? (
                   <BackButton
                     label={`Back to ${bot.name || "bot"}`}
                     onClick={() => up(mainPath)}
@@ -819,7 +840,7 @@ function NextComposerBody({
   )
 }
 
-function CurrentChatPage({ chatId, paneThread, slot }: ChatPageProps) {
+function CurrentChatPage({ chatId, paneThread, slot, closeThread }: ChatPageProps) {
   const params = useParams()
   const { pathname, state: address } = useLocation()
   const id = chatId ?? params.id
@@ -1496,18 +1517,27 @@ function CurrentChatPage({ chatId, paneThread, slot }: ChatPageProps) {
         showBot={!session && !unstarted && !besideMain}
         actions={actions}
         leading={
-          mainPath
-            ? // Beside Main a thread needs no control of its own: the bot is on screen with it, and
-              // the pane keeps the thread wherever the address goes. Below `xl` it is a screen over
-              // Main, and leads back to it.
-              !besideMain && (
-                <BackButton
-                  label={`Back to ${profile?.name ?? "bot"}`}
-                  onClick={() => up(mainPath)}
-                  floating
-                />
-              )
-            : underCode && <BackButton label="Back to Code" onClick={() => void leave()} floating />
+          besideMain ? (
+            // The bot is on screen with the thread, so the way out is the one that puts this pane
+            // away, in the slot a phone's Back takes.
+            closeThread && (
+              <BackButton
+                label="Close thread"
+                onClick={closeThread}
+                floating
+                icon={<XIcon />}
+              />
+            )
+          ) : mainPath ? (
+            // Below `xl` the thread is a screen over Main, and leads back to it.
+            <BackButton
+              label={`Back to ${profile?.name ?? "bot"}`}
+              onClick={() => up(mainPath)}
+              floating
+            />
+          ) : (
+            underCode && <BackButton label="Back to Code" onClick={() => void leave()} floating />
+          )
         }
       />
 

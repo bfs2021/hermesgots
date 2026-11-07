@@ -4,12 +4,15 @@ import {
   assert,
   cardOf,
   centred,
+  centreOf,
+  dragBy,
   flow,
   mockAuth,
   pass,
   readHeader,
   settled,
 } from "./lib.mjs"
+import { SPLIT_KEY } from "../../src/lib/split.ts"
 
 const NEW_MOCK = process.env.TRIAGE_NEW_MOCK_URL
 const THREAD_MOCK = process.env.TRIAGE_THREAD_MOCK_URL
@@ -48,25 +51,22 @@ const viewLink = (card, title) =>
   card.getByRole("link", { name: title ? `View ${title}` : /^View / })
 
 function sequence(page) {
-  return page.evaluate(
-    (messages) => {
-      const content = document.querySelector('[data-slot="message-scroller-content"]')
-      if (!content) return []
-      return [...content.children]
-        .filter((child) => child.hasAttribute("data-slot"))
-        .flatMap((child) => {
-          const slot = child.getAttribute("data-slot")
-          const said = child.textContent?.trim() ?? ""
-          if (slot === "day-heading" || slot === "other") return []
-          // By the thread the card draws: the words on it are not a stable key.
-          if (slot === "thread-card") return [`card:${child.getAttribute("data-thread")}`]
-          if (slot === "message-scroller-item")
-            return [`message:${messages.find((message) => said.includes(message)) ?? said}`]
-          return []
-        })
-    },
-    MESSAGES,
-  )
+  return page.evaluate((messages) => {
+    const content = document.querySelector('[data-slot="message-scroller-content"]')
+    if (!content) return []
+    return [...content.children]
+      .filter((child) => child.hasAttribute("data-slot"))
+      .flatMap((child) => {
+        const slot = child.getAttribute("data-slot")
+        const said = child.textContent?.trim() ?? ""
+        if (slot === "day-heading" || slot === "other") return []
+        // By the thread the card draws: the words on it are not a stable key.
+        if (slot === "thread-card") return [`card:${child.getAttribute("data-thread")}`]
+        if (slot === "message-scroller-item")
+          return [`message:${messages.find((message) => said.includes(message)) ?? said}`]
+        return []
+      })
+  }, MESSAGES)
 }
 
 function seed(
@@ -264,6 +264,68 @@ function stopFrames(page) {
         window.__watching = false
         requestAnimationFrame(() => requestAnimationFrame(() => done(window.__frames ?? [])))
       }),
+  )
+}
+
+/**
+ * Samples the lane frame by frame across a close: Main's box, whether the thread is still drawn, and
+ * the width of the column its transcript is laid out in. The loop starts before the press, so the
+ * first frame is the lane as it was; `laneFrames` ends it and answers what was drawn.
+ */
+function watchLane(page) {
+  return page.evaluate(() => {
+    const box = (node) => (node ? Math.round(node.getBoundingClientRect().width) : 0)
+    const rows = (node) =>
+      node ? node.querySelectorAll('[data-slot="message-scroller-item"]').length : 0
+    const sample = () => {
+      const main = document.querySelector('[data-pane="main"]')
+      const thread = document.querySelector('[data-pane="thread"]')
+      const column = thread?.querySelector('[data-slot="message-scroller-content"]')
+      const lane = document.querySelector('[data-slot="list-lane"]')
+      return {
+        main: box(main),
+        lane: box(document.querySelector('[data-slot="list-lane"]')?.parentElement),
+        thread: Boolean(thread),
+        column: box(column),
+        // What each pane is drawing: a frame that draws neither chat is one the reader never saw.
+        drawn: rows(main) + rows(thread),
+        // The list lane's own paint: a lane that is transparent lets the thread it is covering be
+        // read in the same pixels as Main's words.
+        paint: lane ? getComputedStyle(lane).backgroundColor : "",
+      }
+    }
+    window.__lane = []
+    window.__laneOn = true
+    const tick = () => {
+      if (!window.__laneOn) return
+      window.__lane.push(sample())
+      requestAnimationFrame(tick)
+    }
+    requestAnimationFrame(tick)
+  })
+}
+
+async function laneFrames(page) {
+  const frames = await page.evaluate(() => {
+    window.__laneOn = false
+    return window.__lane ?? []
+  })
+  await page.evaluate(() => {
+    delete window.__lane
+  })
+  return frames
+}
+
+/** The column a chat's transcript is laid out in, as the pane draws it now. */
+function columnWidth(page, pane = "thread") {
+  return page.evaluate(
+    (pane) =>
+      Math.round(
+        document
+          .querySelector(`[data-pane="${pane}"] [data-slot="message-scroller-content"]`)
+          ?.getBoundingClientRect().width ?? 0,
+      ),
+    pane,
   )
 }
 
@@ -724,7 +786,10 @@ await flow(
       if (!body || !undo) return null
       return Math.round(undo.getBoundingClientRect().left - body.getBoundingClientRect().right)
     })
-    assert.ok(gap !== null && gap >= 0 && gap <= 8, `Undo stands at the card's edge (${gap}px away)`)
+    assert.ok(
+      gap !== null && gap >= 0 && gap <= 8,
+      `Undo stands at the card's edge (${gap}px away)`,
+    )
     assert.equal(
       new Set(widths).size,
       1,
@@ -908,6 +973,8 @@ await flow(
       true,
       "and the pane the thread was in is the pane it is still in: nothing was drawn anew",
     )
+    // The thread beside Main is the thread the address names, and the control that puts it away
+    // stands on it either way: a thread's address is not a reason to take the close cross off it (G4).
     const heads = await page.evaluate(() =>
       [...document.querySelectorAll('[data-slot="header-row"]')].map((row) => ({
         title: row.querySelector('[data-slot="header-title"]')?.textContent ?? "",
@@ -922,9 +989,14 @@ await flow(
     assert.notEqual(heads[1].title, "", "the thread beside it reads with its own title")
     assert.notEqual(heads[1].title, "Test bot", "which is the thread's, not the bot's")
     assert.equal(
-      heads[1].controls.some((label) => label.startsWith("Back to") || label === "Close thread"),
-      false,
-      "the thread beside its bot carries no control of its own",
+      heads[1].controls.includes("Close thread"),
+      true,
+      `the thread beside its bot carries the control that puts it away (saw ${heads[1].controls.join(", ")})`,
+    )
+    assert.deepEqual(
+      heads[1].controls.filter((label) => label.startsWith("Back to")),
+      [],
+      "and no way back, which it doesn't need where its bot is on screen",
     )
     assert.deepEqual(
       heads.map((head) => head.pictures),
@@ -936,8 +1008,442 @@ await flow(
     await ready(page, "the laptop in light mode", "main")
     await shot("laptop")
     pass(
-      "on a laptop the thread beside Main carries no control of its own, and naming it changes nothing",
+      "on a laptop the thread beside Main carries the close cross that puts it away, and naming it changes nothing",
     )
+
+    // Once the bot's thread list has answered and a thread stands beside Main, the two chats share
+    // the room the sidebar leaves: half each, as a share of the row rather than a width, so it is
+    // right with the sidebar open or a rail (ADR 0110).
+    const lanes = await page.evaluate(() => {
+      const width = (slot) => {
+        const node = document.querySelector(`[data-pane="${slot}"]`)
+        return node ? node.getBoundingClientRect().width : null
+      }
+      return { main: width("main"), thread: width("thread") }
+    })
+    assert.ok(
+      lanes.main && lanes.thread,
+      `both chats are drawn beside each other (Main ${lanes.main}, thread ${lanes.thread})`,
+    )
+    assert.ok(
+      Math.abs(lanes.main - lanes.thread) <= 2,
+      `the two chats are given the same width (Main ${Math.round(lanes.main)} against the thread ${Math.round(lanes.thread)})`,
+    )
+    assert.ok(
+      lanes.main > 500 && lanes.thread > 500,
+      `and both are wider than the lane Main alone keeps (Main ${Math.round(lanes.main)}, thread ${Math.round(lanes.thread)})`,
+    )
+    pass("the thread beside Main shares the lane evenly")
+
+    // The edge between the chats is the reader's: a drag sets the share, this device keeps it, and
+    // neither chat is drawn narrower than the 412px the app asks its text to read in — a CSS clamp,
+    // so shrinking the window can crush neither (G6).
+    assert.equal(
+      await count(page, '[data-slot="split-handle"]'),
+      1,
+      "the edge between the chats is a control of its own",
+    )
+    const edge = await page.evaluate(() => {
+      const handle = document.querySelector('[data-slot="split-handle"]')
+      return {
+        role: handle.getAttribute("role"),
+        orientation: handle.getAttribute("aria-orientation"),
+        label: handle.getAttribute("aria-label"),
+        share: handle.getAttribute("aria-valuenow"),
+        tab: handle.getAttribute("tabindex"),
+      }
+    })
+    assert.equal(edge.role, "separator", "a separator, as the edge between two panes is")
+    assert.equal(edge.orientation, "vertical")
+    assert.ok(edge.label, "with a name that says what it does")
+    assert.equal(edge.share, "50", "it reads the share it holds, half to begin with")
+    assert.equal(edge.tab, "0", "and a reader's keys can reach it")
+
+    /** The row the sidebar leaves, and the two chats in it, in the page's own px. */
+    const rowBoxes = () =>
+      page.evaluate(() => {
+        const box = (selector) => {
+          const node = document.querySelector(selector)
+          if (!node) return null
+          const rect = node.getBoundingClientRect()
+          return { left: rect.left, width: rect.width }
+        }
+        const row = box("main")
+        const list = box('[data-slot="list-lane"]')
+        const thread = box('[data-pane="thread"]')
+        return row && list && thread ? { row, list, thread } : null
+      })
+    /** One mouse drag of the edge, to `dx` px from where it stands. */
+    const dragEdge = async (dx) => {
+      const at = await centreOf(page, '[data-slot="split-handle"]')
+      // A drag can't leave the page, so a move past its left edge stops at the edge.
+      await dragBy(page, at, Math.max(2 - at.x, dx), 0)
+    }
+    const keptShare = () => page.evaluate((key) => localStorage.getItem(key), SPLIT_KEY)
+
+    // A drag sets the share the two chats are drawn at, and letting go keeps it on this device.
+    await dragEdge(100)
+    const moved = await rowBoxes()
+    assert.ok(moved, "both chats and the row they share are drawn after the drag")
+    assert.ok(
+      moved.list.width > moved.thread.width + 60,
+      `the drag moved the edge toward Main (Main ${Math.round(moved.list.width)}, thread ${Math.round(moved.thread.width)})`,
+    )
+    assert.ok(
+      Math.abs(moved.list.left - moved.row.left) <= 1 &&
+        Math.abs(moved.list.width + moved.thread.width - moved.row.width) <= 1,
+      "the two chats still fill the row the sidebar leaves",
+    )
+    const share = moved.list.width / moved.row.width
+    assert.ok(
+      Math.abs(Number(await keptShare()) - share) <= 0.01,
+      `letting go kept the share this device dragged to (${await keptShare()} against ${share.toFixed(3)})`,
+    )
+
+    // The same share after a reload: it belongs to the device, not to a visit.
+    await page.reload()
+    await until(
+      () =>
+        page.evaluate(() => {
+          const main = document.querySelector('[data-pane="main"]')
+          const title = main?.querySelector('[data-slot="header-title"]')?.textContent?.trim() ?? ""
+          return (
+            Boolean(title) && document.querySelectorAll('[data-slot="header-row"]').length === 2
+          )
+        }),
+      20_000,
+      "Main and its thread, side by side after a reload",
+    )
+    await settled(page)
+    const reloaded = await rowBoxes()
+    assert.ok(reloaded, "both chats are drawn after the reload")
+    assert.ok(
+      Math.abs(reloaded.list.width - moved.list.width) <= 2,
+      `and the share a reader dragged to is the one the reload finds (Main ${Math.round(reloaded.list.width)} against ${Math.round(moved.list.width)})`,
+    )
+
+    // Dragged to the stop, Main stops at the width the app asks its text to read in.
+    await dragEdge(-1000)
+    const stopped = await rowBoxes()
+    assert.ok(stopped, "both chats are drawn at the stop")
+    assert.ok(
+      Math.abs(stopped.list.width - 412) <= 1,
+      `Main is floored at 412px rather than crushed (${stopped.list.width})`,
+    )
+    assert.ok(
+      stopped.thread.width > 412,
+      `and the thread takes the rest of the row (${Math.round(stopped.thread.width)})`,
+    )
+
+    // A close and a reopen leave the share where it was: the device keeps it, not the thread.
+    await page.locator('[data-pane="thread"] [aria-label="Close thread"]').click()
+    await until(
+      async () => (await count(page, '[data-pane="thread"]')) === 0,
+      5_000,
+      "the thread put away from the dragged edge",
+    )
+    await settled(page)
+    await viewLink(cardOf(page, threadId)).click()
+    await page.waitForURL(`**/c/${threadId}`, { timeout: 15_000 })
+    await until(
+      async () => (await count(page, '[data-slot="header-row"]')) === 2,
+      15_000,
+      "the thread back beside Main",
+    )
+    await settled(page)
+    const again = await rowBoxes()
+    assert.ok(again, "both chats are drawn again")
+    assert.ok(
+      Math.abs(again.list.width - 412) <= 1,
+      `and Main takes the share this device keeps (${again.list.width})`,
+    )
+
+    // A double-click puts the edge back to half, where it opened.
+    const middle = await centreOf(page, '[data-slot="split-handle"]')
+    await page.mouse.dblclick(middle.x, middle.y)
+    await settled(page)
+    const halves = await rowBoxes()
+    assert.ok(halves, "both chats are drawn after the double-click")
+    assert.ok(
+      Math.abs(halves.list.width - halves.thread.width) <= 2,
+      `a double-click gives the two chats half the row each (Main ${Math.round(halves.list.width)}, thread ${Math.round(halves.thread.width)})`,
+    )
+    pass("a drag keeps its share across a reload, a close and a reopen")
+
+    // Closing is one surface rearranging, not a pane dropped in a frame: the share the lane gives
+    // back is the one number that moves, the thread keeps the width it had and is clipped out
+    // rather than squeezed, and no frame draws neither chat (G3).
+    const before = await columnWidth(page)
+    assert.ok(before > 0, `the thread's column is drawn before the close (${before}px)`)
+    await watchLane(page)
+    await page.locator('[data-pane="thread"] [aria-label="Close thread"]').click()
+    await until(
+      async () => (await count(page, '[data-pane="thread"]')) === 0,
+      5_000,
+      "the thread clipped out of the lane",
+    )
+    await settled(page)
+    await page.evaluate(
+      () => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))),
+    )
+    const frames = await laneFrames(page)
+    assert.ok(frames.length > 4, `the close was sampled frame by frame (${frames.length} frames)`)
+    assert.equal(frames[0].thread, true, "the lane is sampled holding its thread before the press")
+    // The frame the share starts to move is the frame the close begins: a thread that keeps the
+    // width it had is still drawn there, and one that was squeezed or dropped is not.
+    const grown = frames.findIndex((frame) => frame.main > frames[0].main + 1)
+    assert.ok(
+      grown > 0,
+      `the lane's share moves across the close (frame ${grown} of ${frames.length})`,
+    )
+    const closing = frames.slice(grown)
+    assert.equal(
+      closing[0].thread,
+      true,
+      "on the frame the share starts to move the thread is still drawn",
+    )
+    assert.deepEqual(
+      closing
+        .filter((frame) => frame.thread && Math.abs(frame.column - before) > 1)
+        .map((frame) => frame.column),
+      [],
+      `and its transcript is never re-wrapped narrower while it is clipped out (${closing
+        .filter((frame) => frame.thread)
+        .map((frame) => frame.column)
+        .join(" → ")} against ${before}px)`,
+    )
+    assert.deepEqual(
+      closing
+        .slice(1)
+        .filter((frame, index) => frame.main < closing[index].main - 1)
+        .map((frame) => frame.main),
+      [],
+      `Main's box only ever grows across the close (${closing.map((frame) => frame.main).join(" → ")})`,
+    )
+    assert.deepEqual(
+      frames.filter((frame) => !frame.drawn).map((frame) => frame.main),
+      [],
+      "and no frame draws neither chat",
+    )
+    // The lane Main grows into is painted, so the thread it is clipping out is never drawn in the
+    // same pixels as Main's own words: "Main covers it" has to be literally true.
+    assert.deepEqual(
+      [...new Set(frames.map((frame) => frame.paint))].filter(
+        (paint) => !paint || paint === "transparent" || paint === "rgba(0, 0, 0, 0)",
+      ),
+      [],
+      `the list lane paints its own background all the way through the close (saw ${[
+        ...new Set(frames.map((frame) => frame.paint)),
+      ].join(", ")})`,
+    )
+    assert.equal(
+      closing.some((frame) => !frame.thread),
+      true,
+      "and the thread is gone once the share reaches zero",
+    )
+    assert.ok(
+      Math.abs(frames.at(-1).main - frames.at(-1).lane) <= 2,
+      `Main is the lane's whole width at the end (${frames.at(-1).main} of ${frames.at(-1).lane})`,
+    )
+    pass("the lane closes as one surface")
+
+    // The same close for a reader who asked for no motion: the first frame that shows the close
+    // shows it whole, with nothing held over and nothing asked of the lane to animate.
+    await viewLink(cardOf(page, threadId)).click()
+    await page.waitForURL(`**/c/${threadId}`, { timeout: 15_000 })
+    await until(
+      async () => (await count(page, '[data-pane="thread"] [aria-label="Close thread"]')) === 1,
+      15_000,
+      "the thread beside Main again",
+    )
+    await settled(page)
+    await page.emulateMedia({ reducedMotion: "reduce" })
+    await page.evaluate(() => {
+      const animate = Element.prototype.animate
+      window.__laneAnimated = []
+      window.__laneAnimateRestore = () => {
+        Element.prototype.animate = animate
+      }
+      // Only the lane's own parts: what a chat does inside a pane is not the lane moving.
+      Element.prototype.animate = function (...args) {
+        if (
+          this.matches?.('[data-slot="list-lane"], [data-slot="item-lane"]') ||
+          this.closest?.('[data-slot="item-lane"]')
+        )
+          window.__laneAnimated.push(this.tagName.toLowerCase())
+        return animate.apply(this, args)
+      }
+    })
+    await watchLane(page)
+    await page.locator('[data-pane="thread"] [aria-label="Close thread"]').click()
+    await until(
+      async () => (await count(page, '[data-pane="thread"]')) === 0,
+      5_000,
+      "the thread gone under reduced motion",
+    )
+    await settled(page)
+    await page.evaluate(
+      () => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))),
+    )
+    const quick = await laneFrames(page)
+    const animated = await page.evaluate(() => {
+      window.__laneAnimateRestore()
+      return window.__laneAnimated ?? []
+    })
+    const shut = quick.findIndex((frame) => !frame.thread)
+    assert.ok(
+      shut > 0,
+      `the lane is sampled holding its thread before the press (${quick.length} frames)`,
+    )
+    assert.ok(
+      Math.abs(quick[shut].main - quick[shut].lane) <= 2,
+      `the first frame that shows the close shows Main holding the lane (${quick[shut].main} of ${quick[shut].lane})`,
+    )
+    assert.deepEqual(
+      quick
+        .filter((frame) => frame.thread && frame.main > quick[0].main + 1)
+        .map((frame) => frame.main),
+      [],
+      "and no frame draws the held thread while Main grows: nothing was held over",
+    )
+    assert.deepEqual(animated, [], "and nothing was asked of the lane to animate")
+    await page.emulateMedia({ reducedMotion: null })
+    pass("a close under reduced motion draws both states in one frame")
+
+    // The thread back beside Main, which is the state the close below reads.
+    await viewLink(cardOf(page, threadId)).click()
+    await page.waitForURL(`**/c/${threadId}`, { timeout: 15_000 })
+    await until(
+      async () => (await count(page, '[data-slot="header-row"]')) === 2,
+      15_000,
+      "the thread beside Main, for the close that follows",
+    )
+    await settled(page)
+
+    // Closing it is one press on that cross, straight from the thread's own address: the entry
+    // the thread took is replaced by this bot's Main, so no page slide plays and the address comes
+    // back to where it was before the thread was opened (G4). Main takes the row's whole width, the
+    // width it has when no thread was ever opened (G2).
+    await until(
+      async () => (await count(page, '[data-pane="thread"] [aria-label="Close thread"]')) === 1,
+      15_000,
+      "the close cross on the thread the address names",
+    )
+    await page.locator('[data-pane="thread"] [aria-label="Close thread"]').click()
+    await until(
+      async () => new URL(page.url()).pathname === mainPath,
+      15_000,
+      "the address back on the bot's Main after closing the thread it named",
+    )
+    await until(
+      async () => (await count(page, '[data-pane="thread"]')) === 0,
+      15_000,
+      "Main alone after closing its thread",
+    )
+    await settled(page)
+    assert.equal(
+      await count(page, '[data-slot="header-row"]'),
+      1,
+      "one header is left: the bot's own",
+    )
+    const closed = await page.evaluate(() => {
+      const row = document.querySelector("main")
+      const chat = document.querySelector('[data-pane="main"]')
+      return {
+        lane: row ? row.getBoundingClientRect().width : null,
+        main: chat ? chat.getBoundingClientRect().width : null,
+      }
+    })
+    assert.ok(
+      closed.lane && closed.main,
+      `Main is drawn after the close (the lane ${closed.lane}, Main ${closed.main})`,
+    )
+    assert.ok(
+      Math.abs(closed.main - closed.lane) <= 2,
+      `Main takes the lane's whole width (Main ${Math.round(closed.main)} against the lane ${Math.round(closed.lane)})`,
+    )
+    pass("closing the thread gives Main the whole lane")
+
+    // Back is left with the page before the thread: the entry the close replaced holds Main, so the
+    // step back is Main again and never the thread that was just put away.
+    await page.goBack()
+    await settled(page)
+    assert.equal(
+      new URL(page.url()).pathname,
+      mainPath,
+      "Back lands the page before the thread, not the thread it dismissed",
+    )
+    assert.equal(
+      await count(page, '[data-pane="thread"]'),
+      0,
+      "and the thread it dismissed is not drawn beside Main again",
+    )
+    pass("a close from a thread's address leaves nothing for Back to return to")
+
+    // And forgotten is what "closed" means: the next launch opens Main alone, so a reload of this
+    // address keeps the one chat it names and brings none beside it (G5).
+    await page.reload()
+    // The page boots from nothing, so the shell's Main is waited for: the absence of a thread
+    // beside it only means something once Main itself is drawn.
+    await until(
+      () =>
+        page.evaluate(() => {
+          const main = document.querySelector('[data-pane="main"]')
+          const title = main?.querySelector('[data-slot="header-title"]')?.textContent?.trim() ?? ""
+          const content = main?.querySelector('[data-slot="message-scroller-content"]')
+          return Boolean(title) && Boolean(content?.children.length)
+        }),
+      20_000,
+      "Main drawn again after a reload",
+    )
+    await ready(page, "the laptop after a reload", "main")
+    await settled(page)
+    assert.equal(
+      await count(page, '[data-pane="thread"]'),
+      0,
+      "the thread the close put away is not drawn beside Main after a reload",
+    )
+    assert.equal(
+      await count(page, '[data-slot="header-row"]'),
+      1,
+      "one header after the reload: the bot's own",
+    )
+    assert.equal(
+      await page.evaluate(async (id) => {
+        const { lastThreadKey } = await import("/src/lib/threads.ts")
+        return localStorage.getItem(lastThreadKey(id))
+      }, profileId),
+      null,
+      "and nothing is remembered for the bot to reopen",
+    )
+    const reopened = await page.evaluate(() => {
+      const row = document.querySelector("main")
+      const chat = document.querySelector('[data-pane="main"]')
+      return {
+        lane: row ? row.getBoundingClientRect().width : null,
+        main: chat ? chat.getBoundingClientRect().width : null,
+      }
+    })
+    assert.ok(
+      reopened.lane && reopened.main,
+      `Main is drawn after the reload (the lane ${reopened.lane}, Main ${reopened.main})`,
+    )
+    assert.ok(
+      Math.abs(reopened.main - reopened.lane) <= 2,
+      `and keeps the lane's whole width (Main ${Math.round(reopened.main)} against the lane ${Math.round(reopened.lane)})`,
+    )
+    pass("a closed thread is gone after a reload")
+
+    // And only opening one again brings it back: the card in Main is that door, and the lane splits
+    // once more, which is the state the rest of this laptop section reads.
+    await viewLink(cardOf(page, threadId)).click()
+    await page.waitForURL(`**/c/${threadId}`, { timeout: 15_000 })
+    await until(
+      async () => (await count(page, '[data-slot="header-row"]')) === 2,
+      15_000,
+      "a thread beside Main again",
+    )
+    pass("opening the thread again stands it beside Main")
 
     const secondBot = await addBot(page, { name: SECOND_BOT, messages: SECOND_MESSAGES })
     const secondMain = `/c/main-${secondBot}`

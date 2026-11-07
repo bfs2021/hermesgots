@@ -1,7 +1,7 @@
 import Dexie from "dexie"
-import { useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useLiveQuery } from "dexie-react-hooks"
-import { matchPath, useLocation } from "react-router"
+import { matchPath, useLocation, useNavigate } from "react-router"
 
 import {
   createConversation,
@@ -17,6 +17,7 @@ import {
   type Unsent,
 } from "@/lib/db"
 import { useXLarge } from "@/lib/media"
+import { createStore } from "@/lib/store"
 import { byName } from "@/lib/compare"
 import { oneLine } from "@/lib/words"
 import { withDir, type Sort, type SortKey } from "@/lib/sort"
@@ -333,44 +334,136 @@ export function useBotSummaries(): BotSummary[] | undefined {
 export const lastThreadKey = (profileId: string) => `gots:last-thread:${profileId}`
 
 /**
+ * The thread each bot's third pane remembers — its lane memory, under `gots:last-thread:<bot>` on
+ * this device alone — as a store a reader can subscribe to: a row is loaded from storage the first
+ * time a reader asks for that bot, and every write tells each reader, which is what a close needs.
+ * Storage stays the truth a read is answered from, so a row seeded before the app mounted is found.
+ */
+const remembered = createStore<Record<string, string | null>>({})
+
+/** Writes a bot's row into the store, telling the readers only when it really moved. */
+const writeRow = (profileId: string, thread: string | null) => {
+  const all = remembered.get()
+  if (profileId in all && all[profileId] === thread) return
+  remembered.set({ ...all, [profileId]: thread })
+}
+
+/** What storage holds for a bot, or the row this page has where storage is blocked. */
+function rememberedThread(profileId: string): string | null {
+  try {
+    return localStorage.getItem(lastThreadKey(profileId))
+  } catch {
+    // Storage blocked: the row this page holds still answers for as long as the page lives.
+    return remembered.get()[profileId] ?? null
+  }
+}
+
+/**
+ * This device remembers `thread` for a bot from now on — `null` forgets it, which is what closing a
+ * thread leaves — written through to storage and told to every reader.
+ */
+export function rememberThread(profileId: string, thread: string | null) {
+  writeRow(profileId, thread)
+  try {
+    if (thread === null) localStorage.removeItem(lastThreadKey(profileId))
+    else localStorage.setItem(lastThreadKey(profileId), thread)
+  } catch {
+    // As above: the row this page holds still answers for as long as the page lives.
+  }
+}
+
+/**
+ * The thread a bot's lane remembers, subscribing whatever draws it, and the one load of that bot's
+ * row: the first ask takes storage's answer into the store, so a write on a close has the row it
+ * changed to compare against.
+ */
+export function useRememberedThread(profileId: string | undefined): string | null {
+  const all = remembered.use()
+  const loaded = profileId ? profileId in all : true
+  useEffect(() => {
+    if (profileId && !loaded) writeRow(profileId, rememberedThread(profileId))
+  }, [profileId, loaded])
+  return profileId ? (all[profileId] ?? null) : null
+}
+
+/** What a bot's lane remembers and how many threads it has, read together for one answer. */
+export interface LastOpened {
+  /** The remembered thread, where it is still one of the bot's. */
+  last?: string
+  /** The id storage holds, whether or not the lane may reopen it. */
+  stored: string | null
+  /** How many threads the bot has at all. */
+  threads: number
+}
+
+/**
  * What a bot's third pane holds while the address is Main: the thread this device opened last for
  * that bot, the thread storage holds even where the pane refuses it, and how many threads the bot
  * has at all. A remembered thread that is gone, or is one of another bot's, is no thread of this
  * pane's — Main alone is better than the wrong chat.
  */
-export async function lastOpened(profileId: string) {
-  const threads = await db.conversations
-    .where("[profileId+updatedAt]")
-    .between([profileId, -Infinity], [profileId, Infinity])
-    .filter((chat) => !chat.projectId && !chat.main)
-    .count()
-  let stored: string | null = null
-  let last: string | undefined
-  try {
-    stored = localStorage.getItem(lastThreadKey(profileId))
-    const found = stored ? await db.conversations.get(stored) : undefined
-    if (found && found.profileId === profileId && !found.projectId && !found.main) last = found.id
-  } catch {
-    // Storage can be blocked; the pane then has Main alone.
-  }
+export async function lastOpened(profileId: string): Promise<LastOpened> {
+  const stored = rememberedThread(profileId)
+  // The count and the remembered id are independent reads, so the pane waits for the slower alone.
+  const [threads, found] = await Promise.all([
+    db.conversations
+      .where("[profileId+updatedAt]")
+      .between([profileId, -Infinity], [profileId, Infinity])
+      .filter((chat) => !chat.projectId && !chat.main)
+      .count(),
+    stored ? db.conversations.get(stored) : Promise.resolve(undefined),
+  ])
+  const last =
+    found && found.profileId === profileId && !found.projectId && !found.main ? found.id : undefined
   return { last, stored, threads }
 }
+
+type LaneAnswer = LastOpened & { profileId: string }
 
 /** What a chat's row says about who owns it: its bot, and whether it is a project session. */
 type ChatOwner = Pick<Conversation, "profileId" | "projectId">
 
+/**
+ * What a bot's third pane is, as one answer: closed, so Main has the row's whole width; open at a
+ * thread; open for a bot with no thread yet, where it says so; or not answered, while the bot's
+ * thread list is still out — the lane then keeps the width and the content it had, so a switch
+ * from one bot to another never flashes Main wide and back.
+ */
+export type BotLane =
+  | { state: "closed" }
+  | { state: "thread"; thread: string }
+  | { state: "empty" }
+  | { state: "unknown" }
+
+/**
+ * Everything the shell draws a bot's lane from, asked once: which bot it is for, what the lane is
+ * and holds, and the two moves a later control makes without knowing the rule behind them.
+ */
 export interface BotPane {
   profileId: string
-  /** The thread the address itself is, when it is one of the bot's threads. */
-  thread?: string
-  /** The thread the third pane reopens while the address is Main: this bot's last one opened here. */
-  last?: string
+  lane: BotLane
   /**
-   * Whether the bot has a thread at all, since a bot with none gets the pane's empty state. Absent
-   * while its thread list has not answered for this bot: an unanswered list is never read as no
-   * threads, so the pane holds what it had until the answer lands.
+   * Puts the lane away and forgets this bot's thread, so the next visit opens Main alone. Where the
+   * address names that thread, its entry is replaced by this bot's Main as well — in the same act,
+   * since a lane reading an address that still named the thread would hold it again. Whether there
+   * is a thread to put away is the lane's own answer, so the caller reads `lane.state`.
    */
-  threads?: boolean
+  close: () => void
+  /** Puts back the thread this bot closed on this visit, where the lane is not already holding one. */
+  reopen: () => void
+}
+
+/**
+ * The lane from the thread the address is, this device's remembered one and the bot's count: the
+ * address's thread wins, a list still out is no answer at all rather than no threads, a remembered
+ * thread is the one the lane reopens, a bot with threads but none remembered is closed, and a bot
+ * with none keeps the lane to say so.
+ */
+function laneOf(thread: string | undefined, answer: LastOpened | undefined): BotLane {
+  if (thread) return { state: "thread", thread }
+  if (!answer) return { state: "unknown" }
+  if (answer.last) return { state: "thread", thread: answer.last }
+  return answer.threads > 0 ? { state: "closed" } : { state: "empty" }
 }
 
 /**
@@ -383,9 +476,15 @@ export interface BotPane {
  * What the pane holds beside Main is asked of the bot rather than of the address, so the address
  * moving between Main and a thread answers nothing again: the same chat stays drawn, and leaving a
  * thread leaves the one beside Main where it was.
+ *
+ * One answer for the shell, rather than a thread and an open flag it assembles again at every draw:
+ * `lane` says which of the four the pane is, and what it holds, and `close` and `reopen` are the
+ * moves a control makes without knowing the rule — a close forgets the thread, as the lane memory
+ * and the next visit both need, and takes the address back to this bot's Main where it named it.
  */
 export function useBotPane(enabled: boolean | undefined): BotPane | undefined {
   const large = useXLarge()
+  const navigate = useNavigate()
   const { pathname, state } = useLocation()
   const chat = matchPath("/c/:id", pathname)?.params.id
   const main = chat ? mainThreadProfile(chat) : undefined
@@ -416,29 +515,56 @@ export function useBotPane(enabled: boolean | undefined): BotPane | undefined {
     thread = chat
   }
   // Only a wide screen with the switch on has a third pane to fill, so only it pays for the count.
-  // The address is a dependency so the read follows the thread this page just opened — the storage
-  // it comes from isn't reactive — and Dexie keeps the answer it has until the new one lands, so
-  // the pane never empties between the two.
+  // The address's own thread is the lane's answer already, so nothing is read while it names one:
+  // the dep on `thread` is what asks for the count and the remembered id the moment the address is
+  // Main again. The remembered row is a dep too, so a write that forgets a thread redraws the lane:
+  // the store tells every reader, which the row in storage never did.
+  const rememberedId = useRememberedThread(profileId)
   const kept = useLiveQuery(
-    async () =>
-      large && enabled && profileId ? { profileId, ...(await lastOpened(profileId)) } : undefined,
-    [large, enabled, profileId, thread],
+    async (): Promise<LaneAnswer | undefined> =>
+      !thread && large && enabled && profileId
+        ? { profileId, ...(await lastOpened(profileId)) }
+        : undefined,
+    [large, enabled, profileId, thread, rememberedId],
   )
+  // The answer this bot was last given, kept while an address naming a thread makes the read
+  // needless: the lane must not fall back to `unknown` the moment the address leaves that thread,
+  // or Main alone would be drawn before the bot is known to have a thread at all.
+  const [answered, setAnswered] = useState<LaneAnswer | undefined>(undefined)
   // The answer names the bot it ran for, so one bot's answer can never pass for another's.
-  const answer = kept && kept.profileId === profileId ? kept : undefined
+  const fresh = kept && kept.profileId === profileId ? kept : undefined
+  if (fresh && fresh !== answered) setAnswered(fresh)
+  const answer = fresh ?? (answered?.profileId === profileId ? answered : undefined)
+  const lane = laneOf(thread, answer)
+  const shown = lane.state === "thread" ? lane.thread : undefined
+  // The thread this bot's lane closed on this visit, for `reopen`: one bot's at a time, so leaving
+  // the bot forgets it.
+  const closed = useRef<{ profileId: string; thread: string } | null>(null)
+  useEffect(() => {
+    if (closed.current && closed.current.profileId !== profileId) closed.current = null
+  }, [profileId])
+  const close = useCallback(() => {
+    if (!profileId || !shown) return
+    closed.current = { profileId, thread: shown }
+    rememberThread(profileId, null)
+    // The address moves in this same act, not on a later render: the lane reads the address's
+    // thread before anything else, so forgetting one it still named would hold it again. Replacing
+    // the entry it took — the way a sidebar row opens Main — keeps Back on the page before the
+    // thread, and `quiet` is the state the shell skips its page slide for.
+    if (thread === shown)
+      navigate(`/c/${mainThreadId(profileId)}`, { replace: true, state: { quiet: true } })
+  }, [profileId, shown, thread, navigate])
+  const reopen = useCallback(() => {
+    if (!profileId || lane.state === "thread") return
+    const back = closed.current
+    if (back?.profileId === profileId) rememberThread(profileId, back.thread)
+  }, [profileId, lane.state])
   // Remembers the thread the address is, so the pane reopens it the next time the bot opens on Main.
   useEffect(() => {
     if (!profileId || !thread) return
-    try {
-      localStorage.setItem(lastThreadKey(profileId), thread)
-    } catch {
-      // As above: the pane opens on Main alone.
-    }
+    rememberThread(profileId, thread)
   }, [profileId, thread])
 
   if (!large || !enabled || !profileId) return undefined
-  if (thread) return { profileId, thread, threads: true }
-  // Nothing remembered yet reads as no thread to show, never as a bot without threads; a list that
-  // has not answered is not a list of none.
-  return { profileId, last: answer?.last, threads: answer ? answer.threads > 0 : undefined }
+  return { profileId, lane, close, reopen }
 }

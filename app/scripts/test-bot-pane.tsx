@@ -1,12 +1,16 @@
 import assert from "node:assert/strict"
 import test from "node:test"
+import { act } from "react"
 import { Link, MemoryRouter, Route, Routes } from "react-router"
 
 import { AppShell } from "@/components/app-shell"
 import { ChatPage } from "@/routes/chat"
+import { sendMessage } from "@/lib/chat"
 import { db, ensureMainThread, mainThreadId } from "@/lib/db"
-import { handOver, lastThreadKey, takeHandover } from "@/lib/threads"
+import { SPLIT_KEY } from "@/lib/split"
+import { handOver, lastThreadKey, rememberThread, takeHandover } from "@/lib/threads"
 import {
+  atWidth,
   botProfile,
   click,
   find,
@@ -18,13 +22,19 @@ import {
   path,
   seedSettings,
   settle,
+  spyAnimate,
+  SwitchTo,
   text,
+  type,
   until,
 } from "./component-kit.tsx"
+import { FakeRecorder, dictationHost, installFakeMedia } from "./fake-dictation.ts"
 
 const bot = botProfile("bot-pane", { id: "bot-1", name: "Mainly" })
 const other = botProfile("bot-other", { id: "bot-2", name: "Otherly" })
 const MAIN = mainThreadId(bot.id)
+/** What a run writes into a thread whose pane the reader closed mid-reply. */
+const LANDED = "Landed while the pane was away."
 
 async function seed(threads: string[] = [], patch: { botThreads?: boolean } = {}) {
   await seedSettings({ developer: true, botThreads: true, activeProfileId: bot.id, ...patch })
@@ -59,7 +69,6 @@ async function seed(threads: string[] = [], patch: { botThreads?: boolean } = {}
   globalThis.fetch = async () => json({})
 }
 
-
 const screen = (entry: string) => (
   <MemoryRouter initialEntries={[entry]}>
     <Path />
@@ -75,9 +84,28 @@ const screen = (entry: string) => (
     <Link to={`/c/${mainThreadId(other.id)}`} data-to-other>
       Other
     </Link>
+    {/* The way to a feature's own lane, which slides where a bot's rearranges. */}
+    <SwitchTo to="/code" replace />
     <Routes>
       <Route element={<AppShell />}>
         <Route path="c/:id" element={<ChatPage slot="route" />} />
+        <Route path="code" element={null} />
+      </Route>
+    </Routes>
+  </MemoryRouter>
+)
+
+/**
+ * Code's screen with its list, which the shell keeps beside it: the second lane a test reads, so a
+ * bot's split can be told apart from every feature's own. The route matches so the shell mounts —
+ * what it opens beside the list is the app's, and this test only asks what the list's lane is.
+ */
+const codeScreen = (
+  <MemoryRouter initialEntries={["/code"]}>
+    <Path />
+    <Routes>
+      <Route element={<AppShell />}>
+        <Route path="code" element={null} />
       </Route>
     </Routes>
   </MemoryRouter>
@@ -95,10 +123,100 @@ const titles = () =>
     .filter(live)
     .map((node) => node.textContent)
 /** The card of the thread the pane is showing: the only one that says it is here. */
-const openCards = () =>
-  findAll('[data-slot="thread-card"] [aria-current="page"]').filter(live)
+const openCards = () => findAll('[data-slot="thread-card"] [aria-current="page"]').filter(live)
 const cardLink = (id: string) => find(`[data-slot="thread-card"] a[href="/c/${id}"]`)
+/** The thread's own card in Main, wherever it was placed in the flow. */
+const threadCard = (id: string) => `[data-slot="thread-card"][data-thread="${id}"]`
 const remembered = (profileId: string) => localStorage.getItem(lastThreadKey(profileId))
+/**
+ * A thread this device remembers, written the way the app writes it. Storage on its own leaves the
+ * lane's store holding the row it loaded earlier, so a close would move nothing and tell nobody —
+ * which is a state no visit can produce.
+ */
+const remembers = (thread: string) => rememberThread(bot.id, thread)
+/**
+ * One Escape, as a reader's key arrives at the page: it bubbles and it can be claimed, which is what
+ * a sheet or a menu answering the key does before the lane ever hears it.
+ */
+async function escape() {
+  await act(async () => {
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    )
+  })
+  await settle()
+}
+/**
+ * The same Escape, pressed where the reader is typing: it goes to the field first — the composer
+ * answers it, or leaves it — and then bubbles to the shell, which is the order the page has.
+ */
+async function escapeIn(field: Element | null) {
+  assert.ok(field, "the field the key is pressed in")
+  await act(async () => {
+    field.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    )
+  })
+  await settle()
+}
+/** The thread's own composer, beside Main. */
+const threadComposer = () =>
+  find('[data-pane="thread"] textarea[aria-label="Message"]') as HTMLTextAreaElement | null
+/**
+ * The reopen chord, as the reader's keyboard sends it: a Mac passes Cmd where every other one passes
+ * Ctrl, and the physical key is `Backslash` either way, which is what the lane reads.
+ */
+async function reopen() {
+  const mac = /Mac/.test(navigator.platform)
+  await act(async () => {
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "\\",
+        code: "Backslash",
+        metaKey: mac,
+        ctrlKey: !mac,
+        bubbles: true,
+        cancelable: true,
+      }),
+    )
+  })
+  await settle()
+}
+/**
+ * The classes the shell gives the list's column, since the harness has no layout to measure. The
+ * lane's share is one of them, so a lane that kept `w-103` and one split in half read apart.
+ */
+const listLane = () => {
+  const lane = find('[data-slot="list-lane"]')
+  assert.ok(lane, "the shell draws the list's lane")
+  return [...lane.classList]
+}
+
+/**
+ * The share the list's lane draws, read off the width the shell writes on it: a DOM without layout
+ * can measure no box, and the clamp a split draws narrows and widens with the row, so the number it
+ * holds is the share and not the px.
+ */
+const listShare = () => {
+  const style = find('[data-slot="list-lane"]')?.getAttribute("style") ?? ""
+  const found = /clamp\(412px, ([\d.]+)%/.exec(style)
+  return found ? Number(found[1]) : null
+}
+
+/** The split's edge, as the reader reaches it: a separator between the two chats. */
+const splitEdge = () => find('[data-slot="split-handle"]')
+
+/** A key, as it arrives at the handle the reader has focused. */
+async function key(name: string, init: KeyboardEventInit = {}) {
+  const edge = splitEdge()
+  assert.ok(edge, "the split's handle is on screen")
+  await act(async () => {
+    edge.dispatchEvent(
+      new KeyboardEvent("keydown", { key: name, bubbles: true, cancelable: true, ...init }),
+    )
+  })
+  await settle()
+}
 
 /**
  * Holds the thread count a bot's pane reads, so a test can look at the lane between a switch and the
@@ -259,6 +377,10 @@ test(
     await mount(screen(`/c/${MAIN}`), async () => {
       await until(async () => Boolean(find('[data-slot="bot-pane-empty"]')), "the pane's own line")
       assert.equal(find('[data-slot="bot-pane-empty"]')?.textContent, "No threads yet")
+      assert.ok(
+        listLane().includes("w-103"),
+        `a bot with no threads keeps the 412px rail that says so (the lane took ${listLane().join(" ")})`,
+      )
       assert.ok(find('[data-slot="header-row"]'), "Main is still the pane it stands beside")
     })
   }),
@@ -316,6 +438,11 @@ test(
           false,
           "and no live chat stands in it while the new bot's thread answers",
         )
+        assert.equal(
+          listShare(),
+          50,
+          "the lane keeps the share it had while the list is unanswered",
+        )
         count.release()
 
         await until(
@@ -329,6 +456,76 @@ test(
       } finally {
         count.restore()
       }
+    })
+  }),
+)
+
+test(
+  "a switch out of a closed lane never flashes the 412px rail",
+  laptop(async () => {
+    localStorage.clear()
+    await seed(["t-a", "t-b"])
+    // The bot the reader switches to: its own thread is the one this device remembers, and its
+    // thread count is what the lane waits on.
+    await ensureMainThread(other.id)
+    await db.conversations.put({
+      id: "t-o",
+      profileId: other.id,
+      title: "Thread t-o",
+      titleEdited: true,
+      hermesSessionId: "gots-t-o",
+      createdAt: 20,
+      updatedAt: 20,
+      changedAt: 20,
+    })
+    await db.messages.put({
+      id: "t-o-open",
+      conversationId: "t-o",
+      role: "user",
+      content: "Opened t-o",
+      status: "done",
+      createdAt: 21,
+    })
+    localStorage.setItem(lastThreadKey(other.id), "t-o")
+    await mount(screen(`/c/${MAIN}`), async () => {
+      await until(async () => text().includes("2 threads"), "this bot's threads to load")
+      await settle()
+      assert.ok(
+        listLane().includes("w-full"),
+        `this bot's lane stands closed (the lane took ${listLane().join(" ")})`,
+      )
+      const count = holdThreadCount()
+      const frames: string[] = []
+      const look = () => frames.push(find('[data-slot="list-lane"]')?.className ?? "")
+      const observer = new MutationObserver(look)
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        characterData: true,
+      })
+      look()
+      try {
+        // The switch, while the other bot's thread list is still on its way: unknown is not
+        // closed, so the lane keeps the state and the width it had (ADR 0110).
+        await click(find("[data-to-other]"))
+        await settle()
+        count.release()
+        await until(
+          async () => titles().join("|") === "Otherly|Thread t-o",
+          "the new bot's thread beside its Main",
+        )
+      } finally {
+        observer.disconnect()
+        count.restore()
+      }
+      const railed = frames.filter((frame) => /\bw-103\b/.test(frame))
+      assert.deepEqual(
+        railed,
+        [],
+        `no frame between the two bots draws the 412px rail (${railed.length} did, of ${frames.length})`,
+      )
+      assert.deepEqual(titles(), ["Otherly", "Thread t-o"], "both panes are the new bot's")
     })
   }),
 )
@@ -348,11 +545,12 @@ test(
 )
 
 test(
-  "a thread beside Main carries no control of its own and no picture",
+  "a thread beside Main carries the close cross and no picture",
   laptop(async () => {
     localStorage.clear()
     await seed(["t-a"])
-    await mount(screen("/c/t-a"), async () => {
+    remembers("t-a")
+    await mount(screen(`/c/${MAIN}`), async () => {
       await until(async () => titles().includes("Thread t-a"), "the thread beside Main")
       await until(
         async () => Boolean(findAll('[data-slot="header-row"]')[0]?.querySelector('[role="img"]')),
@@ -361,10 +559,9 @@ test(
       const [main, thread] = findAll('[data-slot="header-row"]')
       assert.ok(main?.querySelector('[role="img"]'), "Main keeps the bot's picture beside its name")
       assert.equal(thread?.querySelector('[role="img"]'), null, "the thread beside it carries none")
-      assert.equal(
+      assert.ok(
         thread?.querySelector('[aria-label="Close thread"]'),
-        null,
-        "and no close control: the bot is beside it either way",
+        "and the close cross, where a phone's Back sits",
       )
       assert.equal(
         thread?.querySelector('[aria-label^="Back to"]'),
@@ -372,6 +569,375 @@ test(
         "and no way back, which it doesn't need where its bot is on screen",
       )
       assert.ok(thread?.querySelector('[aria-label="Chat options"]'), "its own menu is still there")
+    })
+  }),
+)
+
+test(
+  "the close cross by the thread's title closes it, and Main takes the lane",
+  laptop(async () => {
+    localStorage.clear()
+    await seed(["t-a", "t-b"])
+    remembers("t-a")
+    await mount(screen(`/c/${MAIN}`), async () => {
+      await until(async () => titles().join("|") === "Mainly|Thread t-a", "the thread beside Main")
+      assert.equal(listShare(), 50, "the thread stands beside Main in half the row")
+      await click(find('[aria-label="Close thread"]'))
+      await until(async () => titles().join("|") === "Mainly", "Main alone")
+      assert.deepEqual(titles(), ["Mainly"], "the bot's own header is the only one left")
+      assert.ok(
+        listLane().includes("w-full"),
+        `and Main takes the row's whole width (the lane took ${listLane().join(" ")})`,
+      )
+      assert.equal(remembered(bot.id), null, "the thread it closed is forgotten")
+    })
+  }),
+)
+
+test(
+  "closing the thread the address names lands Main with no slide",
+  laptop(async () => {
+    localStorage.clear()
+    await seed(["t-a", "t-b"])
+    await mount(screen("/c/t-a"), async () => {
+      // The lane answers with the address's thread first, so this is the thread beside Main.
+      await until(async () => titles().join("|") === "Mainly|Thread t-a", "the thread beside Main")
+      const animator = spyAnimate()
+      try {
+        await click(find('[aria-label="Close thread"]'))
+        // The entry the thread took is replaced by this bot's Main, so the address comes back with
+        // nothing pushed and nothing left to walk back into.
+        await until(async () => path() === `/c/${MAIN}`, "the address back on the bot's Main")
+        await until(async () => titles().join("|") === "Mainly", "Main alone")
+        assert.deepEqual(titles(), ["Mainly"], "the thread's pane is not beside Main any more")
+        assert.equal(remembered(bot.id), null, "the thread it closed is forgotten, not reopened")
+        assert.deepEqual(
+          animator.onScreen(),
+          [],
+          "and no page slide played for the Main that took its place",
+        )
+      } finally {
+        animator.restore()
+      }
+    })
+  }),
+)
+
+test(
+  "a thread closed here is not reopened on the next visit",
+  laptop(async () => {
+    localStorage.clear()
+    await seed(["t-a", "t-b"])
+    remembers("t-a")
+    await mount(screen(`/c/${MAIN}`), async () => {
+      await until(async () => titles().join("|") === "Mainly|Thread t-a", "the thread beside Main")
+      await click(find('[aria-label="Close thread"]'))
+      await until(async () => titles().join("|") === "Mainly", "Main alone")
+    })
+    // The next visit: the same bot, from its Main, with this page's store as the visit before left
+    // it and storage as a launch would read it.
+    await mount(screen(`/c/${MAIN}`), async () => {
+      await until(async () => text().includes("2 threads"), "Main's own threads to load")
+      await settle()
+      assert.deepEqual(titles(), ["Mainly"], "the bot's own header is the only one left")
+      assert.equal(remembered(bot.id), null, "and nothing is remembered for it")
+      assert.equal(
+        find('[data-slot="bot-pane-empty"]'),
+        null,
+        "a bot with threads is not the empty one",
+      )
+    })
+  }),
+)
+
+/**
+ * A run in flight over a thread a reader closes: the host's answer to the send, its live-runs ledger,
+ * and one event stream the test pushes into, so what lands while the pane is away is the host's own
+ * stream and not a row this test wrote into the store. Every request is recorded, which is what
+ * "the close posted nothing to stop it" is read from — a silence proves nothing.
+ */
+function liveRunInThread() {
+  const encoder = new TextEncoder()
+  const requests: { method: string; path: string }[] = []
+  let push = (_event: unknown) => {}
+  const events = new ReadableStream<Uint8Array>({
+    start(controller) {
+      push = (event) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
+    },
+  })
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input instanceof Request ? input.url : input))
+    const method = (init?.method ?? "GET").toUpperCase()
+    requests.push({ method, path: url.pathname })
+    if (url.pathname.endsWith("/capabilities"))
+      return json({ features: { run_submission: true, run_events_sse: true } })
+    if (url.pathname.endsWith("/plugins/gots/info")) return json({ features: [] })
+    if (url.pathname.endsWith("/skills")) return json({ object: "list", data: [] })
+    // The host's own account of the run, which is what a card's spinner stands on: the pane being
+    // closed says nothing about it.
+    if (url.pathname.endsWith("/plugins/gots/runs/live"))
+      return json({ sessions: { "gots-t-a": "running" }, run_ids: { "gots-t-a": "run-1" } })
+    if (url.pathname.endsWith("/v1/runs/run-1/events"))
+      return new Response(events, { headers: { "content-type": "text/event-stream" } })
+    if (url.pathname.endsWith("/v1/runs/run-1"))
+      return json({ status: "running", created_at: 1, output: "", usage: {} })
+    if (url.pathname.endsWith("/v1/runs") && method === "POST") return json({ run_id: "run-1" })
+    return json({})
+  }) as typeof fetch
+  return { requests, push }
+}
+
+/**
+ * The reply a run is writing in a thread: this device's own copy, which the screen being closed
+ * neither finishes nor stops writing.
+ */
+async function replyOf(thread: string) {
+  const rows = await db.messages.where("conversationId").equals(thread).toArray()
+  return rows.filter((row) => row.role === "assistant").at(-1)
+}
+
+test(
+  "a thread closed while it streams keeps running, and its card in Main still spins",
+  laptop(async () => {
+    localStorage.clear()
+    await seed(["t-a"])
+    remembers("t-a")
+    const host = liveRunInThread()
+    await mount(screen(`/c/${MAIN}`), async () => {
+      await until(async () => titles().join("|") === "Mainly|Thread t-a", "the thread beside Main")
+      // The send the thread's own composer makes, over a host that answers with a run.
+      void sendMessage("t-a", "Write the long answer").catch(() => undefined)
+      await until(
+        async () => host.requests.some((r) => r.method === "POST" && r.path.endsWith("/v1/runs")),
+        "the run's POST",
+      )
+      await until(
+        async () => host.requests.some((r) => r.path.endsWith("/v1/runs/run-1/events")),
+        "the run's events being followed",
+      )
+      await until(async () => (await replyOf("t-a"))?.status === "streaming", "the reply streaming")
+
+      // The reader puts the surface away mid-reply.
+      await click(find('[aria-label="Close thread"]'))
+      await until(async () => titles().join("|") === "Mainly", "Main alone")
+
+      assert.deepEqual(
+        host.requests.filter((r) => r.path.endsWith("/stop")),
+        [],
+        "nothing was posted to stop the run the reader put away",
+      )
+      assert.ok(
+        host.requests.some((r) => r.path.endsWith("/plugins/gots/runs/live")),
+        "the host still reports the run, which is what a card's spinner stands on",
+      )
+      assert.equal(
+        (await replyOf("t-a"))?.status,
+        "streaming",
+        "and this device's copy of the reply is still being written",
+      )
+      await until(
+        async () => Boolean(find(`${threadCard("t-a")} [data-slot="spinner"]`)),
+        "the closed thread's card still spinning",
+      )
+
+      // The run goes on at the host: a row lands while nothing draws the thread.
+      host.push({ event: "message.delta", delta: LANDED, seq: 1 })
+      await until(
+        async () => Boolean((await replyOf("t-a"))?.content.includes(LANDED)),
+        "the row to land in the thread's store",
+      )
+
+      // The thread again, from its card in Main.
+      await click(cardLink("t-a"))
+      await until(async () => path() === "/c/t-a", "the address to name the thread")
+      await until(async () => text().includes(LANDED), "the rows that landed while it was closed")
+      assert.deepEqual(
+        host.requests.filter((r) => r.path.endsWith("/stop")),
+        [],
+        "and opening it again posts no stop either",
+      )
+    })
+  }),
+)
+
+test("Escape closes the lane, and only where the thread is a lane", async () => {
+  localStorage.clear()
+  await seed(["t-a"])
+  remembers("t-a")
+  // A laptop, where the thread is the lane beside Main, then a phone, where it is a screen of its
+  // own with a Back: the key is the close cross's twin on the one and nothing at all on the other.
+  const beside = laptop(async () => {
+    await mount(screen(`/c/${MAIN}`), async () => {
+      await until(async () => titles().join("|") === "Mainly|Thread t-a", "the thread beside Main")
+      // A sheet or a menu that answers Escape itself keeps the key: the lane stands down.
+      const claim = (event: KeyboardEvent) => event.preventDefault()
+      window.addEventListener("keydown", claim, true)
+      await escape()
+      window.removeEventListener("keydown", claim, true)
+      assert.deepEqual(titles(), ["Mainly", "Thread t-a"], "a claimed Escape closes nothing")
+      assert.equal(remembered(bot.id), "t-a", "and the thread stays remembered")
+
+      await escape()
+      await until(async () => titles().join("|") === "Mainly", "Main alone")
+      assert.deepEqual(titles(), ["Mainly"], "Escape closes the lane the close cross would")
+      assert.equal(remembered(bot.id), null, "and the closed thread is forgotten")
+    })
+  })
+  // A visit of its own to a phone, remembering the thread it opens.
+  remembers("t-a")
+  const alone = atWidth(390, async () => {
+    await mount(screen("/c/t-a"), async () => {
+      await until(async () => titles().join("|") === "Thread t-a", "the thread's own screen")
+      assert.ok(find('[aria-label^="Back to"]'), "the thread is a screen, with a way back")
+      await escape()
+      assert.deepEqual(titles(), ["Thread t-a"], "Escape leaves a screen that is not a lane")
+      assert.equal(remembered(bot.id), "t-a", "and the thread it names stays remembered")
+    })
+  })
+  await beside()
+  await alone()
+})
+
+test(
+  "Escape in the thread's composer clears its text before it closes the lane",
+  laptop(async () => {
+    localStorage.clear()
+    await seed(["t-a"])
+    remembers("t-a")
+    // The harness has no editing commands, and the composer clears through the field where it can:
+    // a command it doesn't have answers false, which is the signal its own fallback waits for.
+    const command = Object.getOwnPropertyDescriptor(document, "execCommand")
+    Object.defineProperty(document, "execCommand", { configurable: true, value: () => false })
+    try {
+      await mount(screen(`/c/${MAIN}`), async () => {
+        await until(async () => titles().join("|") === "Mainly|Thread t-a", "the thread beside Main")
+        const field = threadComposer()
+        await type(field, "Half a thought")
+        assert.equal(field?.value, "Half a thought", "the thread's field holds what was typed")
+
+        // The field's own pair, "Escape, Escape — Clear the message": the first press is half of
+        // it, so it is the field's and not the lane's.
+        await escapeIn(field)
+        assert.deepEqual(titles(), ["Mainly", "Thread t-a"], "the first Escape leaves the lane up")
+        assert.equal(field?.value, "Half a thought", "and the text where the reader left it")
+
+        await escapeIn(field)
+        assert.equal(field?.value, "", "the second clears it")
+        assert.deepEqual(titles(), ["Mainly", "Thread t-a"], "and the lane is still up")
+
+        // An empty field has nothing to clear, so the Escape is the lane's and closes it.
+        await escapeIn(field)
+        await until(async () => titles().join("|") === "Mainly", "the lane closed on the empty field")
+        assert.equal(remembered(bot.id), null, "and the thread it put away is forgotten")
+      })
+    } finally {
+      if (command) Object.defineProperty(document, "execCommand", command)
+      else delete (document as { execCommand?: unknown }).execCommand
+    }
+  }),
+)
+
+test(
+  "Escape while dictating in the thread cancels the take and leaves the thread where it was",
+  laptop(async () => {
+    localStorage.clear()
+    await seed(["t-a"])
+    remembers("t-a")
+    installFakeMedia()
+    // A connection of this case's own: what a host answered about dictation is remembered for the
+    // page, and every other case's bot has answered without it.
+    const talking = botProfile("bot-pane-dictation", { id: bot.id, name: "Mainly" })
+    await db.profiles.put(talking)
+    // The bot hears a take; everything the real host answers that this case doesn't care about is
+    // the empty answer the other cases fake.
+    const hosted = dictationHost({ heard: "hello there" })
+    const dictation = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const answer = await dictation(input, init)
+      return answer.status === 404 ? json({}) : answer
+    }) as typeof fetch
+    await mount(screen(`/c/${MAIN}`), async () => {
+      await until(async () => titles().join("|") === "Mainly|Thread t-a", "the thread beside Main")
+      const mic = find('[data-pane="thread"] [aria-label="Voice"]')
+      await click(mic)
+      await until(
+        async () => Boolean(find('[role="group"][aria-label="Speech-to-text take"]')),
+        "the take's bar",
+      )
+      await until(async () => FakeRecorder.slices > 0, "the take's first slice")
+
+      // The take owns this Escape — the cheatsheet sells it as Cancel the recording — so it claims
+      // the key where it takes it, and the lane beside it never hears one.
+      await escape()
+      await until(
+        async () => Boolean(find('[data-pane="thread"] [aria-label="Voice"]')),
+        "the bar back to the microphone",
+      )
+      assert.equal(hosted.cancels().length, 1, "the take was cancelled, not left running")
+      assert.deepEqual(
+        titles(),
+        ["Mainly", "Thread t-a"],
+        "both chats are still on screen: the lane did not also put the thread away",
+      )
+      assert.equal(remembered(bot.id), "t-a", "and the lane still remembers the thread it holds")
+    })
+  }),
+)
+
+test(
+  "⌘\\ reopens the thread just closed, and nothing after leaving the bot",
+  laptop(async () => {
+    localStorage.clear()
+    await seed(["t-a", "t-b"])
+    // The bot to switch to: its Main is a place, whether or not it has a thread of its own.
+    await ensureMainThread(other.id)
+    await mount(screen(`/c/${MAIN}`), async () => {
+      // Of the two threads, the older one is opened: the chord has to bring back the thread it
+      // closed, which is not the newest one a "reopen the newest" would pick. The card is drawn
+      // once the bot's threads have answered, so the press waits for it rather than racing it.
+      await until(async () => Boolean(cardLink("t-a")), "the card that opens the older thread")
+      await click(cardLink("t-a"))
+      await until(async () => titles().join("|") === "Mainly|Thread t-a", "the older thread")
+      await click(find('[aria-label="Close thread"]'))
+      await until(async () => titles().join("|") === "Mainly", "Main alone")
+      assert.equal(remembered(bot.id), null, "a close forgets the thread, whatever comes after it")
+      // The lane really is closed — Main at the row's whole width — so the key below is one the
+      // shell hears rather than one it is still standing down from.
+      await until(async () => listLane().includes("w-full"), "the lane closed")
+
+      await reopen()
+      await until(async () => titles().join("|") === "Mainly|Thread t-a", "the thread, back")
+      assert.deepEqual(
+        titles(),
+        ["Mainly", "Thread t-a"],
+        "the thread this bot closed, and not the newest thread",
+      )
+      assert.equal(remembered(bot.id), "t-a", "and the lane holds it again")
+
+      // A chord on an open lane is no key at all: it never closes one.
+      await reopen()
+      assert.deepEqual(titles(), ["Mainly", "Thread t-a"], "the key leaves an open lane alone")
+      assert.equal(remembered(bot.id), "t-a", "and its thread remembered")
+
+      // The close belongs to this visit and this bot: another bot's Main is another place, and the
+      // visit that comes back finds nothing to put back.
+      await click(find('[aria-label="Close thread"]'))
+      await until(async () => titles().join("|") === "Mainly", "Main alone again")
+      await click(find("[data-to-other]"))
+      await until(async () => path() === `/c/${mainThreadId(other.id)}`, "the other bot's Main")
+      await click(find("[data-to-main]"))
+      await until(async () => path() === `/c/${MAIN}`, "this bot's Main again")
+      // The bot's list has answered, so the lane is closed rather than still on its way: the key
+      // below is one the shell really hears, and it opens nothing.
+      await until(async () => text().includes("2 threads"), "this bot's threads to load")
+      await settle()
+      assert.ok(
+        listLane().includes("w-full"),
+        `the lane stands closed (it took ${listLane().join(" ")})`,
+      )
+      await reopen()
+      assert.deepEqual(titles(), ["Mainly"], "nothing comes back: leaving the bot forgot the close")
+      assert.equal(remembered(bot.id), null, "so the lane stands closed, and nothing remembered")
     })
   }),
 )
@@ -404,6 +970,160 @@ test(
         true,
         "the same pane is still on screen: naming the thread it already held drew it again",
       )
+    })
+  }),
+)
+
+test(
+  "a bot's lane splits the row in half, and a feature's list keeps its 412px lane",
+  laptop(async () => {
+    localStorage.clear()
+    await seed(["t-a"])
+    localStorage.setItem(lastThreadKey(bot.id), "t-a")
+    await mount(screen(`/c/${MAIN}`), async () => {
+      await until(async () => titles().includes("Thread t-a"), "the thread beside Main")
+      await settle()
+      assert.equal(listShare(), 50, "Main and its thread take half the row each")
+    })
+    // The policy is the bot's lane's alone: Code's list is the lane it was designed around, so a
+    // split for bots costs every other feature nothing (ADR 0110).
+    await mount(codeScreen, async () => {
+      await until(async () => Boolean(find('[data-slot="list-lane"]')), "Code's own list lane")
+      await settle()
+      assert.ok(
+        listLane().includes("w-103"),
+        `Code's list keeps the 412px lane (it took ${listLane().join(" ")})`,
+      )
+    })
+  }),
+)
+
+test(
+  "the split's arrow keys move the edge, and Enter puts it back to half",
+  laptop(async () => {
+    localStorage.clear()
+    await seed(["t-a", "t-b"])
+    remembers("t-a")
+    await mount(screen(`/c/${MAIN}`), async () => {
+      await until(async () => titles().join("|") === "Mainly|Thread t-a", "the thread beside Main")
+      assert.equal(
+        splitEdge()?.getAttribute("role"),
+        "separator",
+        "the edge between the chats is a separator of its own",
+      )
+      assert.equal(splitEdge()?.getAttribute("aria-orientation"), "vertical")
+      assert.equal(splitEdge()?.getAttribute("tabindex"), "0", "and a reader's keys reach it")
+      assert.equal(splitEdge()?.getAttribute("aria-valuenow"), "50", "it reads the share it holds")
+      assert.equal(listShare(), 50, "which is the share the lane draws")
+
+      await key("ArrowRight")
+      assert.equal(
+        splitEdge()?.getAttribute("aria-valuenow"),
+        "54",
+        "the right arrow gives Main more",
+      )
+      assert.equal(listShare(), 54, "and the lane follows the handle")
+      assert.equal(localStorage.getItem(SPLIT_KEY), "0.54", "the move is kept on this device")
+      await key("ArrowLeft", { shiftKey: true })
+      assert.equal(
+        splitEdge()?.getAttribute("aria-valuenow"),
+        "38",
+        "Shift moves it four times as far",
+      )
+      await key("Enter")
+      assert.equal(splitEdge()?.getAttribute("aria-valuenow"), "50", "Enter puts it back to half")
+      assert.equal(listShare(), 50, "the lane with it")
+      assert.equal(localStorage.getItem(SPLIT_KEY), "0.5", "and half is what the device keeps")
+    })
+  }),
+)
+
+test(
+  "the lane opens by rearranging, not by sliding",
+  laptop(async () => {
+    localStorage.clear()
+    await seed(["t-a"])
+    await mount(screen(`/c/${MAIN}`), async () => {
+      // A bot with a thread and none remembered: Main alone, at the lane's whole width.
+      await until(async () => Boolean(cardLink("t-a")), "the card that opens the thread")
+      await settle()
+      assert.deepEqual(titles(), ["Mainly"], "Main alone before the thread opens")
+      assert.ok(
+        listLane().includes("w-full"),
+        `and the lane's whole width (the lane took ${listLane().join(" ")})`,
+      )
+      const animator = spyAnimate()
+      try {
+        await click(cardLink("t-a"))
+        await until(
+          async () => titles().join("|") === "Mainly|Thread t-a",
+          "the thread beside Main",
+        )
+        await settle()
+        assert.equal(listShare(), 50, "the edge landed half way")
+        const slides = animator.asked
+          .filter((one) =>
+            one.keyframes.some((frame) => String(frame.transform ?? "").includes("translateX")),
+          )
+          .map(
+            (one) => `${one.element} ${one.keyframes.map((frame) => frame.transform).join(" → ")}`,
+          )
+        assert.deepEqual(
+          slides,
+          [],
+          `the lane opens by the edge moving, and nothing slides (saw ${slides.join("; ")})`,
+        )
+      } finally {
+        animator.restore()
+      }
+      // And both ways of putting it away still close it: the cross, then the key.
+      await click(find('[aria-label="Close thread"]'))
+      await until(async () => titles().join("|") === "Mainly", "the close cross's close")
+      await click(cardLink("t-a"))
+      await until(async () => titles().join("|") === "Mainly|Thread t-a", "the thread again")
+      await escape()
+      await until(async () => titles().join("|") === "Mainly", "Escape's close")
+    })
+  }),
+)
+
+test(
+  "a bot's lane open plays no slide when the policy beside it slides",
+  laptop(async () => {
+    localStorage.clear()
+    await seed(["t-a"])
+    remembers("t-a")
+    await mount(screen(`/c/${MAIN}`), async () => {
+      await until(async () => titles().join("|") === "Mainly|Thread t-a", "the thread beside Main")
+      await settle()
+      const animator = spyAnimate()
+      try {
+        // Code's lane slides its item in where a bot's rearranges. The lane never closed — Main and
+        // its thread were open before and the list's lane is open after — so the entrance is no
+        // pane's to replay: it belongs to an opening, not to the policy that followed it (ADR 0110).
+        await click(find("[data-switch]"))
+        await until(async () => path() === "/code", "Code's own screen")
+        await until(async () => Boolean(find('[data-slot="list-lane"]')), "Code's own lane")
+        await settle()
+        const slides = animator.asked
+          .filter((one) =>
+            one.keyframes.some((frame) => String(frame.transform ?? "").includes("translateX")),
+          )
+          .map(
+            (one) => `${one.element} ${one.keyframes.map((frame) => frame.transform).join(" → ")}`,
+          )
+        assert.deepEqual(
+          slides,
+          [],
+          `a lane that stayed open slides nothing in (saw ${slides.join("; ")})`,
+        )
+        assert.ok(
+          listLane().includes("w-103"),
+          `and Code's lane is the 412px one it was designed around (it took ${listLane().join(" ")})`,
+        )
+      } finally {
+        animator.restore()
+      }
     })
   }),
 )
