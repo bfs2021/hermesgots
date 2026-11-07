@@ -18,6 +18,7 @@ import { useLiveQuery } from "dexie-react-hooks"
 import { MemoryRouter, Navigate, Route, Routes, useLocation, useParams } from "react-router"
 
 import { BotSettingsList, BotSettingsPage } from "@/components/bot-settings"
+import { SettingsPage } from "@/routes/settings"
 import { botSubOf } from "@/lib/bot-subs"
 import { botTabOf, botTabPath } from "@/lib/bot-tabs"
 import { connectionKey } from "@/lib/connection"
@@ -274,6 +275,20 @@ export const editor = (path: string) => (
   </MemoryRouter>
 )
 
+/**
+ * The same address, drawn as the app's own settings route draws it: the Screen a page sits in, and so
+ * the header a sub-screen wears — the title it takes over, and the back that leaves it. The page's
+ * own back control is this mount's, never the page's.
+ */
+export const routedEditor = (path: string) => (
+  <MemoryRouter initialEntries={[path]}>
+    <Where />
+    <Routes>
+      <Route path="/settings/:section?/:botId?/:tab?/:sub?/:leaf?" element={<SettingsPage />} />
+    </Routes>
+  </MemoryRouter>
+)
+
 export const here = () => find("[data-here]")?.textContent
 /** The page itself, and its row in the list beside it. */
 export const speechPage = () => find("[data-bot-dictation]")
@@ -363,13 +378,18 @@ export const openCleanup = async () => {
   await until(async () => Boolean(modelRow("Default")), "the bot's own models")
 }
 
-/** The Vocabulary detail's own pieces: a word's remove button, the add field, and the buttons. */
+/** The Vocabulary detail's own pieces: a word's remove button, and the sheet the header's + opens. */
 export const vocabulary = () => find("[data-vocabulary]")
 export const removeButton = (word: string) => find(`[aria-label="Remove ${word}"]`)
-export const addField = () => find('[aria-label="Add a word"]')
-export const detailButton = (label: string) =>
-  findAll("[data-vocabulary] button").find((one) => one.textContent?.trim() === label) ?? null
-export const add = () => click(detailButton("Add"))
+/** The header's + — a Screen's, so it is there on the app's own route and not on a bare page mount. */
+export const addButton = () => find("[data-vocabulary-add]")
+/** The field the + opens: it is in the sheet, so only while the sheet is. */
+export const addField = () => find("#vocabulary-word")
+export const openAdd = async () => {
+  await click(addButton())
+  await until(async () => Boolean(addField()), "the sheet's field")
+}
+export const add = () => click(sheetButton("Add"))
 /** What the add field holds now, as the user reads it. */
 export const draft = () => (addField() as HTMLInputElement | null)?.value ?? null
 

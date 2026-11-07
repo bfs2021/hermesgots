@@ -4,6 +4,7 @@ import test from "node:test"
 import {
   speech,
   editor,
+  routedEditor,
   here,
   speechPage,
   speechRow,
@@ -25,9 +26,10 @@ import {
   vocabulary,
   removeButton,
   addField,
-  detailButton,
+  addButton,
+  openAdd,
   add,
-  draft,
+  sheetButton,
   seed,
   seedCache,
   loading,
@@ -38,6 +40,10 @@ import {
 import { click, find, findAll, mount, type, until } from "./component-kit.tsx"
 import { connectionKey } from "@/lib/connection"
 import { db } from "@/lib/db"
+
+/** Any button on screen showing nothing but Done: the footer every drill-in used to end with. */
+const doneFooter = () =>
+  findAll("button").find((one) => one.textContent?.trim() === "Done") ?? null
 
 test("a host that can hear speech has a Speech-to-text page, its Vocabulary row counting the words", async () => {
   await seed("dictating", ["dictation"], { vocabulary: ["Haseeb"] })
@@ -124,42 +130,59 @@ test("the Vocabulary detail lists the bot's words, each with a way to remove it"
     assert.match(body, /Haseeb/, "and the second")
     assert.ok(removeButton("Haseeb"), "each word has a button that names the word it removes")
     assert.equal(findAll("[data-vocabulary] h2").length, 0, "no heading over the list")
-    assert.ok(addField(), "and the field to add a word is on the screen")
+    assert.equal(addField(), null, "and no add field on the list: the header's + opens one")
     assert.doesNotMatch(body, /No words yet\./, "the empty line stays away while words are held")
   })
 })
 
-test("the Vocabulary detail says No words yet. where the bot holds none", async () => {
+test("the Vocabulary detail says No words yet. as a line of text, not a card", async () => {
   await seed("vocabulary-empty", ["dictation"])
   await mount(editor("/settings/bots/bot-1/speech-to-text/vocabulary"), async () => {
     assert.match(vocabulary()?.textContent ?? "", /No words yet\./, "the empty list says so")
     assert.ok(!removeButton("Gots"), "with no word to remove")
-    assert.equal(detailButton("Add")?.hasAttribute("disabled"), true, "and nothing to add yet")
+    assert.equal(
+      vocabulary()?.querySelector("[data-settings-group]"),
+      null,
+      "and no card around a list holding nothing",
+    )
   })
 })
 
-test("a word added on the screen is written into the bot's record", async () => {
+test("the header's + opens the word sheet, and Add writes it into the bot's record", async () => {
   await seed("adding", ["dictation"])
-  await mount(editor("/settings/bots/bot-1/speech-to-text/vocabulary"), async () => {
-    assert.equal(detailButton("Add")?.hasAttribute("disabled"), true, "Add waits for a word")
+  await mount(routedEditor("/settings/bots/bot-1/speech-to-text/vocabulary"), async () => {
+    assert.equal(addField(), null, "no field on the page itself")
+    await openAdd()
+    assert.equal(
+      find('[data-slot="sheet-title"]')?.textContent,
+      "Add a word",
+      "the sheet says what it adds",
+    )
+    assert.equal(addButton()?.getAttribute("aria-label"), "Add a word", "and the + names it too")
+    assert.equal(
+      sheetButton("Add")?.hasAttribute("disabled"),
+      true,
+      "Add waits for a word",
+    )
     await type(addField(), "Gots")
     assert.equal(
-      detailButton("Add")?.hasAttribute("disabled"),
+      sheetButton("Add")?.hasAttribute("disabled"),
       false,
       "and opens once one is typed",
     )
     await add()
-    assert.ok(removeButton("Gots"), "the word is on the screen")
+    await until(async () => Boolean(removeButton("Gots")), "the word on the list")
     const saved = await db.profiles.get("bot-1")
     assert.deepEqual(saved?.vocabulary, ["Gots"], "and in the bot's record")
     assert.ok((saved?.updatedAt ?? 0) > 1, "the record is stamped as changed")
-    assert.equal(draft(), "", "the field is empty again")
+    assert.equal(addField(), null, "the sheet closes on the write")
   })
 })
 
 test("a word the list already holds is not added again", async () => {
   await seed("repeated", ["dictation"], { vocabulary: ["Gots"] })
-  await mount(editor("/settings/bots/bot-1/speech-to-text/vocabulary"), async () => {
+  await mount(routedEditor("/settings/bots/bot-1/speech-to-text/vocabulary"), async () => {
+    await openAdd()
     await type(addField(), "gots")
     await add()
     assert.equal((await db.profiles.get("bot-1"))?.vocabulary?.length, 1, "the list keeps one")
@@ -178,12 +201,20 @@ test("a word removed from the screen leaves the record", async () => {
   })
 })
 
-test("the Vocabulary detail's Done takes the page back over the list", async () => {
-  await seed("vocabulary-done", ["dictation"], { vocabulary: ["Gots"] })
-  await mount(editor("/settings/bots/bot-1/speech-to-text/vocabulary"), async () => {
-    await click(detailButton("Done"))
+/**
+ * A drill-in closes the way General's one detail does: the screen's header carries the back, and the
+ * page adds no footer button repeating it. Mounted on the app's own route, so the header and its
+ * back are the ones a user has.
+ */
+test("the Vocabulary page has no Done of its own: the screen's back returns to the page", async () => {
+  await seed("vocabulary-back", ["dictation"], { vocabulary: ["Gots"] })
+  await mount(routedEditor("/settings/bots/bot-1/speech-to-text/vocabulary"), async () => {
+    await until(async () => Boolean(vocabulary()), "the words")
+    assert.equal(find("h1")?.textContent, "Vocabulary", "the screen is titled with the page")
+    assert.equal(doneFooter(), null, "and no Done footer repeats the header's way out")
+    await click(find('button[aria-label="Back"]'))
+    await until(async () => Boolean(speechPage()), "the page the row sits in")
     assert.equal(here(), "/settings/bots/bot-1/speech-to-text", "the page's own address")
-    assert.ok(speechPage(), "and the page is drawn again")
     assert.ok(!vocabulary(), "with the list gone")
   })
 })
