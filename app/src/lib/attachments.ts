@@ -2,14 +2,19 @@ import { useSyncExternalStore } from "react"
 import { toast } from "sonner"
 
 import {
+  carriesPart,
   fitsInline,
   inlineRefusal,
   intake,
   isPhoto,
   keptImage,
   MAX_FILE_BYTES,
+  pickRoad,
+  ridesInline,
   sizeRefusal,
   type Refusal,
+  type RoadFacts,
+  type RouteAnswer,
 } from "@/lib/attachment-caps"
 import { attachmentParts } from "@/lib/attachment-text"
 import type { Attachment } from "@/lib/db"
@@ -60,46 +65,61 @@ function jpegName(name: string) {
 }
 
 /**
- * Reads a picked file into an attachment. An image the browser can decode is scaled down for the
- * model, while the copy kept — the bytes the host stores and this device caches — stays the file
- * the user chose, unless it is too big to send, when the scaled copy stands in for it. With
- * `inline: false` (a model that takes no images) every image goes as the file it is.
+ * One attachment, from what a read decided: the bytes kept, whether the file is a picture, and the
+ * part the model is sent where one rides. The type and size are the kept bytes' own, so a scaled
+ * copy can never be described as the photo it stands in for.
  */
-export async function prepareAttachment(file: File, inline = true): Promise<Attachment> {
-  const name = file.name || "file"
-  if (inline && isPhoto(file.type)) {
-    const photo = await scaled(file)
-    if (photo) {
-      const { kept, inline: part } = keptImage<Blob>(file, photo.blob)
-      return {
-        id: randomId(),
-        name: kept === file ? name : jpegName(name),
-        type: kept.type || file.type,
-        size: kept.size,
-        image: true,
-        blob: kept,
-        ...(part ? { inline: part } : {}),
-        width: photo.width,
-        height: photo.height,
-      }
-    }
-  }
-  if (file.size > MAX_FILE_BYTES) throw new Error(sizeRefusal(name).message)
+function attachmentOf({
+  name,
+  blob,
+  picture,
+  part,
+  width,
+  height,
+}: {
+  name: string
+  blob: Blob
+  picture: boolean
+  part?: Blob
+  width?: number
+  height?: number
+}): Attachment {
   return {
     id: randomId(),
     name,
-    type: file.type || "application/octet-stream",
-    size: file.size,
-    image: false,
-    blob: file,
+    type: blob.type || "application/octet-stream",
+    size: blob.size,
+    image: picture,
+    blob,
+    ...(part ? { inline: part } : {}),
+    ...(width === undefined ? {} : { width, height }),
   }
 }
 
-/** What an attachment adds to a request inline: an image's scaled part, and nothing else. */
-export const inlineSize = (attachment: Attachment) =>
-  attachment.image ? ((attachment.inline ?? attachment.blob)?.size ?? 0) : 0
+export async function prepareAttachment(file: File, inline: boolean): Promise<Attachment> {
+  const name = file.name || "file"
+  if (!isPhoto(file.type)) {
+    if (file.size > MAX_FILE_BYTES) throw new Error(sizeRefusal(name).message)
+    return attachmentOf({ name, blob: file, picture: false })
+  }
+  const photo = inline || file.size > MAX_FILE_BYTES ? await scaled(file) : null
+  if (!photo && file.size > MAX_FILE_BYTES) throw new Error(sizeRefusal(name).message)
+  const { kept, inline: part } = keptImage<Blob>(file, photo?.blob ?? null)
+  return attachmentOf({
+    name: kept === file ? name : jpegName(name),
+    blob: kept,
+    picture: true,
+    part: inline && photo ? part : undefined,
+    width: photo?.width,
+    height: photo?.height,
+  })
+}
 
-/** The bytes a message's photos add to its request. */
+/** What an attachment adds to a request inline: the bytes it carries for the model, and nothing else. */
+export const inlineSize = (attachment: Attachment) =>
+  carriesPart(attachment) ? attachment.inline.size : 0
+
+/** The bytes a message's inline parts add to its request. */
 export const inlineBytes = (attachments: Attachment[]) =>
   attachments.reduce((sum, attachment) => sum + inlineSize(attachment), 0)
 
@@ -109,35 +129,41 @@ export interface PreparedIntake {
   refusals: Refusal[]
 }
 
-/**
- * What `files` becomes on a message already holding `held` attachments — the one intake a pick, a
- * paste, a drop and a share land through. `onTake` is how a surface holds the place of the files it
- * is now reading.
- */
 export async function prepareIntake(
   files: File[],
   {
     held = [],
     reserved = 0,
-    inline = true,
+    readsImages,
+    route,
     onTake,
   }: {
     /** The attachments the message already carries, whose count and inline room these share. */
     held?: Attachment[]
     /** Files already being read for this message, which hold a place in the count. */
     reserved?: number
-    /** Whether the model takes images; with none, an image goes as the file it is. */
-    inline?: boolean
+    /** Whether the chosen model takes image input: `pickRoad`'s first fact. */
+    readsImages: boolean
+    /** What the host answered about the plugin's upload route: `pickRoad`'s second fact. */
+    route: RouteAnswer
     /** Called with the files that passed the caps, before any of them is read. */
     onTake?: (take: File[]) => void
-  } = {},
+  },
 ): Promise<PreparedIntake> {
-  const { take, refusals } = intake(files, held.length + reserved, { inline })
+  const facts: RoadFacts = { readsImages, route }
+  let because: string | null = null
+  const onRoad = files.filter((file) => {
+    const road = pickRoad({ ...facts, picture: isPhoto(file.type) })
+    if (road.road === "none") because ??= road.message
+    return road.road !== "none"
+  })
+  const { take, refusals: capped } = intake(onRoad, held.length + reserved)
+  const refusals: Refusal[] = because ? [{ limit: "route", message: because }, ...capped] : capped
   onTake?.(take)
   const answers = await Promise.all(
     take.map(async (file): Promise<{ attachment?: Attachment; error?: Error }> => {
       try {
-        return { attachment: await prepareAttachment(file, inline) }
+        return { attachment: await prepareAttachment(file, ridesInline(file, facts)) }
       } catch (error) {
         return {
           error: error instanceof Error ? error : new Error(`Couldn't attach ${file.name}.`),
@@ -249,18 +275,14 @@ function blobToDataUrl(blob: Blob) {
   })
 }
 
-/** The message's content for Hermes: the text with a marker per attachment, and each photo inline. */
 export async function wireContent(
   text: string,
   attachments: Attachment[] = [],
 ): Promise<string | ContentPart[]> {
   if (!attachments.length) return text
   const parts = attachmentParts(text, attachments)
-  // The model reads the scaled copy, never a file too big for the request to carry.
-  for (const attachment of attachments) {
-    const part = attachment.inline ?? attachment.blob
-    if (attachment.image && part)
-      parts.push({ type: "image_url", image_url: { url: await blobToDataUrl(part) } })
-  }
+  const carried = attachments.filter(carriesPart)
+  const urls = await Promise.all(carried.map((attachment) => blobToDataUrl(attachment.inline)))
+  for (const url of urls) parts.push({ type: "image_url", image_url: { url } })
   return parts
 }

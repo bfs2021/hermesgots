@@ -141,13 +141,14 @@ export function SharePage() {
     if (!share || !profile || readStarted.current === share.id) return
     readStarted.current = share.id
     let live = true
-    void prepareIntake(share.files, { inline: imagesAvailable }).then(
-      ({ attachments, refusals }) => {
-        if (!live) return
-        for (const refusal of [...share.refused, ...refusals]) toast.error(refusal.message)
-        setRead({ share: share.id, files: attachments })
-      },
-    )
+    void prepareIntake(share.files, {
+      readsImages: imagesAvailable,
+      route: "yes",
+    }).then(({ attachments, refusals }) => {
+      if (!live) return
+      for (const refusal of [...share.refused, ...refusals]) toast.error(refusal.message)
+      setRead({ share: share.id, files: attachments })
+    })
     return () => {
       live = false
     }

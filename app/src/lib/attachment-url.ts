@@ -21,6 +21,11 @@ export function drawingBlob(attachment: Attachment) {
   return attachment.blob
 }
 
+export function drawable(attachment: Attachment) {
+  const blob = drawingBlob(attachment)
+  return Boolean(blob && renderableImage(blob.type))
+}
+
 /** This device's own bytes behind an attachment, as an object URL, or nothing where it holds none. */
 export function attachmentUrl(attachment: Attachment) {
   const blob = drawingBlob(attachment)

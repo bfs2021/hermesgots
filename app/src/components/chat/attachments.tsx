@@ -2,7 +2,7 @@ import { DownloadIcon, FileIcon, ImageIcon, XIcon } from "lucide-react"
 
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
-import { attachmentUrl } from "@/lib/attachment-url"
+import { attachmentUrl, drawable } from "@/lib/attachment-url"
 import { formatBytes } from "@/lib/attachment-caps"
 import { useUploading } from "@/lib/attachments"
 import type { Attachment } from "@/lib/db"
@@ -73,7 +73,7 @@ export function AttachmentTile({
   className?: string
 }) {
   const uploading = useUploading(attachment.id)
-  const url = attachment.image ? attachmentUrl(attachment) : undefined
+  const url = drawable(attachment) ? attachmentUrl(attachment) : undefined
   const Icon = attachment.image ? ImageIcon : action === "download" ? DownloadIcon : FileIcon
   const busy = preparing || uploading
   const tile = url ? (

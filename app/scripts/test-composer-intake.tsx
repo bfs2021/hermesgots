@@ -10,30 +10,51 @@ import { toast } from "sonner"
 
 import { Composer } from "@/components/chat/composer"
 import { MAX_FILE_BYTES } from "@/lib/attachment-caps"
+import { wireContent } from "@/lib/attachments"
 import type { Attachment } from "@/lib/db"
+import type { PluginFeatureAnswer } from "@/lib/features"
+import { uploadAttachments } from "@/lib/send-turn"
 
 import { PreviewerProvider } from "@/components/chat/previewer"
 
-import { click, connection, findAll, mount, settle, until } from "./component-kit.tsx"
+import { click, connection, findAll, json, mount, settle, until } from "./component-kit.tsx"
 
 const bot = connection("composer-intake")
 
+/** A host that saves a file on the route it is posted to and answers where it put it. */
+function host(name: string) {
+  const saved: { name: string; type: string }[] = []
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input instanceof Request ? input.url : input))
+    if (!url.host.startsWith(name)) return json({})
+    if (url.pathname.endsWith("/attachments") && init?.method === "POST") {
+      const file = url.searchParams.get("name") ?? ""
+      saved.push({ name: file, type: (init.body as Blob).type })
+      return json({ name: file, path: `/host/${file}`, size: (init.body as Blob).size })
+    }
+    return json({})
+  }) as typeof fetch
+  return saved
+}
+
 function composer(
   sent: { text: string; attachments: Attachment[] }[],
-  filesFeature: "unknown" | "yes" | "no" = "yes",
+  filesFeature: PluginFeatureAnswer = "yes",
+  imagesAvailable = true,
+  send?: (text: string, attachments: Attachment[]) => Promise<void> | void,
 ) {
   return (
     <Composer
       busy={false}
-      onSend={(text, attachments) => {
+      onSend={send ?? ((text, attachments) => {
         sent.push({ text, attachments })
-      }}
+      })}
       onQueue={() => {}}
       onStop={() => {}}
       onCommand={() => {}}
       connection={bot}
       filesFeature={filesFeature}
-      imagesAvailable
+      imagesAvailable={imagesAvailable}
     />
   )
 }
@@ -163,6 +184,25 @@ test("a pasted file is refused where the menu's Files is off, in the menu's own 
   }
 })
 
+test("a pasted photo is refused where the host has no upload route, in the same words", async () => {
+  const said: string[] = []
+  const original = toast.error
+  const sent: { text: string; attachments: Attachment[] }[] = []
+  toast.error = ((message: unknown) => {
+    said.push(String(message))
+  }) as typeof toast.error
+  try {
+    await mount(composer(sent, "no", false), async () => {
+      await paste([new File(["png"], "cat.png", { type: "image/png", lastModified: 6 })])
+      assert.deepEqual(said, ["File uploads need a newer Gots plugin."], "the route's own reason")
+      assert.deepEqual(tileNames(), [], "a picture nothing can carry never lands")
+      assert.deepEqual(sent, [])
+    })
+  } finally {
+    toast.error = original
+  }
+})
+
 test("a file dropped where no plugin answered is refused the same way", async () => {
   const said: string[] = []
   const original = toast.error
@@ -227,6 +267,197 @@ test("a clip picked from the gallery lands, and one over nine megabytes is refus
   }
 })
 
+test("a photo picked for a model that takes no pictures lands as a file, and its send names the path", async () => {
+  const saved = host("composer-intake")
+  const sent: { text: string; attachments: Attachment[] }[] = []
+  const send = async (text: string, attachments: Attachment[]) => {
+    sent.push({ text, attachments: await uploadAttachments(bot, "session-1", attachments, true) })
+  }
+  await mount(composer(sent, "yes", false, send), async () => {
+    await pick("camera", [
+      new File(["heic"], "IMG_0001.heic", { type: "image/heic", lastModified: 7 }),
+    ])
+    assert.deepEqual(tileNames(), ["IMG_0001.heic"], "the pick lands, on the host's file road")
+    await click(findAll("button").find((one) => one.getAttribute("aria-label") === "Send"))
+    await until(async () => sent.length > 0, "the send")
+
+    assert.deepEqual(
+      saved,
+      [{ name: "IMG_0001.heic", type: "image/heic" }],
+      "the host is handed the photo itself",
+    )
+    const [photo] = sent[0].attachments
+    assert.equal(photo.image, true, "it is still the picture it is")
+    assert.equal(photo.inline, undefined, "and no bytes of it ride in the message")
+    assert.equal(photo.path, "/host/IMG_0001.heic", "the path the host answered with")
+
+    const parts = await wireContent(sent[0].text, sent[0].attachments)
+    const said =
+      typeof parts === "string"
+        ? parts
+        : parts
+            .map((part) => (part.type === "text" ? part.text : `[${part.type}]`))
+            .join("\n")
+    assert.match(said, /path="\/host\/IMG_0001\.heic"/, "the message names the copy the agent opens")
+    assert.doesNotMatch(said, /\[screenshot\]/, "and no photo is promised inline")
+    assert.match(
+      said,
+      /is not included in this message/,
+      "the message says the bytes stayed on the host",
+    )
+  })
+})
+
+test("a photo over nine megabytes is scaled to fit on the file road", async () => {
+  const saved = host("composer-intake")
+  const sent: { text: string; attachments: Attachment[] }[] = []
+  const send = async (text: string, attachments: Attachment[]) => {
+    sent.push({ text, attachments: await uploadAttachments(bot, "session-1", attachments, true) })
+  }
+  // jsdom decodes no image, draws none and makes no object URL: the browser's own effect stands in.
+  const proto = Object.getPrototypeOf(document.createElement("canvas")) as HTMLCanvasElement
+  const real = {
+    bitmap: globalThis.createImageBitmap,
+    context: proto.getContext,
+    toBlob: proto.toBlob,
+    create: URL.createObjectURL,
+    revoke: URL.revokeObjectURL,
+  }
+  globalThis.createImageBitmap = (async () => ({
+    width: 4000,
+    height: 3000,
+    close: () => {},
+  })) as unknown as typeof createImageBitmap
+  proto.getContext = (() => ({ drawImage() {} })) as typeof proto.getContext
+  proto.toBlob = ((done: BlobCallback) =>
+    done(new Blob(["jpeg"], { type: "image/jpeg" }))) as typeof proto.toBlob
+  URL.createObjectURL = (blob: Blob | MediaSource) => `blob:${(blob as Blob).type}`
+  URL.revokeObjectURL = () => {}
+  const refusals: string[] = []
+  const original = toast.error
+  toast.error = ((message: unknown) => {
+    refusals.push(String(message))
+  }) as typeof toast.error
+  try {
+    await mount(composer(sent, "yes", false, send), async () => {
+      await pick("camera", [
+        new File([new Uint8Array(MAX_FILE_BYTES + 1)], "IMG_0001.heic", {
+          type: "image/heic",
+          lastModified: 9,
+        }),
+      ])
+      assert.deepEqual(refusals, [], "nothing is refused over its size")
+      await until(async () => tileNames().length === 1, "the photo's tile")
+      assert.deepEqual(tileNames(), ["IMG_0001.jpg"], "the scaled JPEG is what is on the message")
+
+      await click(findAll("button").find((one) => one.getAttribute("aria-label") === "Send"))
+      await until(async () => sent.length > 0, "the send")
+
+      assert.deepEqual(
+        saved,
+        [{ name: "IMG_0001.jpg", type: "image/jpeg" }],
+        "the host is handed the JPEG, not the photo it could not take",
+      )
+      const [photo] = sent[0].attachments
+      assert.equal(photo.image, true, "it is still the picture it is")
+      assert.equal(photo.inline, undefined, "and no bytes of it ride in the message")
+      assert.equal(photo.type, "image/jpeg", "the copy is typed as what it is")
+      assert.ok(photo.size < MAX_FILE_BYTES, "the copy is the scaled one, so it fits the cap")
+      assert.equal(photo.name, "IMG_0001.jpg", "named after the photo the user picked")
+
+      const parts = await wireContent(sent[0].text, sent[0].attachments)
+      const said =
+        typeof parts === "string"
+          ? parts
+          : parts
+              .map((part) => (part.type === "text" ? part.text : `[${part.type}]`))
+              .join("\n")
+      assert.match(said, /path="\/host\/IMG_0001\.jpg"/, "the message names the copy the agent opens")
+      assert.doesNotMatch(said, /\[screenshot\]/, "and no photo is promised inline")
+    })
+  } finally {
+    toast.error = original
+    if (real.bitmap) globalThis.createImageBitmap = real.bitmap
+    else delete (globalThis as { createImageBitmap?: typeof createImageBitmap }).createImageBitmap
+    proto.getContext = real.context
+    proto.toBlob = real.toBlob
+    URL.createObjectURL = real.create
+    URL.revokeObjectURL = real.revoke
+  }
+})
+
+test("a photo over nine megabytes the browser can't decode is still refused by its size", async () => {
+  const refusals: string[] = []
+  const original = toast.error
+  toast.error = ((message: unknown) => {
+    refusals.push(String(message))
+  }) as typeof toast.error
+  try {
+    await mount(composer([], "yes", false), async () => {
+      await pick("camera", [
+        new File([new Uint8Array(MAX_FILE_BYTES + 1)], "IMG_0003.heic", {
+          type: "image/heic",
+          lastModified: 12,
+        }),
+      ])
+      assert.deepEqual(refusals, ["IMG_0003.heic is over the 9 MB limit."])
+      assert.deepEqual(tileNames(), [], "and it never lands")
+    })
+  } finally {
+    toast.error = original
+  }
+})
+
+test("a photo the browser can't decode is still the picture it is, and carries no part", async () => {
+  const saved = host("composer-intake")
+  const sent: { text: string; attachments: Attachment[] }[] = []
+  const send = async (text: string, attachments: Attachment[]) => {
+    sent.push({ text, attachments: await uploadAttachments(bot, "session-1", attachments, true) })
+  }
+  await mount(composer(sent, "yes", true, send), async () => {
+    await pick("photos", [
+      new File(["heic"], "IMG_0004.heic", { type: "image/heic", lastModified: 13 }),
+    ])
+    assert.deepEqual(tileNames(), ["IMG_0004.heic"], "the pick lands")
+    await click(findAll("button").find((one) => one.getAttribute("aria-label") === "Send"))
+    await until(async () => sent.length > 0, "the send")
+
+    assert.deepEqual(saved, [{ name: "IMG_0004.heic", type: "image/heic" }], "the host keeps it")
+    const [photo] = sent[0].attachments
+    assert.equal(photo.image, true, "it is the picture it is, on either road")
+    assert.equal(photo.inline, undefined, "and no undecodable bytes ride in the message")
+
+    const parts = await wireContent(sent[0].text, sent[0].attachments)
+    const said =
+      typeof parts === "string"
+        ? parts
+        : parts.map((part) => (part.type === "text" ? part.text : `[${part.type}]`)).join("\n")
+    assert.doesNotMatch(said, /\[screenshot\]/, "no image part is promised")
+    assert.match(said, /is not included in this message/, "and the message says where it is")
+  })
+})
+
+test("a photo picked before the host answered is tried, not refused", async () => {
+  const said: string[] = []
+  const original = toast.error
+  const sent: { text: string; attachments: Attachment[] }[] = []
+  toast.error = ((message: unknown) => {
+    said.push(String(message))
+  }) as typeof toast.error
+  try {
+    await mount(composer(sent, "unknown", false), async () => {
+      await pick("photos", [
+        new File(["heic"], "IMG_0002.heic", { type: "image/heic", lastModified: 11 }),
+      ])
+      assert.deepEqual(tileNames(), ["IMG_0002.heic"], "the pick is tried on the host's file road")
+      assert.deepEqual(said, [], "and nothing is refused over an answer still owed")
+      assert.deepEqual(sent, [], "a pick never sends on its own")
+    })
+  } finally {
+    toast.error = original
+  }
+})
+
 test("a staged photo and clip open the screen's Previewer, and Remove takes one off the message", async () => {
   const sent: { text: string; attachments: Attachment[] }[] = []
   const real = { create: URL.createObjectURL, revoke: URL.revokeObjectURL }
@@ -262,6 +493,39 @@ test("a staged photo and clip open the screen's Previewer, and Remove takes one 
   } finally {
     URL.createObjectURL = real.create
     URL.revokeObjectURL = real.revoke
+  }
+})
+
+test("a staged photo this device can't draw is handed to the platform, not the Previewer", async () => {
+  const sent: { text: string; attachments: Attachment[] }[] = []
+  const real = {
+    create: URL.createObjectURL,
+    revoke: URL.revokeObjectURL,
+    open: window.open,
+  }
+  const opened: string[] = []
+  URL.createObjectURL = (blob: Blob | MediaSource) => `blob:${(blob as Blob).type || "bytes"}`
+  URL.revokeObjectURL = () => {}
+  window.open = ((url: string | URL) => {
+    opened.push(String(url))
+    return null
+  }) as typeof window.open
+  try {
+    await mount(<PreviewerProvider>{composer(sent)}</PreviewerProvider>, async () => {
+      await pick("photos", [
+        new File(["heic"], "IMG_0005.heic", { type: "image/heic", lastModified: 14 }),
+      ])
+      await click(
+        findAll("button").find((one) => one.getAttribute("aria-label") === "Open IMG_0005.heic"),
+      )
+      await until(async () => opened.length > 0, "the platform's hand-off")
+      assert.match(opened[0], /^blob:/, "the bytes this device holds, under its own name")
+      assert.equal(document.querySelector('[role="dialog"]'), null, "and no Previewer opens")
+    })
+  } finally {
+    URL.createObjectURL = real.create
+    URL.revokeObjectURL = real.revoke
+    window.open = real.open
   }
 })
 

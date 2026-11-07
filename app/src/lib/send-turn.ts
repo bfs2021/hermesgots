@@ -12,6 +12,7 @@ import {
   type Profile,
 } from "@/lib/db"
 import { setUploading } from "@/lib/attachments"
+import { carriesPart } from "@/lib/attachment-caps"
 import { HermesError, uploadAttachment, type HermesConfig } from "@/lib/hermes"
 import { botModel, hostChoice, modelInfoFor } from "@/lib/model-info"
 import { pinOf, samePick, storedPick, wantsPin } from "@/lib/model-pick"
@@ -24,8 +25,8 @@ const UPLOADS_AT_ONCE = 3
 
 /**
  * Saves each attachment on the Hermes host through the plugin, a few at a time, so the agent can
- * open it on later turns too. An image still goes inline when that fails; a file has no other way
- * to get there.
+ * open it on later turns too. Bytes the model is sent inline need no save: a file with no part has
+ * no other way to get there, so its save is fatal where a photo's isn't.
  */
 export async function uploadAttachments(
   config: HermesConfig,
@@ -37,8 +38,8 @@ export async function uploadAttachments(
   const pending = attachments
     .map((attachment, index) => ({ attachment, index }))
     .filter(({ attachment }) => !attachment.path && attachment.blob)
-    .filter(({ attachment }) => plugin || !attachment.image)
-  const missing = pending.find(({ attachment }) => !plugin && !attachment.image)
+    .filter(({ attachment }) => plugin || !carriesPart(attachment))
+  const missing = pending.find(({ attachment }) => !plugin && !carriesPart(attachment))
   if (missing)
     throw new AttachmentError(`Attaching ${missing.attachment.name} needs the Gots plugin.`)
   for (const { attachment } of pending) setUploading(attachment.id, true)
@@ -51,7 +52,7 @@ export async function uploadAttachments(
         })
         saved[index] = { ...attachment, path }
       } catch (error) {
-        if (!attachment.image) {
+        if (!carriesPart(attachment)) {
           const reason = error instanceof Error ? error.message : ""
           throw new AttachmentError(
             reason.includes(attachment.name)

@@ -8,7 +8,14 @@ import test from "node:test"
 import { canSteer, midReply, steerAsked } from "../src/lib/steer.ts"
 
 const note = { id: "f1", name: "notes.txt", type: "text/plain", size: 12, image: false }
-const photo = { id: "f2", name: "cat.png", type: "image/png", size: 12, image: true }
+const photo = {
+  id: "f2",
+  name: "cat.png",
+  type: "image/png",
+  size: 12,
+  image: true,
+  inline: new Blob(["png"]),
+}
 const asked = { steer: true }
 const askedToQueue = { steer: false }
 

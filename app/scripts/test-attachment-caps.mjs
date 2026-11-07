@@ -12,6 +12,7 @@ import {
   MAX_ATTACHMENTS,
   MAX_FILE_BYTES,
   MAX_INLINE_BYTES,
+  pickRoad,
   sizeRefusal,
   unreadableRefusal,
 } from "../src/lib/attachment-caps.ts"
@@ -47,17 +48,15 @@ test("a file over nine megabytes is refused in its own name", () => {
   )
   assert.equal(picked.refusals[0].limit, "file")
 
-  assert.equal(intake([file("clip.mov", MAX_FILE_BYTES, "video/quicktime")]).take.length, 1)
+  assert.equal(
+    intake([file("clip.mov", MAX_FILE_BYTES, "video/quicktime")]).take.length,
+    1,
+  )
 })
 
 test("a photo that will be scaled is taken however big it arrives", () => {
   const shot = file("shot.heic", 12 * 1024 * 1024, "image/heic")
   assert.equal(intake([shot]).take.length, 1, "scaling it is what makes it fit the request")
-  assert.equal(
-    intake([shot], 0, { inline: false }).take.length,
-    0,
-    "a model that takes no images is sent the file itself, so the cap applies",
-  )
   assert.deepEqual(
     intake([file("draw.svg", 10 * 1024 * 1024, "image/svg+xml")]).take,
     [],
@@ -119,6 +118,62 @@ test("Files is refused in one sentence wherever a file can arrive", () => {
   assert.equal(filesReason("unknown"), "File uploads need the Gots plugin.")
 })
 
+test("a photo the model reads rides inline, whatever the host says about its route", () => {
+  for (const route of ["yes", "unknown", "no"]) {
+    assert.deepEqual(
+      pickRoad({ picture: true, readsImages: true, route }),
+      { road: "inline" },
+      `the model's own bytes need no upload route (${route})`,
+    )
+  }
+})
+
+test("a photo for a model that takes no images takes the host's file route", () => {
+  assert.deepEqual(
+    pickRoad({ picture: true, readsImages: false, route: "yes" }),
+    { road: "file" },
+    "a picture the model can't read travels as the file Files already sends",
+  )
+})
+
+test("a photo for a model that takes no images is refused where the host has no route", () => {
+  assert.deepEqual(pickRoad({ picture: true, readsImages: false, route: "no" }), {
+    road: "none",
+    message: "File uploads need a newer Gots plugin.",
+  })
+  assert.equal(
+    pickRoad({ picture: true, readsImages: false, route: "no" }).message,
+    filesReason("no"),
+    "a refused photo is refused in the words Files gives",
+  )
+})
+
+test("a photo picked before the host answered is tried on its file road", () => {
+  assert.deepEqual(
+    pickRoad({ picture: true, readsImages: false, route: "unknown" }),
+    { road: "file" },
+    "a picture takes the file road while the host's answer is owed",
+  )
+  assert.deepEqual(
+    pickRoad({ picture: false, readsImages: false, route: "unknown" }),
+    { road: "none", message: filesReason("unknown") },
+    "a document keeps needing a confirmed route",
+  )
+})
+
+test("a pick that isn't a picture goes by the host's route, and nowhere without one", () => {
+  assert.deepEqual(pickRoad({ picture: false, readsImages: true, route: "yes" }), { road: "file" })
+  assert.deepEqual(pickRoad({ picture: false, readsImages: false, route: "yes" }), { road: "file" })
+  assert.deepEqual(pickRoad({ picture: false, readsImages: true, route: "no" }), {
+    road: "none",
+    message: "File uploads need a newer Gots plugin.",
+  })
+  assert.deepEqual(pickRoad({ picture: false, readsImages: true, route: "unknown" }), {
+    road: "none",
+    message: "File uploads need the Gots plugin.",
+  })
+})
+
 test("the host keeps the file the user chose, with the scaled copy as the model's part", () => {
   const original = { size: 4 * 1024 * 1024, type: "image/png" }
   const smaller = { size: 900 * 1024, type: "image/jpeg" }
@@ -131,9 +186,9 @@ test("an original too big to keep is what the scaled copy stands in for", () => 
   const huge = { size: MAX_FILE_BYTES + 1, type: "image/heic" }
   const smaller = { size: 2 * 1024 * 1024, type: "image/jpeg" }
   const stand = keptImage(huge, smaller)
-  assert.deepEqual(stand, { kept: smaller })
+  assert.deepEqual(stand, { kept: smaller, inline: smaller })
   assert.equal(
-    stand.inline ?? stand.kept,
+    stand.inline,
     smaller,
     "and it is the part the model reads too, so a huge photo still rides inline",
   )
@@ -147,17 +202,31 @@ test("an original too big to keep is what the scaled copy stands in for", () => 
 test("a photo over the file cap is exempt from it, since scaling is what makes it fit", () => {
   // A modern camera's photo is past 9 MB, and refusing it would be hostile: the caps measure a
   // file the host is handed, while a photo is scaled and its kept copy is what rides.
-  const camera = file("IMG_0001.heic", 12 * 1024 * 1024, "image/heic")
   const shot = { size: 12 * 1024 * 1024, type: "image/heic" }
   const scaled = { size: 700 * 1024, type: "image/jpeg" }
-  assert.deepEqual(intake([camera]).take, [camera], "a pick takes it")
-  assert.equal(intake([camera]).refusals.length, 0, "and says nothing about its size")
   assert.equal(keptImage(shot, scaled).kept, scaled, "the scaled JPEG is what the host keeps")
   assert.equal(sizeRefusal("IMG_0001.heic").limit, "file", "the words are still a file's")
 })
 
-test("a photo that needed no scaling is one copy, not two", () => {
+test("a photo over the file cap is taken on the file road too", () => {
+  const camera = file("IMG_0001.heic", 12 * 1024 * 1024, "image/heic")
+  assert.deepEqual(
+    pickRoad({ picture: true, readsImages: false, route: "yes" }),
+    { road: "file" },
+    "a model that reads no images sends the photo down the host's file road",
+  )
+  const picked = intake([camera])
+  assert.deepEqual(picked.take, [camera], "the file road takes the photo at any size")
+  assert.deepEqual(picked.refusals, [], "and says nothing about its size")
+  assert.deepEqual(
+    intake([file("notes.bin", MAX_FILE_BYTES + 1)]).take,
+    [],
+    "a file that isn't a picture is still measured against the cap",
+  )
+})
+
+test("a photo that needed no scaling is one copy, and it is the model's too", () => {
   const photo = { size: 400 * 1024, type: "image/png" }
-  assert.deepEqual(keptImage(photo, photo), { kept: photo })
-  assert.deepEqual(keptImage(photo, null), { kept: photo })
+  assert.deepEqual(keptImage(photo, photo), { kept: photo, inline: photo })
+  assert.deepEqual(keptImage(photo, null), { kept: photo, inline: photo })
 })

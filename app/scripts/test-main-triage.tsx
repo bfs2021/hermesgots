@@ -6,24 +6,40 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
+import { act } from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 import { MemoryRouter } from "react-router"
+import Dexie from "dexie"
 
 import { MovedMarker } from "@/components/chat/moved-marker"
+import { Composer } from "@/components/chat/composer"
 import {
   queueMessage,
   refreshQueue,
   sendFromMain,
   sendMessage,
+  sendQueued,
   settleTriaging,
   stopMessage,
 } from "@/lib/chat"
-import { db, mainThreadId, type Message, type Profile } from "@/lib/db"
+import { db, MESSAGE_STORES, mainThreadId, type Message, type Profile } from "@/lib/db"
+import { prepareIntake } from "@/lib/attachments"
 import type { Move } from "@/lib/hermes"
 import { moveMarks } from "@/lib/move-marks"
 import { refreshMoves, undoMove } from "@/lib/moves"
 import { TRIAGE_MS } from "@/lib/freshness"
-import { botProfile, json, seedSettings, until } from "./component-kit.tsx"
+import {
+  botProfile,
+  click,
+  connection,
+  findAll,
+  json,
+  mount,
+  seedSettings,
+  settle,
+  type,
+  until,
+} from "./component-kit.tsx"
 
 const MAIN = mainThreadId("bot-1")
 const MAIN_SESSION = `gots-${MAIN}`
@@ -34,6 +50,8 @@ type Answer = "stay" | "thread" | "new" | "fail" | "hang"
 const uploads: string[] = []
 /** Hosts whose runs never answer, so a reply started on them stays running. */
 const hangingRuns = new Set<string>()
+/** Hosts that answer an upload with the 404 a plugin without the route gives. */
+const noUploadRoute = new Set<string>()
 const hung = new Set<() => void>()
 
 /** Ends every run a host left hanging, so the reply that waited on it settles. */
@@ -72,6 +90,7 @@ function host(name: string, triage: Answer, features: string[] = ["queue", "tria
       )
     }
     if (url.pathname.endsWith("/attachments") && init?.method === "POST") {
+      if (noUploadRoute.has(name)) return json({ error: { message: "no such route" } }, 404)
       uploads.push(url.searchParams.get("name") ?? "")
       return json({
         name: url.searchParams.get("name"),
@@ -97,13 +116,13 @@ function host(name: string, triage: Answer, features: string[] = ["queue", "tria
 
 async function seed(
   name: string,
-  extra: { main?: boolean; bot?: Partial<Profile> } = { main: true },
+  extra: { main?: boolean; bot?: Partial<Profile>; keepMessages?: boolean } = { main: true },
 ) {
   const bot = botProfile(name, extra.bot)
   await seedSettings({ developer: true, botThreads: true })
   await db.profiles.clear()
   await db.profiles.put(bot)
-  await db.messages.clear()
+  if (!extra.keepMessages) await db.messages.clear()
   await db.conversations.clear()
   await db.conversations.bulkPut([
     {
@@ -359,6 +378,141 @@ test("a stay keeps the files already saved and saves nothing twice", async () =>
   assert.equal(await sendFromMain(MAIN, "read this", [attachment]), undefined)
   assert.deepEqual(uploads, ["brief.pdf"])
   assert.equal(runsFor(seen, MAIN_SESSION).length, 1)
+})
+
+test("a stored photo with no part still goes inline when its message is sent again", async () => {
+  const older = new Dexie("gots")
+  older.version(34).stores({ messages: MESSAGE_STORES, conversations: "id, updatedAt" })
+  await db.close()
+  await Dexie.delete("gots")
+  await older.open()
+  await older.table("conversations").add({
+    id: MAIN,
+    profileId: "bot-1",
+    title: "Main",
+    hermesSessionId: MAIN_SESSION,
+    createdAt: 1,
+    updatedAt: 1,
+    changedAt: 0,
+    main: true,
+  })
+  await older.table("messages").add({
+    id: "stored-photo",
+    conversationId: MAIN,
+    role: "user",
+    content: "look at this",
+    status: "error",
+    createdAt: 5,
+    attachments: [
+      {
+        id: "p1",
+        name: "cat.png",
+        type: "image/png",
+        size: 3,
+        image: true,
+        blob: new Blob(["png"], { type: "image/png" }),
+      },
+    ],
+  })
+  await older.close()
+  await db.open()
+  await seed("route-stored-photo", { keepMessages: true })
+  const seen = host("route-stored-photo", "stay")
+  await sendQueued((await db.messages.get("stored-photo"))!)
+  const parts = runsFor(seen, MAIN_SESSION)[0]?.body.input.at(-1).content as {
+    type: string
+    image_url?: { url: string }
+  }[]
+  const photo = parts.find((part) => part.type === "image_url")
+  assert.ok(photo, "the photo rides in the message, as the build before this one sent it")
+  assert.match(photo.image_url?.url ?? "", /^data:image\/png;base64,/, "with its own bytes")
+})
+
+test("a photo that travels as a file says why it never reached the agent when the host won't take it", async () => {
+  await seed("route-photo-refused")
+  uploads.length = 0
+  noUploadRoute.add("route-photo-refused")
+  const seen = host("route-photo-refused", "stay")
+  try {
+    const picked = await prepareIntake(
+      [new File(["heic"], "IMG_0001.heic", { type: "image/heic", lastModified: 9 })],
+      { readsImages: false, route: "unknown" },
+    )
+    assert.equal(picked.attachments.length, 1, "the photo the pick hands the send")
+    assert.equal(picked.attachments[0].image, true, "is the picture it is")
+    assert.equal(picked.attachments[0].inline, undefined, "with its bytes left for the host to keep")
+
+    await assert.rejects(
+      () => sendFromMain(MAIN, "look at this", picked.attachments),
+      /Couldn't attach IMG_0001\.heic\. Check that Hermes is reachable and its Gots plugin is up to date\./,
+    )
+    assert.deepEqual(runsFor(seen, MAIN_SESSION), [], "nothing reached the agent")
+  } finally {
+    noUploadRoute.delete("route-photo-refused")
+  }
+})
+
+/** The tiles the message carries, by name: each one's own Remove button. */
+const tileNames = () =>
+  findAll("[aria-label^='Remove ']").map((button) =>
+    button.getAttribute("aria-label")!.replace("Remove ", ""),
+  )
+
+/** A pick from the `+` menu's own Camera input, the way the browser hands one over. */
+async function pickCamera(file: File) {
+  const input = document.querySelector('input[name="camera"]')
+  assert.ok(input, "the menu's picker is on screen")
+  Object.defineProperty(input, "files", { value: [file], configurable: true })
+  await act(async () => {
+    input.dispatchEvent(new Event("change", { bubbles: true }))
+  })
+  await settle()
+}
+
+test("a photo picked for a model that reads no images reaches the agent as a path, never as bytes", async () => {
+  // The seam a pick crosses, end to end: the composer's `onSend`, the send to Main, the plugin's
+  // upload and the body the run is started with — where the composer's own test stops at the send.
+  await seed("route-blind-photo", { main: true, bot: { imageInput: false } })
+  uploads.length = 0
+  const seen = host("route-blind-photo", "stay")
+  const bot = (await db.profiles.get("bot-1"))!
+  await mount(
+    <Composer
+      busy={false}
+      connection={connection("route-blind-photo")}
+      filesFeature="yes"
+      imagesAvailable={bot.imageInput !== false}
+      onSend={(text, attachments) => sendFromMain(MAIN, text, attachments)}
+      onQueue={() => {}}
+      onStop={() => {}}
+      onCommand={() => {}}
+    />,
+    async () => {
+      await pickCamera(new File(["heic"], "IMG_0001.heic", { type: "image/heic", lastModified: 7 }))
+      assert.deepEqual(tileNames(), ["IMG_0001.heic"], "the pick lands on the message")
+      await type(document.querySelector("textarea"), "what is this?")
+      await click(findAll("button").find((one) => one.getAttribute("aria-label") === "Send"))
+      await until(async () => runsFor(seen, MAIN_SESSION).length > 0, "the run to Main")
+
+      assert.deepEqual(uploads, ["IMG_0001.heic"], "the host was handed the photo itself")
+      assert.equal(triaged(seen).length, 1, "the confirmed route was the one the send asked")
+      const content = runsFor(seen, MAIN_SESSION)[0].body.input.at(-1).content
+      const parts = Array.isArray(content) ? content : [{ type: "text", text: content }]
+      assert.deepEqual(
+        parts.filter((part) => part.type !== "text"),
+        [],
+        "no image part for a model that can't read one",
+      )
+      const said = parts.map((part) => (part.type === "text" ? part.text : "")).join("\n")
+      assert.match(
+        said,
+        /<attachment name="IMG_0001\.heic" type="image\/heic" size="4" path="\/host\/IMG_0001\.heic" \/>/,
+        "the message names the copy the agent opens",
+      )
+      assert.match(said, /is not included in this message/, "and says the bytes stayed on the host")
+      assert.doesNotMatch(said, /\[screenshot\]/, "with no photo promised inline")
+    },
+  )
 })
 
 test("a move is read back from the host and leaves a marker, a stay leaves none", async () => {

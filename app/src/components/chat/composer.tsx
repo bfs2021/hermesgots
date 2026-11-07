@@ -28,10 +28,10 @@ import {
   InputGroupTextarea,
 } from "@/components/ui/input-group"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
-import { filesReason, fresh, isPhoto, MAX_ATTACHMENTS } from "@/lib/attachment-caps"
+import { fresh, MAX_ATTACHMENTS } from "@/lib/attachment-caps"
 import { AGENT_WORK_MS } from "@/lib/freshness"
 import { openAttachment, prepareIntake } from "@/lib/attachments"
-import { attachmentUrl } from "@/lib/attachment-url"
+import { attachmentUrl, drawable } from "@/lib/attachment-url"
 import { drawnCell, mediaKind } from "@/lib/media-kind"
 import { previewItem } from "@/lib/media-items"
 import type { Attachment } from "@/lib/db"
@@ -86,6 +86,15 @@ const STOP_ASKED_MS = 15_000
  * flight — is not the answer, and a child that keeps working until its boundary is.
  */
 const STOP_SETTLED_MS = AGENT_WORK_MS
+
+/**
+ * Whether the Previewer is what a tap on a staged attachment opens: a file it can draw — a photo, a
+ * clip, a recording — whose bytes this device has, since a photo it can't decode is handed to the
+ * platform like a document is.
+ */
+const canPreview = (attachment: Attachment) =>
+  drawnCell(attachment.type, attachment.name) !== "file" &&
+  (!attachment.image || drawable(attachment))
 
 export function Composer({
   busy,
@@ -384,16 +393,12 @@ export function Composer({
     // A paste and the drop the browser can also fire carry the same file, which lands once.
     const added = fresh(files, recent.current, Date.now(), { repeat: !picked })
     if (!added.length) return
-    // Files need the plugin's upload route; a photo the model reads inline doesn't, and still lands.
-    const because = filesReason(filesFeature)
-    const taken = because ? added.filter((file) => imagesAvailable && isPhoto(file.type)) : added
-    if (taken.length < added.length && because) toast.error(because)
-    if (!taken.length) return
     let placeholders: { id: string; name: string; image: boolean }[] = []
-    const { attachments: prepared, refusals } = await prepareIntake(taken, {
+    const { attachments: prepared, refusals } = await prepareIntake(added, {
       held: attachments,
       reserved: preparing.length,
-      inline: imagesAvailable,
+      readsImages: imagesAvailable,
+      route: filesFeature,
       onTake: (take) => {
         placeholders = take.map((file) => ({
           id: randomId(),
@@ -454,7 +459,7 @@ export function Composer({
         name: attachment.name,
         type: attachment.type,
         size: attachment.size,
-        src: attachmentUrl(attachment),
+        src: canPreview(attachment) ? attachmentUrl(attachment) : undefined,
         state: "ready",
       },
       { width: attachment.width, height: attachment.height },
@@ -465,7 +470,7 @@ export function Composer({
   // A tap that means "look at this" opens the screen's own Previewer, here as in the thread; a file
   // the Previewer can't draw is handed to the platform instead.
   const open = (attachment: Attachment) => {
-    if (drawnCell(attachment.type, attachment.name) === "file") {
+    if (!canPreview(attachment)) {
       void openAttachment(null, attachment)
       return
     }

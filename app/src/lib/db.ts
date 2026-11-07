@@ -4,6 +4,7 @@ import type { Agent } from "@/chat-next/agents"
 import type { Queued } from "@/chat-next/api"
 import type { Row, Turn } from "@/chat-next/fold"
 import { BOTS, LEGACY_BOT_IDS } from "@/components/bots"
+import { carriesPart } from "@/lib/attachment-caps"
 import { connectionKey, hasServer } from "@/lib/connection"
 import { mediaKeyPrefix } from "@/lib/media-key"
 import { forgetRead } from "@/lib/read-marks"
@@ -445,7 +446,7 @@ export interface Attachment {
   /** MIME type. */
   type: string
   size: number
-  /** Goes to the model inline as well. */
+  /** This file is a picture: the tile draws it as one, whatever road its bytes take. */
   image: boolean
   /**
    * A photo the host's row named and this thread draws: not a file the user attached, so it never
@@ -456,8 +457,10 @@ export interface Attachment {
    * host's transcript doesn't keep it. */
   blob?: Blob
   /**
-   * The scaled copy the model reads inline, when it isn't the file itself. The host keeps `blob`;
-   * this is only the part a request carries and, for a photo a browser can't draw, the preview.
+   * The bytes the model is sent in the message itself, where it is sent any: present means this
+   * attachment rides inline. A photo scaled for the model carries the scaled copy, and one that
+   * needed no scaling carries the file. The host keeps `blob`; this is only the part a request
+   * carries and, for a photo a browser can't draw, the preview.
    */
   inline?: Blob
   /** A photo's own size, so a viewer can hold its box before it's read. */
@@ -988,6 +991,10 @@ export const db = new Dexie("gots") as Dexie & {
   appCache: EntityTable<AppCacheRow, "key">
 }
 
+/** The messages store as this device declares it, so a test can stand a database up at an old version. */
+export const MESSAGE_STORES =
+  "id, conversationId, [conversationId+createdAt], status, [conversationId+role]"
+
 db.version(1).stores({
   settings: "id",
   conversations: "id, updatedAt",
@@ -1132,7 +1139,7 @@ db.version(12).stores({ dictations: "id" })
 // Hermes session (push taps, change events), a thread's replies by role, and the newest change.
 db.version(13).stores({
   conversations: "id, updatedAt, [profileId+updatedAt], projectId, hermesSessionId, changedAt",
-  messages: "id, conversationId, [conversationId+createdAt], status, [conversationId+role]",
+  messages: MESSAGE_STORES,
 })
 
 // v14: BenchLM overall rankings replace the coding cache. The coding table is dropped; the cache is
@@ -1308,6 +1315,47 @@ db.version(33).upgrade((tx) =>
 // v34: the apps a bot's host listed and the pages read from it, kept on the device so an app opens
 // with the host away. A new table: nothing older has to be moved into it.
 db.version(34).stores({ appCache: "key, connection" })
+
+const rodeInlineBeforeV35 = (attachment: Attachment) =>
+  Boolean(attachment.image && !carriesPart(attachment) && attachment.blob)
+
+const withInlinePart = (attachment: Attachment): Attachment =>
+  rodeInlineBeforeV35(attachment) ? { ...attachment, inline: attachment.blob } : attachment
+
+// v35: an attachment's `image` says only that the file is a picture, and the presence of its inline
+// part says the model is sent the bytes. Every row a build before this one wrote used the flag for
+// both, so the photos it stored are given the part they rode with — a message sent again from such a
+// row would otherwise reach the model as a marker alone. Only the rows the upgrade can change are
+// rewritten; Dexie puts back every row it visits otherwise. Both tables are read at once, inside the
+// one transaction the upgrade already runs in.
+db.version(35).upgrade(async (tx) => {
+  const photos = async () => {
+    const messages = tx.table<Message>("messages")
+    const chats = await tx.table<Conversation>("conversations").toCollection().primaryKeys()
+    for (const chat of chats)
+      await messages
+        .where("[conversationId+role]")
+        .equals([chat, "user"])
+        .filter((message) => Boolean(message.attachments?.some(rodeInlineBeforeV35)))
+        .modify((message) => {
+          message.attachments = message.attachments?.map(withInlinePart)
+        })
+  }
+  const unsent = async () =>
+    tx
+      .table<SessionState>("sessionStates")
+      .toCollection()
+      .filter((state) =>
+        Boolean(state.unsent?.some((row) => row.attachments?.some(rodeInlineBeforeV35))),
+      )
+      .modify((state) => {
+        state.unsent = state.unsent?.map((row) => ({
+          ...row,
+          attachments: row.attachments?.map(withInlinePart),
+        }))
+      })
+  await Promise.all([photos(), unsent()])
+})
 
 db.on("populate", (tx) => seedProfile(tx))
 
