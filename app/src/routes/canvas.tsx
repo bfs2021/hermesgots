@@ -16,6 +16,7 @@ import { Popup, PopupContent, PopupHeader, PopupTitle } from "@/components/popup
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { attempt } from "@/lib/attempt"
+import { awayLine } from "@/lib/away"
 import { bridgeHandler } from "@/lib/canvas-bridge"
 import { canvasCss, canvasCssKey } from "@/lib/canvas-css"
 import { canvasDocument, readScroll, themeTokens, type CanvasMode } from "@/lib/canvas-document"
@@ -31,6 +32,7 @@ import {
 } from "@/lib/canvases"
 import { db, getActiveProfile } from "@/lib/db"
 import { useLarge } from "@/lib/media"
+import { useOnline } from "@/lib/online"
 import { useDark } from "@/lib/theme"
 import { formatRelative } from "@/lib/format"
 import { useNow } from "@/lib/threads"
@@ -159,7 +161,12 @@ const SNAPS = [0.5, 1]
 /** One canvas, drawn from the version its record points at, with its chat beside it or raised over it. */
 export function CanvasView() {
   const { id = "" } = useParams()
-  const { canvas, missing, loaded } = useCanvas(id)
+  const { canvas, missing, loaded, away } = useCanvas(id)
+  const online = useOnline()
+  // A device with no network can't reach the host either, and is told so in its own words (ADR 0071)
+  // rather than being told its bot is down.
+  const awayNow = away || !online
+  const awayWords = awayLine(awayNow, online)
   const dark = useDark()
   const mode: CanvasMode = dark ? "dark" : "light"
   const html = canvas?.html
@@ -299,8 +306,17 @@ export function CanvasView() {
           {canvas?.version ? (
             <span className="shrink-0 text-xs text-muted-foreground">v{canvas.version}</span>
           ) : null}
+          {awayWords ? (
+            <span
+              role="status"
+              data-canvas-offline
+              className="shrink-0 text-xs text-muted-foreground"
+            >
+              {awayWords}
+            </span>
+          ) : null}
         </div>
-        {canvas?.canUndo ? (
+        {canvas?.canUndo && !awayNow ? (
           <Button
             variant="ghost"
             size="icon-lg"
@@ -335,7 +351,11 @@ export function CanvasView() {
             />
           ) : (
             <p className="p-4 text-center text-sm text-muted-foreground">
-              {loaded && !html ? "Your bot is building it…" : "Reading the canvas…"}
+              {awayNow && !html
+                ? "This canvas isn't on this device, and its bot isn't answering."
+                : loaded && !html
+                  ? "Your bot is building it…"
+                  : "Reading the canvas…"}
             </p>
           )}
           {/* A phone has room for the page or its chat, not both: the chat is raised over the page

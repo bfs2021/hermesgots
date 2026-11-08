@@ -5,6 +5,7 @@ import type { Queued } from "@/chat-next/api"
 import type { Row, Turn } from "@/chat-next/fold"
 import { BOTS, LEGACY_BOT_IDS } from "@/components/bots"
 import { carriesPart } from "@/lib/attachment-caps"
+import type { Canvas, CanvasRecord } from "@/lib/canvases"
 import { connectionKey, hasServer } from "@/lib/connection"
 import { mediaKeyPrefix } from "@/lib/media-key"
 import { forgetRead } from "@/lib/read-marks"
@@ -1018,6 +1019,29 @@ export interface CanvasCssRow {
   at: number
 }
 
+/**
+ * What this device last read of a bot's canvases, so a canvas opens with the host away (ADR 0113):
+ * one row for the list and one for each canvas read, carrying the page its record points at,
+ * its version, the tools it declared and its own data. It is this device's copy — nothing syncs it —
+ * and it goes with the bot whose host answered it.
+ */
+export interface CanvasCacheRow {
+  /** `<connectionKey>\ncanvases` for the list, `<connectionKey>\n<canvasId>` for one canvas. */
+  key: string
+  connection: string
+  /**
+   * The canvas this row holds, indexed so a canvas opened from a cold app finds its bot and its copy
+   * without a sweep of every bot — which a host that isn't answering could never finish. Unset on a
+   * list row.
+   */
+  canvasId?: string
+  /** The list's records, as the host answered them: no page, no tools and no data, which a listing
+   * omits — the shape a list keeps (`CanvasRecord`). */
+  canvases?: CanvasRecord[]
+  /** One canvas with the page, the tools and the data its last read or write left. */
+  canvas?: Canvas
+}
+
 export const db = new Dexie("gots") as Dexie & {
   settings: EntityTable<Settings, "id">
   profiles: EntityTable<Profile, "id">
@@ -1042,6 +1066,7 @@ export const db = new Dexie("gots") as Dexie & {
   netLog: EntityTable<NetRequest, "id">
   roomLog: Table<RoomLogRow, [string, number]>
   canvasCss: EntityTable<CanvasCssRow, "key">
+  canvasCache: EntityTable<CanvasCacheRow, "key">
 }
 
 /** The messages store as this device declares it, so a test can stand a database up at an old version. */
@@ -1424,6 +1449,10 @@ db.version(37).stores({ roomLog: "[roomId+seq], roomId" })
 // rather than a compile. A new table: nothing older has to be moved into it.
 db.version(38).stores({ canvasCss: "key, at" })
 
+// v39: the canvases a bot's host listed and the pages read from it, kept on this device so a canvas
+// opens with the host away. A new table: nothing older has to be moved into it.
+db.version(39).stores({ canvasCache: "key, connection, canvasId" })
+
 /**
  * How many rows of one room's log this device keeps: the page a reader can scroll back through.
  * A room's log lives on its Host and is read by sequence, so a page is what a screen needs and no
@@ -1544,7 +1573,24 @@ export async function addProfile(
 }
 
 export async function updateProfile(id: string, patch: Partial<Omit<Profile, "id">>) {
+  const before = await db.profiles.get(id)
   await db.profiles.update(id, { ...patch, updatedAt: Date.now() })
+  // A bot moved to another address or key can't reach the canvases kept under the old one, and nothing
+  // would ever prune them: they go, and the next read fills the new connection's rows.
+  const after = await db.profiles.get(id)
+  if (before && after && connectionKey(before) !== connectionKey(after))
+    await forgetCanvases(connectionKey(before), id)
+}
+
+/**
+ * Drops the canvases kept under a connection, unless another bot still reads them: the rows are keyed
+ * by the server and key a bot is reached at, so two bots on one connection share them.
+ */
+async function forgetCanvases(key: string, except: string) {
+  const twins = await db.profiles
+    .filter((other) => other.id !== except && connectionKey(other) === key)
+    .count()
+  if (!twins) await db.canvasCache.where("connection").equals(key).delete()
 }
 
 const RECENT_MODELS = 3
@@ -1581,6 +1627,7 @@ export async function deleteProfile(id: string, { remote = false, last = false }
     db.speechCache,
     db.netLog,
     db.roomLog,
+    db.canvasCache,
   ]
   return db.transaction("rw", tables, async () => {
     const alone = (await db.profiles.count()) <= 1
@@ -1607,6 +1654,8 @@ export async function deleteProfile(id: string, { remote = false, last = false }
       await db.dictationStats.delete(key)
       await db.mediaCache.where("key").startsWith(mediaKeyPrefix(profile.baseUrl)).delete()
       await db.speechCache.delete(key)
+      // The pages it answered go with it, unless a twin on the same connection is still here.
+      await forgetCanvases(key, id)
       // Its requests go with it: every row that names this bot, including the ones a twin on the same
       // server shares with it.
       await db.netLog.where("bots").equals(id).delete()
@@ -1765,6 +1814,7 @@ export async function clearAllData() {
     db.netLog,
     db.roomLog,
     db.canvasCss,
+    db.canvasCache,
   ]
   await db.transaction("rw", tables, async () => {
     await Promise.all(tables.map((table) => table.clear()))
