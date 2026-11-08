@@ -42,6 +42,17 @@ function page(prompt, title, version) {
 export function createCanvasStore() {
   const canvases = new Map()
 
+  /**
+   * The greatest version stored under the record's pointer, as the plugin's `_greatest_below` reads:
+   * the number itself, or null when nothing sits below the pointer.
+   */
+  const below = (c) => {
+    const under = c.versions.filter((v) => v.version < c.version).map((v) => v.version)
+    return under.length ? Math.max(...under) : null
+  }
+
+  // A listing carries the record and no document, so no `can_undo`: only the one-canvas answer does,
+  // as the plugin's own `listing` answers.
   const summary = (c) => ({
     id: c.id,
     title: c.title,
@@ -54,22 +65,26 @@ export function createCanvasStore() {
     created_at: c.created_at,
   })
 
+  // The pointer's version, not the newest stored one: an undo moves the pointer back and leaves the
+  // versions above it stored but unreachable, as the plugin does.
   const full = (c) => {
-    const newest = c.versions[c.versions.length - 1]
+    const current = c.versions.find((v) => v.version === c.version)
+    const earlier = below(c)
     return {
       ...summary(c),
-      html: newest?.html ?? "",
-      tools: newest?.tools ?? [],
-      written_at: newest?.at ?? c.at,
+      html: current?.html ?? "",
+      tools: current?.tools ?? [],
+      written_at: current?.at ?? c.at,
+      can_undo: earlier !== null,
     }
   }
 
-  return { canvases, summary, full }
+  return { canvases, summary, full, below }
 }
 
 export async function handleCanvas(req, res, path, { json, readBody, noteEvent }, store) {
   if (!path.startsWith("/api/plugins/gots/canvases")) return false
-  const { canvases, summary, full } = store
+  const { canvases, summary, full, below } = store
   const fail = (status, message) => json(res, status, { error: { message } })
 
   if (path === "/api/plugins/gots/canvases") {
@@ -110,6 +125,29 @@ export async function handleCanvas(req, res, path, { json, readBody, noteEvent }
       json(res, 202, { object: "gots.canvas", canvas: full(canvas) })
       return true
     }
+  }
+
+  const undo = /^\/api\/plugins\/gots\/canvases\/([^/]+)\/undo$/.exec(path)
+  if (undo) {
+    const canvas = canvases.get(decodeURIComponent(undo[1]))
+    if (!canvas) {
+      fail(404, "There is no such canvas.")
+      return true
+    }
+    if (req.method !== "POST") {
+      fail(405, "Undo is a POST.")
+      return true
+    }
+    const earlier = below(canvas)
+    if (earlier === null) {
+      fail(409, "This canvas has no earlier version to undo to.")
+      return true
+    }
+    canvas.version = earlier
+    canvas.at = Date.now()
+    noteEvent("canvas", canvas.session_id)
+    json(res, 200, { object: "gots.canvas", canvas: full(canvas) })
+    return true
   }
 
   const match = /^\/api\/plugins\/gots\/canvases\/([^/]+)$/.exec(path)

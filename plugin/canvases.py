@@ -2,11 +2,15 @@
 has to pass before it becomes one (ADR 0113).
 
 The host owns everything a canvas is. Its record lives in ``canvases`` (title, the session it is
-edited in, the chat that session belongs to, its newest version and its placement) and every write
-is a row of ``canvas_versions``, the newest ``KEEP_VERSIONS`` kept. A canvas is changed only from its
-own session: ``canvas_write`` and ``canvas_read`` are equipped there and nowhere else, and the canvas
-is found from a run's session by walking the chat's compression lineage (``sessions.chat_session``),
-so a chat that has been compacted still reaches its canvas.
+is edited in, the chat that session belongs to, its current version and its placement) and every
+write is a row of ``canvas_versions``, the newest ``KEEP_VERSIONS`` kept. A canvas is changed only
+from its own session: ``canvas_write``, ``canvas_edit`` and ``canvas_read`` are equipped there and
+nowhere else, and the canvas is found from a run's session by walking the chat's compression lineage
+(``sessions.chat_session``), so a chat that has been compacted still reaches its canvas.
+
+A version is the whole document. A small change is a list of find-and-replace pairs applied as one
+version (``edit``), undo moves the record's pointer back one without deleting anything, and a read
+answers the version the pointer names — so the agent always edits what the user is looking at.
 
 The scan is hygiene, not the defence — the sandbox the page is drawn in is (ADR 0114). It refuses a
 write whole, naming why: past ``MAX_BYTES``, holding what looks like a secret, not a complete
@@ -22,7 +26,7 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from . import chats, events, outbox, sessions, tools_common, triage
 from .store import connect
@@ -36,6 +40,7 @@ KEEP_VERSIONS = 20
 TITLE_CHARS = 60
 
 TOOL_WRITE = "canvas_write"
+TOOL_EDIT = "canvas_edit"
 TOOL_READ = "canvas_read"
 
 # Set by register() and _wire_api_server, and what `ready` answers with.
@@ -219,19 +224,12 @@ def listing(path: Path) -> List[Dict[str, Any]]:
     return [_row(row) for row in rows]
 
 
-def version_of(path: Path, canvas_id: str) -> Optional[Dict[str, Any]]:
-    """The newest version's document and the tools it declared, or None before the first write."""
-    if not canvas_id or not path.exists():
-        return None
-    conn = connect(path)
-    try:
-        row = conn.execute(
-            """SELECT version, html, tools, at FROM canvas_versions
-               WHERE canvas_id = ? ORDER BY version DESC LIMIT 1""",
-            (canvas_id,),
-        ).fetchone()
-    finally:
-        conn.close()
+def _version(conn: sqlite3.Connection, canvas_id: str, number: int) -> Optional[Dict[str, Any]]:
+    """One version's document and the tools it declared, over a connection the caller holds."""
+    row = conn.execute(
+        "SELECT version, html, tools, at FROM canvas_versions WHERE canvas_id = ? AND version = ?",
+        (canvas_id, number),
+    ).fetchone()
     if row is None:
         return None
     return {
@@ -242,18 +240,45 @@ def version_of(path: Path, canvas_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _empty_version(found: Dict[str, Any]) -> Dict[str, Any]:
+    """A canvas nothing has been written to yet: no document, no tools, and its record's clock."""
+    return {"version": 0, "html": "", "tools": [], "written_at": found["at"]}
+
+
+def _greatest_below(conn: sqlite3.Connection, canvas_id: str, version: int) -> Optional[int]:
+    """The greatest stored version under ``version``, or None when nothing is stored below it."""
+    row = conn.execute(
+        "SELECT MAX(version) FROM canvas_versions WHERE canvas_id = ? AND version < ?",
+        (canvas_id, version),
+    ).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def _answer(
+    found: Dict[str, Any], version: Dict[str, Any], can_undo: bool
+) -> Dict[str, Any]:
+    """A canvas as the app draws it: its record, the version the record points at, and whether a
+    version sits under that one to undo to."""
+    return {**found, **version, "can_undo": can_undo}
+
+
 def current(path: Path, canvas_id: str) -> Dict[str, Any]:
-    """A canvas as the app draws it: its record, and the newest document with its tools."""
-    found = record(path, canvas_id)
-    if found is None:
+    """A canvas as the app draws it, answered from one connection: its record, the version the
+    record points at, and whether there is a version under that one to undo to."""
+    if not canvas_id or not path.exists():
         raise CanvasError("There is no such canvas.", 404)
-    return {
-        **found,
-        **(
-            version_of(path, canvas_id)
-            or {"version": 0, "html": "", "tools": [], "written_at": found["at"]}
-        ),
-    }
+    conn = connect(path)
+    try:
+        found = _record(conn, canvas_id)
+        if found is None:
+            raise CanvasError("There is no such canvas.", 404)
+        version = _version(conn, canvas_id, found["version"]) or _empty_version(found)
+        # A canvas at its first version, or one whose older versions were trimmed, has nothing to
+        # undo: the read of what sits under the pointer is on this same connection.
+        under = _greatest_below(conn, canvas_id, version["version"])
+        return _answer(found, version, under is not None)
+    finally:
+        conn.close()
 
 
 def title_of(prompt: Any) -> str:
@@ -270,6 +295,34 @@ def _tools(raw: Any) -> Optional[str]:
     return json.dumps(list(dict.fromkeys(raw)))
 
 
+def _apply(html: str, edits: List[Any]) -> str:
+    """The document with every find and replace pair applied in order.
+
+    Each ``find`` has to match exactly once: a pair matching none or several writes nothing at all,
+    since a page that landed half-way is a change nobody asked for. A refusal names the pair by its
+    1-based place and how many the edit holds.
+    """
+    for index, pair in enumerate(edits, start=1):
+        if not isinstance(pair, dict):
+            raise CanvasError(f"Edit {index} of {len(edits)} is not a find and replace pair.")
+        find, replace = pair.get("find"), pair.get("replace")
+        if not isinstance(find, str) or not find:
+            raise CanvasError(f"Edit {index} of {len(edits)} needs a find: the text to look for.")
+        if not isinstance(replace, str):
+            raise CanvasError(
+                f'Edit {index} of {len(edits)} needs a replace: what stands in its place, or "" to '
+                "cut it."
+            )
+        count = html.count(find)
+        if count != 1:
+            raise CanvasError(
+                f'Edit {index} of {len(edits)}: "{find}" matches {count} times; an edit needs '
+                "exactly one."
+            )
+        html = html.replace(find, replace, 1)
+    return html
+
+
 def write(
     path: Path,
     canvas_id: str,
@@ -281,26 +334,74 @@ def write(
 
     A write is one version: the whole document, scanned, stored, and the record's version moved on
     in the same transaction. Only the newest ``KEEP_VERSIONS`` are kept, and an older one going is
-    the oldest version's row — never the newest, which is what a canvas is. A title writes the
-    canvas's and its chat's together, so a rename is one name.
+    the oldest version's row — never the one the record points at, which is what a canvas is. A title
+    writes the canvas's and its chat's together, so a rename is one name.
     """
-    scan(html)
-    declared = _tools(tools)
+    return _commit(path, canvas_id, html=html, title=title, tools=tools)
+
+
+def edit(path: Path, canvas_id: str, edits: Any, tools: Any = None) -> Dict[str, Any]:
+    """Changes a canvas by find and replace, stored as one version, and answers it as it now is.
+
+    Every pair is applied in order to the version the user is looking at, and that version is read
+    inside the transaction the edit writes in — so an undo landing between the two can't be reverted
+    by an edit built from the version it walked off. The version carries the tools it declared
+    forward unless this edit declares its own.
+    """
+    if not isinstance(edits, list) or not edits:
+        raise CanvasError("edits must be a list of find and replace pairs.")
+    return _commit(path, canvas_id, edits=edits, tools=tools)
+
+
+def _commit(
+    path: Path,
+    canvas_id: str,
+    *,
+    html: Any = None,
+    edits: Optional[List[Any]] = None,
+    title: Optional[Any] = None,
+    tools: Any = None,
+) -> Dict[str, Any]:
+    """One version, written under the store's write lock, and the canvas as it now is.
+
+    ``html`` is a write's whole document; ``edits`` are an edit's pairs, applied to the version the
+    record points at, which is read on this connection under this transaction. Both answer the same
+    shape ``current`` does.
+    """
     named = title_of(title) if isinstance(title, str) and title.strip() else None
     now = int(time.time() * 1000)
     conn = connect(path)
     try:
         conn.execute("BEGIN IMMEDIATE")
-        # Read under the write lock: two writes racing here would otherwise both take the same
+        # Read under the write lock: two writers racing here would otherwise both take the same
         # number, and the second would fail on the versions' primary key.
         found = _record(conn, canvas_id)
         if found is None:
             raise CanvasError("There is no such canvas.", 404)
+        if edits is None:
+            document = html
+            declared = _tools(tools)
+        else:
+            # An edit is built from the version the record points at, read here rather than before
+            # the transaction: an undo landing in between would otherwise be silently reverted.
+            pointer = _version(conn, canvas_id, found["version"])
+            if pointer is None or not pointer["html"]:
+                raise CanvasError("This canvas has no document yet: write it with canvas_write first.")
+            document = _apply(pointer["html"], edits)
+            declared = _tools(tools) if tools is not None else json.dumps(pointer["tools"])
+        scan(document)
+        # The version above the one the record points at. An undo left the versions it walked off
+        # stored and unreachable — there is no redo — and a write replaces that history rather than
+        # sitting on top of it: otherwise a later undo would land on the page the user rejected.
+        conn.execute(
+            "DELETE FROM canvas_versions WHERE canvas_id = ? AND version > ?",
+            (canvas_id, found["version"]),
+        )
         number = found["version"] + 1
         conn.execute(
             """INSERT INTO canvas_versions (canvas_id, version, html, tools, at)
                VALUES (?, ?, ?, ?, ?)""",
-            (canvas_id, number, html, declared, now),
+            (canvas_id, number, document, declared, now),
         )
         conn.execute(
             """UPDATE canvases SET version = ?, at = ?, title = COALESCE(?, title)
@@ -312,7 +413,19 @@ def write(
                WHERE canvas_id = ? AND version <= ?""",
             (canvas_id, number - KEEP_VERSIONS),
         )
+        # What sits under the version just written, read before the commit rather than after it.
+        can_undo = _greatest_below(conn, canvas_id, number) is not None
         conn.execute("COMMIT")
+        answer = _answer(
+            {**found, "title": named or found["title"], "version": number, "at": now},
+            {
+                "version": number,
+                "html": document,
+                "tools": json.loads(declared) if declared else [],
+                "written_at": now,
+            },
+            can_undo,
+        )
     except BaseException:
         if conn.in_transaction:
             conn.execute("ROLLBACK")
@@ -327,15 +440,43 @@ def write(
         except Exception:
             logger.debug("gots: couldn't rename %s's chat", canvas_id, exc_info=True)
     events.note("canvas", found["session_id"], path, True)
-    return {
-        **found,
-        "title": named or found["title"],
-        "version": number,
-        "html": html,
-        "tools": json.loads(declared) if declared else [],
-        "written_at": now,
-        "at": now,
-    }
+    return answer
+
+
+def undo(path: Path, canvas_id: str) -> Dict[str, Any]:
+    """Moves a canvas's current version back one, and answers it as the app draws it.
+
+    Undo is the pointer and nothing else: the versions above it stay stored but unreachable, since
+    there is no redo, and the first version has nothing under it to walk back to. The answer is read
+    on the connection the pointer was moved on, so it costs one connection rather than four.
+    """
+    if not path.exists():
+        raise CanvasError("There is no such canvas.", 404)
+    now = int(time.time() * 1000)
+    conn = connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        found = _record(conn, canvas_id)
+        if found is None:
+            raise CanvasError("There is no such canvas.", 404)
+        number = _greatest_below(conn, canvas_id, found["version"])
+        if number is None:
+            raise CanvasError("This canvas has no earlier version to undo to.", 409)
+        conn.execute(
+            "UPDATE canvases SET version = ?, at = ? WHERE id = ?", (number, now, canvas_id)
+        )
+        version = _version(conn, canvas_id, number) or _empty_version(found)
+        can_undo = _greatest_below(conn, canvas_id, number) is not None
+        conn.execute("COMMIT")
+        answer = _answer({**found, "version": number, "at": now}, version, can_undo)
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    events.note("canvas", found["session_id"], path, True)
+    return answer
 
 
 def _insert(path: Path, found: Dict[str, Any]) -> None:
@@ -502,7 +643,10 @@ WRITE_SCHEMA = {
             "tools": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "The host tools this version's page may call, if any.",
+                "description": (
+                    "The host tools this version's page may call. A write replaces the page whole, "
+                    "so leaving this out declares none — the list a page had does not carry over."
+                ),
             },
         },
         "required": ["html"],
@@ -512,45 +656,123 @@ WRITE_SCHEMA = {
 READ_SCHEMA = {
     "name": TOOL_READ,
     "description": (
-        "Canvas sessions only: reads the canvas's newest version — its document, its number and the "
-        "tools that version declared — so a change starts from what is there now."
+        "Canvas sessions only: reads the canvas's current version — its document, its number and "
+        "the tools that version declared — so a change starts from what is there now."
     ),
     "parameters": {"type": "object", "properties": {}},
 }
+
+EDIT_SCHEMA = {
+    "name": TOOL_EDIT,
+    "description": (
+        "Canvas sessions only: changes the canvas by find and replace, stored as one new version. "
+        "Each find has to match the current document exactly once, and either every pair is applied "
+        "or nothing is written — so a small change costs no whole rewrite. Write the page again "
+        "with canvas_write when the change is too big to name."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "edits": {
+                "type": "array",
+                "description": "Find and replace pairs, applied in order.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "find": {
+                            "type": "string",
+                            "description": "Text as it stands in the current version, exactly once.",
+                        },
+                        "replace": {
+                            "type": "string",
+                            "description": 'What stands in its place; "" cuts it.',
+                        },
+                    },
+                    "required": ["find", "replace"],
+                },
+            },
+            "tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "The host tools this version's page may call. An edit changes the page rather "
+                    "than replacing it, so leaving this out keeps the list the page already had."
+                ),
+            },
+        },
+        "required": ["edits"],
+    },
+}
+
+
+def _tool_answer(
+    tool: str,
+    task_id: Optional[str],
+    session_id: Optional[str],
+    run: Callable[[Path, str], Dict[str, Any]],
+    answer: Callable[[Dict[str, Any]], Dict[str, Any]],
+) -> str:
+    """One canvas tool's answer: a canvas's session only, a refusal as an error, else its payload."""
+    canvas_id, path = _call_canvas(task_id, session_id)
+    if not canvas_id or path is None:
+        return json.dumps({"error": f"{tool} only works in a canvas's session."})
+    try:
+        found = run(path, canvas_id)
+    except CanvasError as error:
+        return json.dumps({"error": str(error)})
+    return json.dumps(answer(found))
 
 
 def handle_write(args: Any, task_id: Optional[str] = None, session_id: Optional[str] = None, **_: Any) -> str:
     """The tool: writes the canvas whose session made the call."""
     args = args if isinstance(args, dict) else {}
-    canvas_id, path = _call_canvas(task_id, session_id)
-    if not canvas_id or path is None:
-        return json.dumps({"error": f"{TOOL_WRITE} only works in a canvas's session."})
-    try:
-        found = write(path, canvas_id, args.get("html"), args.get("title"), args.get("tools"))
-    except CanvasError as error:
-        return json.dumps({"error": str(error)})
-    return json.dumps(
-        {"id": found["id"], "title": found["title"], "version": found["version"], "written": True}
+    return _tool_answer(
+        TOOL_WRITE,
+        task_id,
+        session_id,
+        lambda path, canvas_id: write(
+            path, canvas_id, args.get("html"), args.get("title"), args.get("tools")
+        ),
+        lambda found: {
+            "id": found["id"],
+            "title": found["title"],
+            "version": found["version"],
+            "written": True,
+        },
+    )
+
+
+def handle_edit(args: Any, task_id: Optional[str] = None, session_id: Optional[str] = None, **_: Any) -> str:
+    """The tool: changes the canvas whose session made the call, by find and replace."""
+    args = args if isinstance(args, dict) else {}
+    return _tool_answer(
+        TOOL_EDIT,
+        task_id,
+        session_id,
+        lambda path, canvas_id: edit(path, canvas_id, args.get("edits"), args.get("tools")),
+        lambda found: {
+            "id": found["id"],
+            "title": found["title"],
+            "version": found["version"],
+            "edited": True,
+        },
     )
 
 
 def handle_read(args: Any, task_id: Optional[str] = None, session_id: Optional[str] = None, **_: Any) -> str:
-    """The tool: the canvas's newest version, as it stands."""
-    canvas_id, path = _call_canvas(task_id, session_id)
-    if not canvas_id or path is None:
-        return json.dumps({"error": f"{TOOL_READ} only works in a canvas's session."})
-    try:
-        found = current(path, canvas_id)
-    except CanvasError as error:
-        return json.dumps({"error": str(error)})
-    return json.dumps(
-        {
+    """The tool: the canvas's current version, as it stands."""
+    return _tool_answer(
+        TOOL_READ,
+        task_id,
+        session_id,
+        current,
+        lambda found: {
             "id": found["id"],
             "title": found["title"],
             "version": found["version"],
             "tools": found["tools"],
             "html": found["html"],
-        }
+        },
     )
 
 
@@ -568,14 +790,14 @@ def before_tool(**kwargs: Any) -> Optional[Dict[str, str]]:
     return {
         "action": "block",
         "message": (
-            f"This is a canvas's session: change the canvas with {TOOL_WRITE} and {TOOL_READ} only. "
-            "It can't ship a pull request, file a library item or take a task."
+            f"This is a canvas's session: change the canvas with {TOOL_WRITE}, {TOOL_EDIT} and "
+            f"{TOOL_READ} only. It can't ship a pull request, file a library item or take a task."
         ),
     }
 
 
 def register(plugin_ctx: Any) -> bool:
-    """Keeps the context and registers the canvas's two tools."""
+    """Keeps the context and registers the canvas's three tools."""
     global ctx, _registered
     ctx = plugin_ctx
     register_tool = getattr(plugin_ctx, "register_tool", None)
@@ -584,6 +806,7 @@ def register(plugin_ctx: Any) -> bool:
     took = True
     for tool, schema, handler in (
         (TOOL_WRITE, WRITE_SCHEMA, handle_write),
+        (TOOL_EDIT, EDIT_SCHEMA, handle_edit),
         (TOOL_READ, READ_SCHEMA, handle_read),
     ):
         try:
@@ -597,7 +820,7 @@ def register(plugin_ctx: Any) -> bool:
 
 
 def wire(api_adapter: Any) -> bool:
-    """Gives a canvas's agents its two tools, and only them: every other session would carry two
+    """Gives a canvas's agents its three tools, and only them: every other session would carry
     tools it can't use."""
     global adapter, _wired
     adapter = api_adapter
@@ -605,6 +828,8 @@ def wire(api_adapter: Any) -> bool:
         return _session_canvas(session) is not None
 
     took = tools_common.wire_tool(api_adapter, TOOL_WRITE, WRITE_SCHEMA, TOOL_WRITE, when=is_canvas)
+    if not tools_common.wire_tool(api_adapter, TOOL_EDIT, EDIT_SCHEMA, TOOL_EDIT, when=is_canvas):
+        took = False
     if not tools_common.wire_tool(api_adapter, TOOL_READ, READ_SCHEMA, TOOL_READ, when=is_canvas):
         took = False
     _wired = took

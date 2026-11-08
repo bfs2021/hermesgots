@@ -291,8 +291,11 @@ class SessionTest(unittest.TestCase):
             self.assertTrue(canvases.wire(adapter))
             canvas_agent = adapter._create_agent(session_id=self.session + "-c1")
             plain_agent = adapter._create_agent(session_id=self.plain)
-        self.assertEqual(sorted(canvas_agent.valid_tool_names), [canvases.TOOL_READ, canvases.TOOL_WRITE])
-        self.assertEqual(len(canvas_agent.tools), 2)
+        self.assertEqual(
+            sorted(canvas_agent.valid_tool_names),
+            [canvases.TOOL_EDIT, canvases.TOOL_READ, canvases.TOOL_WRITE],
+        )
+        self.assertEqual(len(canvas_agent.tools), 3)
         self.assertEqual(plain_agent.tools, [])
         self.assertEqual(plain_agent.valid_tool_names, set())
 
@@ -334,6 +337,151 @@ class SessionTest(unittest.TestCase):
             self.assertIn("error", json.loads(canvases.handle_read({}, session_id="s")))
 
 
+class EditTest(unittest.TestCase):
+    """A small change is find and replace, and undo walks the pointer back a version."""
+
+    def setUp(self) -> None:
+        self.path = store_of(self)
+        self.canvas = make_canvas(self.path)
+
+    def stored_versions(self) -> list:
+        conn = connect(self.path)
+        try:
+            return [
+                row[0]
+                for row in conn.execute(
+                    "SELECT version FROM canvas_versions WHERE canvas_id = ? ORDER BY version",
+                    (self.canvas["id"],),
+                )
+            ]
+        finally:
+            conn.close()
+
+    def test_edit_versions_and_undo_restores(self) -> None:
+        first = canvases.write(self.path, self.canvas["id"], DOCUMENT, tools=["todo_list"])
+        second = canvases.write(
+            self.path,
+            self.canvas["id"],
+            DOCUMENT.replace("<h1>Tip</h1>", "<h1>Split</h1>"),
+            tools=["todo_list", "media_url"],
+        )
+        edited = canvases.edit(
+            self.path,
+            self.canvas["id"],
+            [
+                {"find": "<title>Tip</title>", "replace": "<title>Split</title>"},
+                {"find": "<h1>Split</h1>", "replace": "<h1>Split the bill</h1>"},
+            ],
+        )
+        # Every pair is one version, and that version carries the tools the one before it declared.
+        self.assertEqual(edited["version"], 3)
+        self.assertIn("<title>Split</title>", edited["html"])
+        self.assertIn("<h1>Split the bill</h1>", edited["html"])
+        self.assertEqual(edited["tools"], second["tools"])
+        self.assertEqual(canvases.current(self.path, self.canvas["id"])["version"], 3)
+
+        restored = canvases.undo(self.path, self.canvas["id"])
+        self.assertEqual((restored["version"], restored["html"]), (second["version"], second["html"]))
+        self.assertEqual(restored["tools"], second["tools"])
+        # The version the undo walked off is still stored: undo moves a pointer and deletes nothing.
+        self.assertIn(edited["version"], self.stored_versions())
+        self.assertIs(restored["can_undo"], True)
+        self.assertIs(canvases.current(self.path, self.canvas["id"])["can_undo"], True)
+
+        back = canvases.undo(self.path, self.canvas["id"])
+        self.assertEqual((back["version"], back["html"]), (first["version"], first["html"]))
+        self.assertIs(back["can_undo"], False)
+        with self.assertRaises(canvases.CanvasError) as refused:
+            canvases.undo(self.path, self.canvas["id"])
+        self.assertEqual(refused.exception.status, 409)
+
+        # A write lands on the version the user is looking at: the history the undo walked off is
+        # replaced rather than kept above it.
+        written = canvases.write(
+            self.path, self.canvas["id"], DOCUMENT.replace("<h1>Tip</h1>", "<h1>Again</h1>")
+        )
+        self.assertEqual(written["version"], first["version"] + 1)
+        self.assertEqual(self.stored_versions(), [first["version"], written["version"]])
+
+    def test_an_edit_whose_second_pair_matches_twice_writes_nothing(self) -> None:
+        twice = DOCUMENT.replace(
+            "<body><h1>Tip</h1></body>",
+            "<body><h1>Tip</h1><button>Save</button><button>Save</button></body>",
+        )
+        written = canvases.write(self.path, self.canvas["id"], twice)
+        with self.assertRaises(canvases.CanvasError) as refused:
+            canvases.edit(
+                self.path,
+                self.canvas["id"],
+                [
+                    {"find": "<h1>Tip</h1>", "replace": "<h1>Split</h1>"},
+                    {"find": "Save", "replace": "Keep"},
+                ],
+            )
+        message = str(refused.exception)
+        self.assertIn("2 of 2", message)
+        self.assertIn('"Save"', message)
+        self.assertIn("2 times", message)
+        self.assertEqual(canvases.record(self.path, self.canvas["id"])["version"], written["version"])
+        self.assertEqual(canvases.current(self.path, self.canvas["id"])["html"], twice)
+
+    def test_after_an_undo_canvas_read_answers_the_restored_version(self) -> None:
+        kept = canvases.write(self.path, self.canvas["id"], DOCUMENT)
+        canvases.write(
+            self.path, self.canvas["id"], DOCUMENT.replace("<h1>Tip</h1>", "<h1>Split</h1>")
+        )
+        canvases.undo(self.path, self.canvas["id"])
+        with mock.patch.object(canvases, "_session_canvas", return_value=self.canvas["id"]):
+            read = json.loads(canvases.handle_read({}, session_id=self.canvas["session_id"]))
+        # The agent reads what the user is looking at, not the version the undo walked off.
+        self.assertEqual((read["version"], read["html"]), (kept["version"], kept["html"]))
+
+    def test_an_edit_after_an_undo_builds_on_the_restored_text(self) -> None:
+        # What it holds: the pairs are applied to the version the record points at, and that version
+        # is read on the connection the write takes, so an undo cannot be reverted by an edit built
+        # from the version it walked off. The race needs two writers, which a single-threaded case
+        # cannot stage.
+        first = canvases.write(
+            self.path, self.canvas["id"], DOCUMENT.replace("<h1>Tip</h1>", "<h1>First</h1>")
+        )
+        canvases.write(
+            self.path, self.canvas["id"], DOCUMENT.replace("<h1>Tip</h1>", "<h1>Second</h1>")
+        )
+        restored = canvases.undo(self.path, self.canvas["id"])
+        self.assertEqual(restored["version"], first["version"])
+        edited = canvases.edit(
+            self.path,
+            self.canvas["id"],
+            [{"find": "<h1>First</h1>", "replace": "<h1>Restored</h1>"}],
+        )
+        # One above the restored version, built on the text the undo put back.
+        self.assertEqual(edited["version"], first["version"] + 1)
+        self.assertIn("<h1>Restored</h1>", edited["html"])
+        self.assertNotIn("<h1>Second</h1>", edited["html"])
+        self.assertEqual(canvases.current(self.path, self.canvas["id"])["version"], 2)
+
+    def test_after_a_write_the_undo_goes_back_to_what_the_write_replaced(self) -> None:
+        one = canvases.write(
+            self.path, self.canvas["id"], DOCUMENT.replace("<h1>Tip</h1>", "<h1>One</h1>")
+        )
+        two = canvases.write(
+            self.path, self.canvas["id"], DOCUMENT.replace("<h1>Tip</h1>", "<h1>Two</h1>")
+        )
+        canvases.write(
+            self.path, self.canvas["id"], DOCUMENT.replace("<h1>Tip</h1>", "<h1>Three</h1>")
+        )
+        self.assertEqual(canvases.undo(self.path, self.canvas["id"])["version"], two["version"])
+        # The write lands on the version the user is looking at, replacing the history they walked
+        # off — so the undo after it goes back to that version, never into the abandoned one.
+        four = canvases.write(
+            self.path, self.canvas["id"], DOCUMENT.replace("<h1>Tip</h1>", "<h1>Four</h1>")
+        )
+        self.assertEqual(four["version"], two["version"] + 1)
+        back = canvases.undo(self.path, self.canvas["id"])
+        self.assertEqual((back["version"], back["html"]), (two["version"], two["html"]))
+        self.assertGreater(one["version"], 0)
+
+
 class RouteTest(unittest.TestCase):
     def setUp(self) -> None:
         temp_hermes_home(self)
@@ -368,6 +516,22 @@ class RouteTest(unittest.TestCase):
         self.assertEqual(without_run["status"], 400)
         self.assertIn("run request", without_run["payload"]["error"]["message"])
         self.assertEqual(self.call("/canvases")["payload"]["canvases"], [])
+
+    def test_undo_moves_the_canvas_back_one_version(self) -> None:
+        made = self.call("/canvases", "POST", {"prompt": PROMPT, "profile_id": "bot-1", "body": BODY})
+        canvas_id = made["payload"]["canvas"]["id"]
+        canvases.write(self.path, canvas_id, DOCUMENT)
+        canvases.write(
+            self.path, canvas_id, DOCUMENT.replace("<h1>Tip</h1>", "<h1>Split</h1>")
+        )
+        undone = self.call("/canvases/{canvas_id}/undo", "POST", canvas_id=canvas_id)
+        self.assertEqual(undone["status"], 200)
+        self.assertEqual(undone["payload"]["object"], "gots.canvas")
+        found = undone["payload"]["canvas"]
+        self.assertEqual((found["version"], found["html"]), (1, DOCUMENT))
+        # At the first version there is nothing left to walk back to.
+        again = self.call("/canvases/{canvas_id}/undo", "POST", canvas_id=canvas_id)
+        self.assertEqual(again["status"], 409)
 
     def test_info_advertises_canvas_only_where_it_can_be_worked(self) -> None:
         # The tools have to reach a canvas's session and that session has to be told its guide: a
