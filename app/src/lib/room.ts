@@ -12,10 +12,28 @@ import {
 } from "@/lib/db"
 import { equal } from "@/lib/equal"
 import { CHAT_IDLE_MS, CHAT_POLL_MS } from "@/lib/freshness"
-import { HermesError, getRoom, sendRoomMessage } from "@/lib/hermes"
+import {
+  HermesError,
+  answerRoom,
+  approveRoom,
+  getRoom,
+  sendRoomMessage,
+  stopRoom,
+  type RoomApproval,
+  type RoomAsked,
+  type RoomAsk,
+} from "@/lib/hermes"
 import { useChanges } from "@/lib/live"
 import { usePoll } from "@/lib/poll"
-import { foldRoom, newestSeq, queuedMembers, workingLine, workingMembers } from "@/lib/room-log"
+import { randomId } from "@/lib/utils"
+import {
+  askingMember,
+  foldRoom,
+  newestSeq,
+  queuedMembers,
+  workingLine,
+  workingMembers,
+} from "@/lib/room-log"
 
 /**
  * A room on this device (ADR 0116): its words are the Host's log, read by sequence and kept on the
@@ -45,17 +63,21 @@ export interface RoomLive {
   members: RoomMember[]
   /** The who-is-working line, and nothing at all while the room is at rest. */
   working?: string
+  /** What the room waits on the user for: an approval, or a question, and nothing at rest. */
+  waiting: RoomAsk[]
+  /** Whether this room's round can be stopped, and `undefined` until a read has said either way. */
+  canStop?: boolean
   /** Whether this room takes a send, and `undefined` until a read has said either way. */
   canSend?: boolean
+  /** The member whose reply ended addressed to `@user`, read from the log this device holds. */
+  asking?: { memberId?: string; name?: string }
   /** The last read that failed, in the Host's own words, and cleared by the next good read. */
   error?: string
-  /** A send the Host refused, in its own words: it stands until the next attempt. */
+  /** A send, an answer or a stop the Host refused, in its own words: it stands until the next try. */
   refused?: string
-  /** A send on its way to the Host. */
-  sending: boolean
 }
 
-const EMPTY: RoomLive = { name: "", members: [], sending: false }
+const EMPTY: RoomLive = { name: "", members: [], waiting: [] }
 
 /** The index range one room's page sits in, which every read and write of it asks for. */
 const pageRange = (roomId: string) =>
@@ -149,9 +171,10 @@ export function useRoom(chat: Conversation | undefined, bot: Profile | undefined
               queuedMembers(members, found.activity),
               found.working,
             ),
+            waiting: found.waiting,
+            canStop: found.canStop,
             canSend: found.canSend,
-            sending: held.sending,
-            // A refusal is the send's, not the read's: a good read does not take its words away.
+            // A refusal is the write's, not the read's: a good read does not take its words away.
             ...(held.refused ? { refused: held.refused } : {}),
           }
           return equal(next, held) ? held : next
@@ -216,14 +239,14 @@ export function useRoom(chat: Conversation | undefined, bot: Profile | undefined
   const send = useCallback(
     async (text: string): Promise<boolean> => {
       if (!roomId || !hasServer(bot) || !text.trim()) return false
-      setLive((held) => ({ ...held, sending: true, refused: undefined }))
+      setLive((held) => ({ ...held, refused: undefined }))
       try {
         const words = text.trim()
         // The id is minted here and kept with the words, so a send retried after a dropped answer
         // is the Host's same message rather than a second one. Words the user changed are a new
         // message: the Host binds an id to its content, and would refuse the old id for them.
         const eventId =
-          failed.current?.text === words ? failed.current.eventId : crypto.randomUUID()
+          failed.current?.text === words ? failed.current.eventId : randomId()
         failed.current = { text: words, eventId }
         const sent = await sendRoomMessage(config, roomId, eventId, words)
         const held = await readMark(roomId)
@@ -236,11 +259,54 @@ export function useRoom(chat: Conversation | undefined, bot: Profile | undefined
         setLive((held) => ({ ...held, refused: reasonOf(error) }))
         return false
       } finally {
-        setLive((held) => ({ ...held, sending: false }))
         sync(undefined, true)
       }
     },
     [roomId, bot, config, sync],
+  )
+
+  /**
+   * One answer into the room — an approval, a question, or a stop — and a read the moment it lands,
+   * since what the room waits on is the Host's own state and not this device's guess. A refusal
+   * stays on screen in the Host's words, as a refused send does.
+   */
+  const act = useCallback(
+    async (work: () => Promise<void>): Promise<boolean> => {
+      if (!roomId || !hasServer(bot)) return false
+      setLive((held) => ({ ...held, refused: undefined }))
+      try {
+        await work()
+        return true
+      } catch (error) {
+        setLive((held) => ({ ...held, refused: reasonOf(error) }))
+        return false
+      } finally {
+        sync(undefined, true)
+      }
+    },
+    [roomId, bot, sync],
+  )
+
+  const approve = useCallback(
+    (approval: RoomApproval, choice: "once" | "deny") =>
+      roomId
+        ? act(() => approveRoom(config, roomId, approval, choice))
+        : Promise.resolve(false),
+    [roomId, config, act],
+  )
+
+  const answer = useCallback(
+    (asked: RoomAsked, answers: Record<string, string | string[]>) =>
+      roomId ? act(() => answerRoom(config, roomId, asked, answers)) : Promise.resolve(false),
+    [roomId, config, act],
+  )
+
+  const stop = useCallback(
+    () =>
+      roomId
+        ? act(() => stopRoom(config, roomId, randomId()))
+        : Promise.resolve(false),
+    [roomId, config, act],
   )
 
   // One read as the screen opens, another each time the Host says the room moved, and the poll as
@@ -253,5 +319,13 @@ export function useRoom(chat: Conversation | undefined, bot: Profile | undefined
     [live.members, chat],
   )
   const folded = useMemo(() => foldRoom(rows ?? [], members), [rows, members])
-  return { live: { ...live, members }, rows: folded, send }
+  const asking = useMemo(() => askingMember(rows ?? [], members), [rows, members])
+  return {
+    live: { ...live, members, asking },
+    rows: folded,
+    send,
+    approve,
+    answer,
+    stop,
+  }
 }
