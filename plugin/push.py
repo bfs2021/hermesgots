@@ -58,8 +58,9 @@ TITLE_MAX = 80
 # The push services accept 4096 bytes; ours are far smaller.
 RECORD_SIZE = 4096
 MAX_SUBSCRIPTIONS = 20
-# What a push is about. The first three wait on the user; the rest are news. The registry
-# (`app/netlify/lib/fcm.ts`) and the app (`app/src/lib/push-kinds.ts`) keep the same lists.
+# What a push is about. `approval`, `question`, `plan` and `room_input` wait on the user; the rest
+# are news. The registry (`app/netlify/lib/fcm.ts`) and the app (`app/src/lib/push-kinds.ts`) keep
+# the same lists.
 KINDS = (
     "approval",
     "question",
@@ -78,13 +79,18 @@ KINDS = (
     "routine_message",
     "meeting_done",
     "meeting_failed",
+    # A room of this Host's bots waits on the user, and it is its own kind because a room is
+    # nobody's chat: a push about one names the room, not a session.
+    "room_input",
 )
 # What a device switches: a kind within a feature (chats, code, routines, research). A session's
-# kinds belong to Code when it is a project session, else to Chats.
+# kinds belong to Code when it is a project session, else to Chats; a room's is the room's own,
+# whichever feature its session would have been in.
 CATEGORIES = (
     "chat_input",
     "chat_run_failed",
     "chat_run_done",
+    "room_input",
     "code_input",
     "code_run_failed",
     "code_run_done",
@@ -116,6 +122,9 @@ def category_of(kind: str, project: bool = False) -> str:
         return "routine_failed"
     if kind == "routine_message":
         return "routine_message"
+    # A room is nobody's chat, so which feature a session is in says nothing about it.
+    if kind == "room_input":
+        return "room_input"
     if kind == "clone_failed":
         return "code_setup_failed"
     if kind in ("research_brief", "research_scope"):
@@ -452,12 +461,15 @@ def notify(
 ) -> None:
     """Something a device should hear about. ``session_id`` is the session it is about, or for the
     kinds that aren't about one the routine's job id (``routine_failed``), the project's id
-    (``clone_failed``) or the research mission's id (``research_*``); it only picks what a tap opens.
-    ``title`` names what it is about when that isn't a session (whose chat title is looked up).
+    (``clone_failed``), the research mission's id (``research_*``) or the room's id
+    (``room_input``); it only picks what a tap opens. ``title`` names what it is about when that
+    isn't a session (whose chat title is looked up). Answers whether a push will be sent — a device
+    exists that asked for this category, and one of this kind for this id wasn't told a moment ago —
+    so a caller that remembers what it has told the user doesn't remember a push that was dropped.
     Never raises: it runs inside Hermes's hooks."""
     try:
         if kind not in KINDS or not session_id:
-            return
+            return False
         if path is None:
             # Hooks run inside the turn's profile scope, so this is that profile's store.
             path = current_path()
@@ -465,17 +477,19 @@ def notify(
         key = (str(path), kind, session_id)
         with _lock:
             if now - _last.get(key, -THROTTLE_SECONDS) < THROTTLE_SECONDS:
-                return
+                return False
             _last[key] = now
             if len(_last) > 512:
                 _last.clear()
         if not reachable(path):
-            return
+            return False
         threading.Thread(
             target=_run, args=(path, kind, session_id, title), name="gots-push", daemon=True
         ).start()
+        return True
     except Exception:
         logger.debug("gots: couldn't send a push", exc_info=True)
+        return False
 
 
 BOT_ID = re.compile(r"^[a-z0-9-]{1,32}$")

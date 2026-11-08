@@ -63,6 +63,12 @@ class Categories(unittest.TestCase):
         self.assertEqual(push.category_of("meeting_done"), "meeting_done")
         self.assertEqual(push.category_of("meeting_failed", project=True), "meeting_failed")
 
+    def test_a_room_that_needs_the_user_is_a_category_of_its_own(self):
+        self.assertEqual(push.category_of("room_input"), "room_input")
+        self.assertEqual(push.category_of("room_input", project=True), "room_input")
+        self.assertIn("room_input", push.CATEGORIES)
+        self.assertIn("room_input", push.KINDS)
+
     def test_every_kind_lands_in_a_category_that_exists(self):
         for kind in push.KINDS:
             for project in (False, True):
@@ -83,6 +89,16 @@ class Categories(unittest.TestCase):
         worker = (app / "public" / "push-sw.js").read_text()
         words = re.search(r"const WORDS = \{(.*?)\}", worker, re.S).group(1)
         self.assertEqual(tuple(re.findall(r"^\s*(\w+):", words, re.M)), push.KINDS)
+        # The same event read out of a closed app and out of an open page is one sentence, or the two
+        # ways a device hears about it disagree.
+        said = re.search(r"const WORDS[^{]*\{(.*?)\n\}", fcm, re.S).group(1)
+        theirs = dict(re.findall(r'(\w+): "([^"]*)"', said))
+        theirs.pop("test", None)  # the registry's own probe, which no device is told
+        self.assertEqual(
+            dict(re.findall(r'(\w+): "([^"]*)"', words)),
+            theirs,
+            "the registry and the worker say the same words",
+        )
 
     def test_a_database_from_before_categories_gains_the_column(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -109,6 +125,50 @@ class Categories(unittest.TestCase):
             self.assertTrue(push.once(path, "b"))
             push.clear(path, "a")
             self.assertTrue(push.once(path, "a"))
+
+
+class Delivery(unittest.TestCase):
+    """Who hears a push: a device that asked for its category, and never one with the app on screen."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = db_path(Path(self.tmp.name))
+        conn = connect(self.path)
+        conn.execute(
+            "INSERT INTO push_subscriptions (endpoint, device, p256dh, auth, vapid_key, subject,"
+            " created_at, categories) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("https://push.example/1", "phone-1", "key", "auth", "vapid", "mailto:a@b.c", 1,
+             '["room_input"]'),
+        )
+        conn.close()
+        self.sent = []
+        patch = mock.patch.object(
+            push, "send", lambda row, payload, topic: self.sent.append(payload) or 201
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+        relay = mock.patch.object(push, "_relay", lambda *args, **kwargs: None)
+        relay.start()
+        self.addCleanup(relay.stop)
+
+    def deliver(self):
+        push._deliver(self.path, "room_input", "room_input", "room-1", {"title": "Planning"})
+
+    def test_a_waiting_room_reaches_a_device_that_asked_for_it(self):
+        self.deliver()
+        self.assertEqual(
+            self.sent,
+            [{"kind": "room_input", "session_id": "room-1", "title": "Planning"}],
+            "the room's id, so a tap opens it, and its name, so the notification says which",
+        )
+
+    def test_a_device_with_the_app_on_screen_is_not_pushed(self):
+        with push.watching(self.path, "phone-1"):
+            self.deliver()
+            self.assertEqual(self.sent, [], "the app is already drawing the room")
+        self.deliver()
+        self.assertEqual(len(self.sent), 1, "put away, it hears it then")
 
 
 class Mutes(unittest.TestCase):
