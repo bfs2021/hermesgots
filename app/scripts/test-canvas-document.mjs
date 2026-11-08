@@ -2,8 +2,10 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import test from "node:test"
 
+import { BRIDGE_METHODS } from "../src/lib/canvas-bridge.ts"
 import {
   CANVAS_CSP,
+  LIBRARIES,
   SCROLL_MESSAGE,
   TOKENS,
   canvasDocument,
@@ -11,6 +13,7 @@ import {
   themeTokens,
   themeVariables,
 } from "../src/lib/canvas-document.ts"
+import { canvasClasses, CANVAS_THEME, compileCanvasCss } from "../src/lib/canvas-tailwind.ts"
 
 const PAGE = `<!doctype html>
 <html lang="en">
@@ -138,6 +141,160 @@ test("the tokens the page is given are the ones its guide names", () => {
   const guide = readFileSync(new URL("../../plugin/canvas/prompt.txt", import.meta.url), "utf8")
   const named = new Set([...guide.matchAll(/--([a-z-]+)/g)].map((match) => match[1]))
   assert.deepEqual([...named].sort(), [...TOKENS].sort())
+})
+
+test("a named library is inlined and an unknown one dropped", () => {
+  // A page asks for a library by naming it in an empty script; the app puts the source where the
+  // ask was, and a name it can't answer is taken out rather than left as a tag the page would parse
+  // as an empty script of its own.
+  const page = PAGE.replace(
+    "<title>Tip</title>",
+    '<title>Tip</title>\n    <script data-canvas-lib="chart"></script>\n' +
+      '    <script data-canvas-lib="nope"></script>\n' +
+      "    <script data-canvas-lib='icons'></script>",
+  )
+  const html = canvasDocument(page, {
+    mode: "light",
+    tokens: LIGHT,
+    libraries: { chart: "window.Chart=function(){}" },
+  })
+  assert.match(html, /<script>window\.Chart=function\(\)\{\}<\/script>/, "the source is inlined")
+  // The ask is a placeholder, not a hoist: the library lands where the page put it, which is what
+  // the guide tells a bot to rely on when it asks above the script that uses it.
+  const late = PAGE.replace(
+    "<h1>Tip</h1>",
+    '<h1>Tip</h1>\n    <script data-canvas-lib="chart"></script>',
+  )
+  const after = canvasDocument(late, {
+    mode: "light",
+    tokens: LIGHT,
+    libraries: { chart: "window.Chart=function(){}" },
+  })
+  assert.ok(
+    after.indexOf("<h1>Tip</h1>") < after.indexOf("window.Chart"),
+    "the library lands where the page asked for it",
+  )
+  assert.equal(html.includes("data-canvas-lib"), false, "no ask is left in the document")
+  assert.equal(html.includes("nope"), false, "an unknown name is dropped")
+  assert.equal(
+    html.includes("<script></script>"),
+    false,
+    "a known name with no source is dropped too",
+  )
+  // A second ask for a library already inlined adds nothing: its global is defined by the first.
+  const twice = canvasDocument(
+    PAGE.replace(
+      "<title>Tip</title>",
+      '<title>Tip</title>\n    <script data-canvas-lib="chart"></script>' +
+        '<script data-canvas-lib="chart"></script>',
+    ),
+    { mode: "light", tokens: LIGHT, libraries: { chart: "window.Chart=function(){}" } },
+  )
+  assert.equal(twice.split("window.Chart=function").length - 1, 1, "the source is inlined once")
+  // An ask whose other attributes carry a `>` is still an ask: the tag is read, not its bytes.
+  const quoted = canvasDocument(
+    PAGE.replace(
+      "<title>Tip</title>",
+      '<title>Tip</title>\n    <script data-x="a>b" data-canvas-lib="date"></script>',
+    ),
+    { mode: "light", tokens: LIGHT, libraries: { date: "window.dayjs=function(){}" } },
+  )
+  assert.match(quoted, /<script>window\.dayjs=function\(\)\{\}<\/script>/, "a quoted `>` doesn't hide the ask")
+})
+
+test("bg-primary compiles to the token's variable", async () => {
+  // The page's classes are Tailwind's, compiled from the same tokens the page is handed: a utility
+  // that resolves to anything but `var(--primary)` would follow a colour the app never set.
+  const base = readFileSync(
+    new URL("../node_modules/tailwindcss/index.css", import.meta.url),
+    "utf8",
+  )
+  const css = await compileCanvasCss(base, ["bg-primary", "text-primary-foreground", "rounded-lg"])
+  const ruleFor = (name) => {
+    const found = new RegExp(
+      `\\.${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{[^}]*\\}`,
+    ).exec(css)
+    assert.ok(found, `${name} is compiled`)
+    return found[0]
+  }
+  assert.match(ruleFor("bg-primary"), /background-color: var\(--primary\)/)
+  assert.match(ruleFor("text-primary-foreground"), /color: var\(--primary-foreground\)/)
+  assert.match(ruleFor("rounded-lg"), /border-radius: var\(--radius\)/)
+})
+
+test("dark: classes follow the app's mode, not the phone's", async () => {
+  // The page's tokens are set for the reader's mode, so a `dark:` utility has to answer the same
+  // question. Tailwind's own variant asks the operating system, which can disagree with the app.
+  const dark = canvasDocument(PAGE, { mode: "dark", tokens: DARK })
+  const light = canvasDocument(PAGE, { mode: "light", tokens: LIGHT })
+  assert.match(dark, /<html lang="en" class="dark">/, "the dark page says so on its html")
+  assert.equal(/<html[^>]*class="[^"]*\bdark\b/.test(light), false, "the light page doesn't")
+  const base = readFileSync(new URL("../node_modules/tailwindcss/index.css", import.meta.url), "utf8")
+  const css = await compileCanvasCss(base, ["dark:bg-card"])
+  assert.match(css, /:where\(\.dark, \.dark \*\)/, "the variant is the page's own class")
+  assert.equal(css.includes("prefers-color-scheme"), false, "and not the phone's setting")
+})
+
+test("compiled CSS can't end the style element it rides in", () => {
+  // `before:content-['</style>']` compiles to a raw close tag: unescaped, the style element ends and
+  // the rest of the utilities spill into the page as text.
+  const page = PAGE.replace("<h1>Tip</h1>", '<h1 class="before:content-[\'x\']">Tip</h1>')
+  const html = canvasDocument(page, {
+    mode: "light",
+    tokens: LIGHT,
+    css: `p::before{content:'</style>'}`,
+  })
+  assert.equal((html.match(/<style>/g) ?? []).length, (html.match(/<\/style>/g) ?? []).length)
+  assert.match(html, /content:'<\\\/style>'/, "the close tag is escaped, not spelled")
+})
+
+test("the radius steps a canvas gets are the app's own", () => {
+  // The canvas copies the app's four radius steps rather than Tailwind's defaults, and a copy is
+  // only as good as the thing holding it to the original: a step the app changes is a step the
+  // canvas must change with, or a `rounded-lg` on a page stops matching the app's own.
+  const app = readFileSync(new URL("../src/index.css", import.meta.url), "utf8")
+  for (const step of ["sm", "md", "lg", "xl"]) {
+    const declared = new RegExp(`--radius-${step}:\\s*([^;]+);`).exec(app)?.[1].trim()
+    assert.ok(declared, `the app declares --radius-${step}`)
+    assert.ok(
+      CANVAS_THEME.includes(`--radius-${step}: ${declared};`),
+      `the canvas takes the app's --radius-${step}`,
+    )
+  }
+})
+
+test("the classes compiled are the ones the page's class attributes name", () => {
+  // Only what is in the markup is compiled (`classes` in the guide): the reader takes both quote
+  // styles, keeps each name once, and is not fooled by a script or a style block that looks like
+  // one. The three ways HTML may write the attribute all count, and so does a space spelled as an
+  // entity — the browser reads them all as classes, so the compiler has to as well.
+  const page = `<div class="p-4  bg-card bg-card" data-x="p-4"></div>
+    <span class='text-foreground md:mt-2'></span>
+    <p CLASS="gap-2"></p>
+    <p class=bg-primary></p>
+    <p class="p-4&#32;bg-muted"></p>
+    <script>var prose = 'class="nope"'</script>
+    <style>.nope{color:red}</style>`
+  assert.deepEqual(canvasClasses(page), [
+    "bg-card",
+    "bg-muted",
+    "bg-primary",
+    "gap-2",
+    "md:mt-2",
+    "p-4",
+    "text-foreground",
+  ])
+})
+
+test("the canvas section names exactly the libraries and bridge methods the app has", () => {
+  // The guide is what a bot is told it may ask for, and the app is what answers: a name in one and
+  // not the other is a page that draws a hole where a library or a call should be. Over the host's
+  // 4,000-character section cap the section is dropped whole, so the guide's length is part of it.
+  const guide = readFileSync(new URL("../../plugin/canvas/prompt.txt", import.meta.url), "utf8")
+  const named = (pattern) => [...new Set([...guide.matchAll(pattern)].map((match) => match[1]))]
+  assert.deepEqual(named(/data-canvas-lib="([a-z]+)"/g).sort(), [...LIBRARIES].sort())
+  assert.deepEqual(named(/canvas\.data\.([a-z]+)/g).sort(), [...BRIDGE_METHODS].sort())
+  assert.ok(guide.length <= 4_000, `the guide is ${guide.length} characters, under the host's 4,000`)
 })
 
 test("the app's own policy keeps a canvas's frame from navigating itself away", () => {

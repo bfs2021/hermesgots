@@ -17,7 +17,9 @@ import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { attempt } from "@/lib/attempt"
 import { bridgeHandler } from "@/lib/canvas-bridge"
+import { canvasCss, canvasCssKey } from "@/lib/canvas-css"
 import { canvasDocument, readScroll, themeTokens, type CanvasMode } from "@/lib/canvas-document"
+import { CANVAS_LIBRARIES } from "@/lib/canvas-libraries"
 import {
   canvasData,
   refreshCanvas,
@@ -172,6 +174,32 @@ export function CanvasView() {
   // canvas opens at its own top rather than at the offset the first one was left at.
   const scrolled = useRef<{ id: string; at: number }>({ id, at: 0 })
   const chatId = canvas?.chatId
+  // The page's classes compiled, kept with the version they were compiled for: an answer that lands
+  // after the screen has moved to another version is no CSS to draw with, and no CSS at all keeps
+  // the frame off the page until there is one.
+  const [compiled, setCompiled] = useState<{ key: string; css: string } | null>(null)
+  const canvasId = canvas?.id
+  const version = canvas?.version
+  const cssKey = canvasId && version !== undefined ? canvasCssKey(canvasId, version) : null
+  const css = compiled && compiled.key === cssKey ? compiled.css : null
+  useEffect(() => {
+    if (!canvasId || version === undefined || !html) return
+    const key = canvasCssKey(canvasId, version)
+    let live = true
+    void canvasCss(canvasId, version, html).then(
+      (value) => {
+        if (live) setCompiled({ key, css: value })
+      },
+      // A page whose classes couldn't be compiled is still a page: it is drawn with its own
+      // `<style>` and the app's tokens, as a canvas was before any of its classes were compiled.
+      () => {
+        if (live) setCompiled({ key, css: "" })
+      },
+    )
+    return () => {
+      live = false
+    }
+  }, [canvasId, version, html])
   const chat = useLiveQuery(() => (chatId ? db.conversations.get(chatId) : undefined), [chatId])
   const profile = useLiveQuery(
     () => (canvas ? db.profiles.get(canvas.profileId) : undefined),
@@ -181,20 +209,22 @@ export function CanvasView() {
     setUsageOpen(true),
   )
   const drawn = useMemo(() => {
-    if (!html) return null
+    if (!html || css === null) return null
     const tokens = themeTokens(readTheme())
     try {
       return {
         document: canvasDocument(html, {
           mode,
           tokens,
+          css,
+          libraries: CANVAS_LIBRARIES,
           scroll: scrolled.current.id === id ? scrolled.current.at : 0,
         }),
       }
     } catch {
       return { error: "This canvas can't be drawn: its document has no head." }
     }
-  }, [id, html, mode])
+  }, [id, html, mode, css])
 
   // The page says where it has been scrolled to, and only this screen's own frame is heard: a message
   // from any other window is not the canvas talking.
@@ -305,7 +335,7 @@ export function CanvasView() {
             />
           ) : (
             <p className="p-4 text-center text-sm text-muted-foreground">
-              {loaded ? "Your bot is building it…" : "Reading the canvas…"}
+              {loaded && !html ? "Your bot is building it…" : "Reading the canvas…"}
             </p>
           )}
           {/* A phone has room for the page or its chat, not both: the chat is raised over the page

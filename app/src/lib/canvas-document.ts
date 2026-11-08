@@ -17,6 +17,14 @@ import { BRIDGE_SCRIPT } from "./canvas-bridge.ts"
 
 export type CanvasMode = "light" | "dark"
 
+/**
+ * The libraries a page may ask for by name: the ones the app carries a source for, so a page reads
+ * them with the app's own copy rather than a CDN the policy wouldn't allow anyway. A name outside
+ * this list is dropped, which is how a page asking for something the app doesn't have still draws.
+ */
+export const LIBRARIES = ["chart", "date", "icons"] as const
+export type CanvasLibrary = (typeof LIBRARIES)[number]
+
 export const CANVAS_CSP =
   "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; " +
   "font-src data:; connect-src 'none'; frame-src 'none'; form-action 'none'"
@@ -98,12 +106,69 @@ export function themeVariables(tokens: Record<string, string>, mode: CanvasMode)
 }
 
 /**
- * The document a frame is given: the page, with the policy, the theme, the WebRTC removal, the
- * scroll bridge and the data bridge in its head ahead of anything it wrote — five things, the bridge
- * last. `scroll` is the position the bridge last reported, so a page rebuilt at a new version opens
- * where the reader left the one before it. A page with no head can't be drawn — the plugin's scan
- * refuses one, so this is a bug rather than a page, and it throws instead of drawing something
- * unstyled.
+ * A page's ask for a library, as the guide writes it: an empty script naming one. Other attributes
+ * may ride the tag — quoted values included — and both quote styles count, since a bot writes
+ * markup, not a spec.
+ */
+const LIBRARY_TAG =
+  /<script\b(?:[^>"']|"[^"]*"|'[^']*')*?\bdata-canvas-lib\s*=\s*["']([^"']*)["'](?:[^>"']|"[^"]*"|'[^']*')*>\s*<\/script>/gi
+
+/**
+ * Every ask taken out, the ones the app can answer replaced by the library's own source where the
+ * page put it. A name it doesn't know, a known one the caller gave no source for, and a second ask
+ * for one already inlined, leave nothing behind: the page draws without the library rather than
+ * carrying a tag for one it never got, or the same source twice.
+ */
+function inlineLibraries(html: string, libraries: Partial<Record<CanvasLibrary, string>>): string {
+  const placed = new Set<string>()
+  return html.replace(LIBRARY_TAG, (_tag, name: string) => {
+    const known = (LIBRARIES as readonly string[]).includes(name)
+    const source = known ? libraries[name as CanvasLibrary] : undefined
+    if (!source || placed.has(name)) return ""
+    placed.add(name)
+    // `</script` inside the source would end the element it is in; the escape spells the same string.
+    return `<script>${source.replace(/<\/script/gi, "<\\/script")}</script>`
+  })
+}
+
+/**
+ * The reader's mode, as a class on the page's `html`: `dark:` in a compiled class follows the app
+ * rather than the phone's own setting, which is the only way a variant and the tokens agree.
+ */
+function withMode(html: string, mode: CanvasMode): string {
+  if (mode !== "dark") return html
+  const open = /<html\b([^>]*)>/i.exec(html)
+  if (!open) return html
+  const attributes = open[1]
+  const declared = /\bclass\s*=\s*("([^"]*)"|'([^']*)')/i.exec(attributes)
+  const tag = (rest: string) => `<html${rest}>`
+  const after = html.slice(open.index + open[0].length)
+  if (!declared) return html.slice(0, open.index) + tag(`${attributes} class="dark"`) + after
+  const held = declared[2] ?? declared[3] ?? ""
+  if (/\bdark\b/.test(held)) return html
+  const quote = declared[0].includes('"') ? '"' : "'"
+  const value = `class=${quote}${held}${held ? " " : ""}dark${quote}`
+  const rest = attributes.slice(0, declared.index) + value + attributes.slice(declared.index + declared[0].length)
+  return html.slice(0, open.index) + tag(rest) + after
+}
+
+/**
+ * Compiled CSS, made safe for the `<style>` it rides in: a class whose compiled value spells
+ * `</style>` — `before:content-['</style>']` does — would end the element and spill the rest of the
+ * utilities into the page as text. `<\/style` is the same CSS, since a CSS string reads `\/` as `/`.
+ */
+function escapeStyle(css: string): string {
+  return css.replace(/<\/style/gi, "<\\/style")
+}
+
+/**
+ * The document a frame is given: the page, with the app's own head ahead of anything it wrote — the
+ * policy, the theme, the compiled classes and the scripts a page is handed, the data bridge last
+ * since the page's own scripts are what call it. `scroll` is the position the bridge last reported,
+ * so a page rebuilt at a new version opens where the reader left the one before it; `libraries` are
+ * the sources an ask for one is answered with, and `css` the Tailwind the page's own classes
+ * compiled to. A page with no head can't be drawn — the plugin's scan refuses one, so this is a bug
+ * rather than a page, and it throws instead of drawing something unstyled.
  */
 export function canvasDocument(
   html: string,
@@ -111,18 +176,28 @@ export function canvasDocument(
     mode,
     tokens,
     scroll = 0,
-  }: { mode: CanvasMode; tokens: Record<string, string>; scroll?: number },
+    libraries = {},
+    css = "",
+  }: {
+    mode: CanvasMode
+    tokens: Record<string, string>
+    scroll?: number
+    libraries?: Partial<Record<CanvasLibrary, string>>
+    css?: string
+  },
 ): string {
-  const head = findHead(html)
+  const page = withMode(inlineLibraries(html, libraries), mode)
+  const head = findHead(page)
   if (!head) throw new Error("a canvas document needs a <head> to be drawn")
   const at = head.index + head.length
   const prefix =
     `<meta http-equiv="Content-Security-Policy" content="${CANVAS_CSP}">` +
     `<style>${themeVariables(tokens, mode)}</style>` +
+    (css ? `<style>${escapeStyle(css)}</style>` : "") +
     `<script>${NO_PEER}</script>` +
     `<script>${scrollBridge(scroll)}</script>` +
     `<script>${BRIDGE_SCRIPT}</script>`
-  return html.slice(0, at) + prefix + html.slice(at)
+  return page.slice(0, at) + prefix + page.slice(at)
 }
 
 /**
