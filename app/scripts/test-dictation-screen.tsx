@@ -30,6 +30,7 @@ import {
   findAll,
   json,
   lineLabel,
+  missing,
   mount,
   seedSettings,
   text,
@@ -306,8 +307,8 @@ test("the screen draws three tabs in one address, Overview first", async () => {
     )
     assert.equal(tab("Overview")?.getAttribute("aria-selected"), "true", "Overview is what opens")
     assert.ok(overview(), "and its panel is the one drawn")
-    assert.equal(history(), null, "with the others closed")
-    assert.equal(botsTab(), null, "both of them")
+    assert.ok(missing("[data-dictation-history]"), "with the others closed")
+    assert.ok(missing("[data-dictation-bots]"), "both of them")
   })
 })
 
@@ -390,9 +391,8 @@ test("a row opens its dictation whole, a Copy that copies it", async () => {
     await click(rows()[0] ?? null)
     await until(async () => Boolean(sheet()), "the dictation's sheet")
     assert.equal(sheet()?.textContent, said, "the sheet holds every word, the line break included")
-    assert.equal(
-      heardBlock(),
-      null,
+    assert.ok(
+      missing("[data-dictation-heard]"),
       "a take kept before the words as heard existed draws no block for them",
     )
     assert.equal(
@@ -522,7 +522,7 @@ test("a row whose cleanup was never recorded says nothing about it", async () =>
     await until(async () => rows().length === 1, "the dictation")
     await click(rows()[0] ?? null)
     await until(async () => Boolean(heardBlock()), "the sheet")
-    assert.equal(find("[data-dictation-tidied]"), null, "nothing is claimed about its cleanup")
+    assert.ok(missing("[data-dictation-tidied]"), "nothing is claimed about its cleanup")
   })
 })
 
@@ -542,9 +542,8 @@ test("a take the cleanup left alone reads as one block, named Transcribed", asyn
     await click(rows()[0] ?? null)
     await until(async () => Boolean(heardBlock()), "the dictation's sheet")
     assert.ok(blockText(heardBlock()).startsWith("Transcribed"), "the one block says what it is")
-    assert.equal(
-      sheet(),
-      null,
+    assert.ok(
+      missing("[data-dictation-text]"),
       "the same words are never drawn twice under a heading the cleanup didn't earn",
     )
     assert.equal(

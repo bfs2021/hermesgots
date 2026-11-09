@@ -20,6 +20,7 @@ import {
   findAll,
   findText,
   mediaHost,
+  missing,
   mount,
   path,
   seedSettings,
@@ -82,7 +83,7 @@ test("a linked bot's trash asks first, then unlinks its host and lands on the Se
     assert.ok(control, "the header carries a trash named for the bot")
     assert.ok(control!.closest("header"), "and it sits in the screen's header")
     assert.equal((control as HTMLButtonElement).disabled, false, "a linked bot can always go")
-    assert.equal(dialog(), null, "nothing is asked before it is tapped")
+    assert.ok(missing('[role="alertdialog"]'), "nothing is asked before it is tapped")
 
     await click(control)
     assert.ok(dialog(), "tapping it asks first")
@@ -169,7 +170,7 @@ test("the bot's own page holds no remove or delete control but the header's tras
     for (const name of ["Remove A bot", "Delete bot"])
       assert.equal(buttonNamed(name), null, `no button named ${name} on the page`)
     absent("button", "Remove")
-    assert.equal(find('[data-slot="alert-dialog-trigger"]'), null, "and nothing there asks first")
+    assert.ok(missing('[data-slot="alert-dialog-trigger"]'), "and nothing there asks first")
     for (const label of ["Enabled", "Mute notifications", "Bot Profile", "Test connection"])
       assert.ok(text().includes(label), `it still has ${label}`)
   })
@@ -188,7 +189,7 @@ test("an unlinked bot this device would be left without has the trash, and it is
     )
     await click(control)
     await settle()
-    assert.equal(dialog(), null, "so tapping it asks nothing")
+    assert.ok(missing('[role="alertdialog"]'), "so tapping it asks nothing")
     assert.ok(await db.profiles.get("bot-1"), "and the bot stays")
   })
 })

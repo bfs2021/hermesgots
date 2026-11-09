@@ -25,6 +25,7 @@ import {
   findAll,
   laptop,
   mediaHost,
+  missing,
   mount,
   path,
   seedSettings,
@@ -154,7 +155,7 @@ for (const { feature, segment, name } of GATED) {
       ALL.filter((one) => one !== feature),
     )
     await mount(settings(`/settings/bots/bot-1/${segment}`), async () => {
-      assert.equal(row(segment), null, `no ${name} row on the settings card`)
+      assert.ok(missing(`[data-bot-page="${segment}"]`), `no ${name} row on the settings card`)
       assert.equal(path(), "/settings/bots/bot-1", "the bot's own address, in place")
       assert.ok(find("[data-bot-card]"), "and the bot's page is what is drawn")
     })
@@ -356,11 +357,7 @@ test(
         "/settings/bots/bot-1",
         "the card closes onto the page it was opened over",
       )
-      assert.equal(
-        find('[role="alertdialog"]'),
-        null,
-        "with nothing asked: closing a pop-up is the whole of saying no",
-      )
+      assert.ok(missing('[role="alertdialog"]'), "with nothing asked: closing a pop-up is the whole of saying no")
       assert.equal((await db.profiles.get("bot-1"))?.name, "A bot", "and nothing was written")
     })
   }),
@@ -376,6 +373,6 @@ test("an untouched edit leaves without a word", async () => {
       "/settings/bots/bot-1/general",
       "a form nobody typed in is a back, not a question",
     )
-    assert.equal(find('[role="alertdialog"]'), null, "with nothing to ask")
+    assert.ok(missing('[role="alertdialog"]'), "with nothing to ask")
   })
 })

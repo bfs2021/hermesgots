@@ -515,6 +515,12 @@ export const wordsOf = (element: Element | null) =>
 export const find = (selector: string) => document.querySelector(selector)
 export const findAll = (selector: string) => [...document.querySelectorAll(selector)]
 /**
+ * Whether nothing on the screen matches a selector, as a boolean: a failed assertion handed the
+ * element builds its diff by inspecting it, and a mounted element carries React's fiber graph, so
+ * that diff walks the whole tree.
+ */
+export const missing = (selector: string) => find(selector) === null
+/**
  * The card Main draws for a thread, by the thread it draws and never by the words on it: those are the
  * thread's own message, which a fixture can reword (ADR 0082).
  */
@@ -555,9 +561,12 @@ export const labelled = (selector: string, label: string) =>
  * what should have been absent, rather than printing the element that was found.
  */
 export function absent(selector: string, label?: string) {
-  const found = label === undefined ? find(selector) : findText(selector, label)
-  const what = label === undefined ? selector : `${selector} reading "${label}"`
-  assert.ok(!found, `nothing on the screen matches ${what}`)
+  if (label === undefined) {
+    assert.ok(missing(selector), `nothing on the screen matches ${selector}`)
+    return
+  }
+  const found = findText(selector, label)
+  assert.ok(!found, `nothing on the screen matches ${selector} reading "${label}"`)
 }
 
 export const composerField = () =>

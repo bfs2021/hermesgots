@@ -37,7 +37,7 @@ import {
   STT,
   switchIn,
 } from "./dictation-page-kit.tsx"
-import { click, find, findAll, mount, type, until } from "./component-kit.tsx"
+import { click, find, findAll, missing, mount, type, until } from "./component-kit.tsx"
 import { connectionKey } from "@/lib/connection"
 import { db } from "@/lib/db"
 
@@ -267,11 +267,7 @@ test("the Speech model row names the model in play, and opens the host's models 
       /Not measured/,
       "a row nobody timed says so rather than quoting a factor",
     )
-    assert.equal(
-      find("[data-speech-probe]"),
-      null,
-      "and a host that owes nothing captions nothing: each row carries its own measurement",
-    )
+    assert.ok(missing("[data-speech-probe]"), "and a host that owes nothing captions nothing: each row carries its own measurement")
     const clearing = speechOptions().find((option) =>
       /\b(default|none|clear)\b/i.test(option.textContent ?? ""),
     )
@@ -689,7 +685,10 @@ test("Cleanup level is one row that names the level, and its sheet offers all fo
       ["Cleanup level", "Gots", "How much the tidying changes in a take", "Light"],
       "a title, its mark, what it decides, and the level in play",
     )
-    assert.deepEqual(levelCards(), [], "no cards on the page itself: they live in the sheet")
+    assert.ok(
+      missing("[data-cleanup-level]"),
+      "no cards on the page itself: they live in the sheet",
+    )
     await click(row("cleanup-level"))
     await until(async () => levelCards().length === 4, "the four levels")
     assert.equal(
@@ -714,7 +713,7 @@ test("Cleanup level is one row that names the level, and its sheet offers all fo
       async () => lines(row("cleanup-level"))[3] === "High",
       "the row naming the level the host now runs",
     )
-    assert.deepEqual(levelCards(), [], "and the sheet closed behind the pick")
+    assert.ok(missing("[data-cleanup-level]"), "and the sheet closed behind the pick")
   })
 })
 
