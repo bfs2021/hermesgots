@@ -20,22 +20,32 @@ import {
   type Profile,
   type RoomMember,
 } from "@/lib/db"
-import { usePluginFeatureByServer } from "@/lib/features"
+import { refreshAnswer, usePluginFeatureByServer, useRoomSeatable } from "@/lib/features"
 import { COLUMN_BOX, COMPOSER_SLOT } from "@/lib/layout"
 import { botModel, fullModel, useModelInfo } from "@/lib/model-info"
 import { FACES, roomSeats } from "@/lib/rooms"
+import { seatsProfile } from "@/lib/room-seats"
 import { startRoom } from "@/lib/room-writes"
 import { tell } from "@/lib/tell"
 import { cn, randomId } from "@/lib/utils"
 
-/** Why a row refuses a seat: a full room says nothing, another Host says what to do about it. */
-type Refusal = { kind: "full" } | { kind: "host"; say: string }
+/**
+ * Why a row refuses a seat: a full room says nothing, and a greyed row says on a press what to do
+ * about it. One shape for both greying reasons, since every reader of a refusal treats them alike.
+ */
+type Refusal = { kind: "full" } | { kind: "greyed"; say: string }
+
+/** A row greyed and answering a press with why: the sentence is the whole of what it offers. */
+const saysWhy = (refusal: Refusal | null): refusal is { kind: "greyed"; say: string } =>
+  refusal?.kind === "greyed"
 
 /** The fewest and most seats a room may hold: the Host's rule, said before it can be broken. */
 const LEAST = 2
 const MOST = 6
 
 const OTHER_HOST = "A room holds one Host's bots. Unpick every bot to change Host."
+const UNSEATABLE =
+  "Only the bots this Host's connection seats can join its room. Unpick every bot to change connection."
 
 /**
  * A room that does not exist yet, drawn the way a new chat is (ADR 0096, ADR 0125): no record, no
@@ -70,15 +80,30 @@ export function NewRoomScreen({ slot }: { slot?: string }) {
   const [sending, setSending] = useState(false)
   const [failure, setFailure] = useState<string>()
 
-  const chosen = writers.filter((bot) => picked.includes(bot.id))
+  // The seats in the order they were picked, which is the order the room is named and made in: the
+  // first pick is the bot whose connection makes it (ADR 0125, ADR 0128).
+  const chosen = picked
+    .map((id) => writers.find((bot) => bot.id === id))
+    .filter((bot): bot is Profile => Boolean(bot))
   const ready = chosen.length >= LEAST && chosen.length <= MOST
+  // The room is made as the bot picked FIRST, in pick order: its connection names the Host, answers
+  // for the roster every other row is held to, and takes the create (ADR 0128).
+  const maker = chosen[0] ?? null
 
-  const lockedHost = chosen[0] ? hostKey(chosen[0]) : null
+  const lockedHost = maker ? hostKey(maker) : null
+  // The roster belongs to the connection the room is made from, so it is the first pick's; until
+  // there is one, no connection is named and nothing is held out (ADR 0128).
+  const seatable = useRoomSeatable(maker)
+  // A pick the room's own connection cannot seat: the picker holds one out, but the roster can land
+  // after a pick and the Host would then refuse the create in words about a profile already chosen.
+  const unseated = chosen.filter((bot) => !seatsProfile(seatable, bot.hermesProfile))
 
   const refusalFor = (bot: Profile): Refusal | null => {
     if (picked.includes(bot.id)) return null
     // Another Host before the ceiling: at six seats its row must still say the thing a press can act on.
-    if (lockedHost && hostKey(bot) !== lockedHost) return { kind: "host", say: OTHER_HOST }
+    if (lockedHost && hostKey(bot) !== lockedHost) return { kind: "greyed", say: OTHER_HOST }
+    // Then the seats it holds: a bot this connection can't seat is refused by the Host at the create.
+    if (!seatsProfile(seatable, bot.hermesProfile)) return { kind: "greyed", say: UNSEATABLE }
     return picked.length >= MOST ? { kind: "full" } : null
   }
 
@@ -91,7 +116,7 @@ export function NewRoomScreen({ slot }: { slot?: string }) {
     if (!bot) return
     const refusal = refusalFor(bot)
     if (refusal) {
-      if (refusal.kind === "host") tell.info(refusal.say)
+      if (saysWhy(refusal)) tell.info(refusal.say)
       return
     }
     // The guards inside the updater too: a press that lands twice in one batch seats one bot once.
@@ -112,12 +137,16 @@ export function NewRoomScreen({ slot }: { slot?: string }) {
   const faces = chosen.map((bot) => bot.botId ?? "").filter(Boolean)
 
   const send = async (text: string, attachments: Attachment[] = []) => {
-    if (!ready || sending || !chosen.length) return
+    if (!ready || sending || !maker) return
+    if (unseated.length) {
+      setFailure(UNSEATABLE)
+      return
+    }
     setSending(true)
     setFailure(undefined)
     try {
       const members = chosen.map(seatOf)
-      await startRoom(chosen[0], {
+      await startRoom(maker, {
         roomId,
         // Its name until the Host says otherwise: its seats' own names.
         name: chosen.map((bot) => bot.name).join(", "),
@@ -126,12 +155,23 @@ export function NewRoomScreen({ slot }: { slot?: string }) {
       // The room exists: its own screen takes the address and sends the first message into it.
       navigate(`/c/${roomId}`, { replace: true, state: { first: { text, attachments } } })
     } catch (error) {
+      // A create that failed is the one moment the roster could have been wrong, and the roster is
+      // only ever a prediction: reading it again asks the Host whether a seat still stands, while
+      // the picks stay seated until the answer lands (ADR 0128).
+      refreshAnswer(maker)
       setFailure(error instanceof Error && error.message ? error.message : "The room wasn't made.")
       setSending(false)
+      // The words are the user's: a create that failed hands them back to the field for the retry,
+      // the way a room's own refused send does (ADR 0125).
+      throw error
     }
   }
 
-  const connection = serverConfig(chosen[0] ?? writers[0])
+  const connection = serverConfig(maker ?? writers[0])
+  // What the screen says above the composer: a pick this connection can't seat outranks a create's
+  // own sentence, because unpicking is what frees the field and a `failure` can linger from before
+  // the roster moved. A dead Send always says why (ADR 0128).
+  const notice = unseated.length ? UNSEATABLE : failure
 
   return (
     <div data-slot="chat-pane" data-pane={slot} className="relative flex min-h-0 flex-1 flex-col">
@@ -149,9 +189,9 @@ export function NewRoomScreen({ slot }: { slot?: string }) {
         </p>
       </div>
 
-      {failure && (
+      {notice && (
         <div className={cn(COLUMN_BOX, "px-3 pb-2 sm:px-4")} role="alert">
-          <Banner tone="error">{failure}</Banner>
+          <Banner tone="error">{notice}</Banner>
         </div>
       )}
 
@@ -183,9 +223,9 @@ export function NewRoomScreen({ slot }: { slot?: string }) {
         <Composer
           plain
           busy={false}
-          disabled={!ready || sending || !connection}
+          disabled={!ready || sending || unseated.length > 0 || !connection}
           connection={connection}
-          botName={chosen[0]?.name ?? "Hermes"}
+          botName={maker?.name ?? "Hermes"}
           draftKey="room-new"
           files={false}
           filesFeature="no"
@@ -279,16 +319,17 @@ function SeatRow({
   refusal: Refusal | null
   onToggle: () => void
 }) {
-  // A row that can never be seated this time reads no model: its Host would be asked for one nothing
-  // on this screen can use.
-  const info = useModelInfo(refusal?.kind === "host" ? null : bot)
+  // A greyed row reads no model: its Host would be asked for one nothing on this screen can use, so
+  // its subtitle falls back to the bot's own model. A full row is not greyed, and still reads one.
+  const greyed = saysWhy(refusal)
+  const info = useModelInfo(greyed ? null : bot)
   const choice = botModel(bot, info)
   return (
     <button
       type="button"
       aria-pressed={checked}
-      // Never `disabled` for another Host's row: that would swallow the press the sentence answers.
-      aria-disabled={refusal ? "true" : undefined}
+      // Never `disabled` for a greyed row: that would swallow the press the sentence answers.
+      aria-disabled={greyed ? "true" : undefined}
       data-bot={bot.id}
       disabled={refusal?.kind === "full"}
       onClick={onToggle}
@@ -296,7 +337,7 @@ function SeatRow({
         linkRowClass,
         refusal?.kind === "full" && "cursor-not-allowed",
         // A row that still answers a press keeps the pointer, so cursor and press tell one story.
-        refusal?.kind === "host" && "cursor-pointer",
+        greyed && "cursor-pointer",
         refusal && "opacity-40",
         checked && "bg-muted",
       )}

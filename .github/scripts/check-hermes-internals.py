@@ -88,9 +88,9 @@ ANCHORS: Tuple[Tuple[Tuple[str, ...], str], ...] = (
     (("gateway/session_api.py",), "def restore_api_session"),
     (("gateway/session_authorities.py",), "def authority_for_home"),
     # The Host's rooms, as `plugin/rooms.py` reaches them (ADR 0117): the dispatcher the seam hands a
-    # request to in process, the two contract entries it calls and the two fields it reads out of
-    # `groups.capabilities`, and the loopback client it falls back to when neither the import nor the
-    # call answers.
+    # request to in process, the two contract entries it calls and the `groups.capabilities` fields
+    # it reads (`driver`, `methods`, `features`, `seatable_profiles`), and the loopback client it
+    # falls back to when neither the import nor the call answers.
     (("tui_gateway/rpc_dispatch.py",), "def dispatch(req: dict"),
     (("tui_gateway/contracts/groups_bot_relay.py",), 'method("groups.capabilities"'),
     (("tui_gateway/contracts/groups_bot_relay.py",), 'method("groups.list"'),
@@ -114,6 +114,17 @@ ANCHORS: Tuple[Tuple[Tuple[str, ...], str], ...] = (
     ),
     (("tui_gateway/contracts/groups_bot_relay.py",), "class GroupsCapabilitiesResult(Result):"),
     (("tui_gateway/contracts/groups_bot_relay.py",), "    driver: bool"),
+    (
+        ("tui_gateway/contracts/groups_bot_relay.py",),
+        "    seatable_profiles: list[str] | None = None",
+    ),
+    # The line that fills that field. The contract above only says the answer may carry a roster;
+    # this is the one place the gateway works out which profiles the caller seats, so a Host that
+    # kept the field and stopped naming the profiles would leave every picker offering every bot.
+    (
+        ("gateway/session_group_controls.py",),
+        "'seatable_profiles': sorted(name for name in homes if name not in refused)",
+    ),
     (("hermes_cli/gateway_client.py",), "async def connect_gateway"),
     (("hermes_cli/gateway_runtime.py",), "def discover_gateway_endpoint"),
     (("hermes_cli/gateway_runtime.py",), "def attachable"),

@@ -5,7 +5,8 @@
  * opens at its own address on the name its seats give it, and carries the message as its first turn.
  *
  * A Host that cannot make rooms draws no control at all rather than one that can only come back
- * refused.
+ * refused. A create the Host does refuse says so in its own words, keeps the seats it was made from,
+ * asks that connection's roster again, and hands the typed message back for the retry.
  */
 import assert from "node:assert/strict"
 import test from "node:test"
@@ -16,6 +17,7 @@ import { ConversationList } from "@/components/conversation-list"
 import { NewRoomScreen } from "@/components/room/new-room-screen"
 import { RoomChat } from "@/components/room/room-chat"
 import { db, type Profile } from "@/lib/db"
+import { pluginRoot } from "@/lib/host-url"
 import { COMPOSER_SLOT } from "@/lib/layout"
 import {
   Path,
@@ -38,9 +40,23 @@ import {
 const WRITABLE = ["chats", "rooms", "rooms_write"]
 
 /** Every call the screen made, so the create and the first send can be read back in order. */
-const posted: { path: string; body: Record<string, unknown> }[] = []
-/** What each Host's plugin advertises, by the host name a test gave it. */
+const posted: { path: string; auth: string; body: Record<string, unknown> }[] = []
+/** What each connection's plugin advertises, by the name `connectionAt` gives it. */
 const offers = new Map<string, string[]>()
+/** The profiles each connection seats, by the name `connectionAt` gives it. */
+const seatable = new Map<string, string[]>()
+/** How many times each connection's `info` was read, so a re-read can be counted. */
+const reads = new Map<string, number>()
+/** What the Host says when it refuses a create, in its own words; undefined while it makes them. */
+let refusal: string | undefined
+
+/**
+ * The connection a bot's reads arrive on, as this fixture names it: the path its `info` is read at and
+ * the key it carries. Two bots at one address on two keys are two connections with two rosters
+ * (ADR 0128), so a fixture keyed by host could not express the case the rule exists for.
+ */
+const connectionAt = (bot: Profile) =>
+  `${new URL(pluginRoot(bot.baseUrl)).pathname}/info|Bearer ${bot.apiKey}`
 
 const members = [
   { memberId: "m1", profile: "default", handle: "default", displayName: "Test bot" },
@@ -54,11 +70,21 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(String(input))
   const method = (init?.method ?? "GET").toUpperCase()
   const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {}
-  if (url.pathname.endsWith("/plugins/gots/info"))
-    return json({ name: "gots", features: offers.get(url.host) ?? ["chats"] })
+  const auth = new Headers(init?.headers).get("Authorization") ?? ""
+  const onThis = `${url.pathname}|${auth}`
+  if (url.pathname.endsWith("/plugins/gots/info")) {
+    reads.set(onThis, (reads.get(onThis) ?? 0) + 1)
+    return json({
+      name: "gots",
+      features: offers.get(onThis) ?? ["chats"],
+      ...(seatable.has(onThis) ? { rooms: { seatable: seatable.get(onThis) } } : {}),
+    })
+  }
   if (url.pathname.endsWith("/plugins/gots/chats")) return json({ object: "gots.chats", chats: {} })
   if (url.pathname.endsWith("/plugins/gots/rooms") && method === "POST") {
-    posted.push({ path: url.pathname, body })
+    posted.push({ path: url.pathname, auth, body })
+    if (refusal !== undefined)
+      return json({ error: { code: "room_member_unseated", message: refusal } }, 500)
     const id = String(body.room_id)
     held.id = id
     held.name = String(body.name)
@@ -75,7 +101,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     })
   }
   if (url.pathname.endsWith("/send")) {
-    posted.push({ path: url.pathname, body })
+    posted.push({ path: url.pathname, auth, body })
     return json({
       object: "gots.room.event",
       event: { seq: 1, eventId: "e1", kind: "message.user", text: body.text },
@@ -100,7 +126,6 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 }) as typeof fetch
 
 async function fresh(host: string, { writable = true }: { writable?: boolean } = {}) {
-  offers.set(host, writable ? WRITABLE : ["chats", "rooms"])
   const bots: Profile[] = [
     botProfile(host, {
       id: `${host}-coder`,
@@ -117,11 +142,15 @@ async function fresh(host: string, { writable = true }: { writable?: boolean } =
     }),
   ]
   await resetRoom(bots)
+  offers.set(connectionAt(bots[0]), writable ? WRITABLE : ["chats", "rooms"])
   return bots
 }
 
 async function resetRoom(bots: Profile[]) {
   posted.length = 0
+  seatable.clear()
+  reads.clear()
+  refusal = undefined
   held.id = undefined
   held.name = ""
   await seedSettings({ onboarded: true, legacyChat: true, movedChats: bots.map((bot) => bot.id) })
@@ -135,8 +164,6 @@ async function resetRoom(bots: Profile[]) {
 
 async function freshAcross() {
   const [alpha, beta] = ["alpha", "beta"]
-  offers.set(`${alpha}.test`, WRITABLE)
-  offers.set(`${beta}.test`, WRITABLE)
   const bots: Profile[] = [
     botProfile(alpha, { id: "alpha-ada", name: "Ada", hermesProfile: "ada", botId: "alpha-ada" }),
     botProfile(alpha, { id: "alpha-bo", name: "Bo", hermesProfile: "bo", botId: "alpha-bo" }),
@@ -155,6 +182,40 @@ async function freshAcross() {
     }),
   ]
   await resetRoom(bots)
+  offers.set(connectionAt(bots[0]), WRITABLE)
+  offers.set(connectionAt(bots[2]), WRITABLE)
+  offers.set(connectionAt(bots[6]), WRITABLE)
+  return bots
+}
+
+/**
+ * Two bots at one address reaching it by two keys: two connections with two rosters (ADR 0128). Ada's
+ * seats only Zed's profile; Zed's seats both. Ada is first in name order, so a room made as "the first
+ * of the chosen" would be made on the poorer connection.
+ */
+async function freshSeats() {
+  const address = "seats-one.test"
+  const bots: Profile[] = [
+    botProfile(address, {
+      id: "poor-ada",
+      name: "Ada",
+      hermesProfile: "ada",
+      apiKey: "key-ada",
+      botId: "poor-ada",
+    }),
+    botProfile(address, {
+      id: "rich-zed",
+      name: "Zed",
+      hermesProfile: "zed",
+      apiKey: "key-zed",
+      botId: "rich-zed",
+    }),
+  ]
+  await resetRoom(bots)
+  offers.set(connectionAt(bots[0]), WRITABLE)
+  offers.set(connectionAt(bots[1]), WRITABLE)
+  seatable.set(connectionAt(bots[0]), ["zed"])
+  seatable.set(connectionAt(bots[1]), ["ada", "zed"])
   return bots
 }
 
@@ -347,6 +408,179 @@ test("the first bot picked chooses the Host, and another Host's bots grey out", 
   } finally {
     tell.info = real
   }
+})
+
+test("a bot this Host's connection can't seat is not a pick", async () => {
+  const bots = await fresh("blank-room-seats.test")
+  // The Host names the profiles the connection the room is made from seats: the writer's is not one.
+  seatable.set(connectionAt(bots[0]), ["coder"])
+  const said: unknown[] = []
+  const real = tell.info
+  tell.info = ((message: unknown) => said.push(message)) as typeof tell.info
+  try {
+    await mount(screen(), async () => {
+      await openSeats()
+      await click(seat(bots[0].id))
+      await until(
+        async () => seat(bots[1].id)?.getAttribute("aria-disabled") === "true",
+        "the writer greyed where the connection can't seat it",
+      )
+      assert.equal(seat(bots[1].id)?.disabled, false, "still pressable, so it can say why")
+      await click(seat(bots[1].id))
+      assert.deepEqual(
+        said,
+        ["Only the bots this Host's connection seats can join its room. Unpick every bot to change connection."],
+        "a greyed row answers a press with why it is greyed",
+      )
+      assert.match(find('[data-slot="seats-pill"]')?.textContent ?? "", /1 of 6/, "and seats nothing")
+      assert.equal(posted.length, 0, "and the Host is never asked for a room it would refuse")
+    })
+  } finally {
+    tell.info = real
+  }
+})
+
+test("a room is made as the bot picked first, on that bot's connection", async () => {
+  const bots = await freshSeats()
+  const [ada, zed] = bots
+  await mount(screen(), async () => {
+    await openSeats()
+    // Zed's roster is the richer one and Zed is later in name order: picking it first is what names
+    // the connection the room is made on, and the order the seats are picked in.
+    await click(seat(zed.id))
+    await click(seat(ada.id))
+    await until(
+      async () => (find('[data-slot="seats-pill"]')?.textContent ?? "").includes("2 of 6"),
+      "two seats",
+    )
+
+    await type(composerField(), "Plan the next release.")
+    await click(find('button[aria-label="Send"]'))
+    await until(async () => posted.length >= 2, "the create and its first message")
+
+    const [create] = posted
+    assert.equal(create.auth, "Bearer key-zed", "the create is made on the first pick's connection")
+    assert.deepEqual(
+      (create.body.members as { handle?: string }[]).map((one) => one.handle),
+      ["zed", "ada"],
+      "and holds every pick, in the order they were picked",
+    )
+    assert.equal(create.body.name, "Zed, Ada", "named by its seats, in the order they were picked")
+  })
+})
+
+test("a room the first pick's connection cannot seat is never sent", async () => {
+  const bots = await freshSeats()
+  const [ada, zed] = bots
+  await mount(screen(), async () => {
+    await openSeats()
+    // Ada first: its roster names Zed and not Ada, so the picker takes both and the connection the
+    // room would be made on cannot seat one of them.
+    await click(seat(ada.id))
+    await click(seat(zed.id))
+    await until(
+      async () => (find('[data-slot="seats-pill"]')?.textContent ?? "").includes("2 of 6"),
+      "two seats",
+    )
+
+    await type(composerField(), "Plan the next release.")
+    const sendButton = find('button[aria-label="Send"]') as HTMLButtonElement | null
+    assert.equal(sendButton?.disabled, true, "Send is held while a pick has no seat")
+    assert.match(
+      find("[role=alert]")?.textContent ?? "",
+      /Only the bots this Host's connection seats can join its room/,
+      "and the held Send says why, so it is never dead without a word",
+    )
+    await click(sendButton)
+    await settle()
+    assert.equal(posted.length, 0, "and the Host is never asked for a room it would refuse")
+  })
+})
+
+test("a create the Host refuses says why, keeps its seats, and reads the roster again", async () => {
+  const bots = await fresh("blank-room-refused.test")
+  const at = connectionAt(bots[0])
+  // The Host's own sentence for a member its connection cannot seat (#141178), and the one word on
+  // whether the roster the picker used still stands.
+  refusal =
+    "member 1 profile 'ops': only a host-scoped connection seats a served profile without an entry"
+  await mount(screen(), async () => {
+    await pick(bots)
+    await until(
+      async () => (find('[data-slot="seats-pill"]')?.textContent ?? "").includes("2 of 6"),
+      "two seats",
+    )
+    const before = reads.get(at) ?? 0
+
+    await type(composerField(), "Plan the next release.")
+    await click(find('button[aria-label="Send"]'))
+    await settle()
+
+    // The refusal is the screen's to say, in the Host's own words.
+    await until(
+      async () =>
+        (find("[role=alert]")?.textContent ?? "").includes("only a host-scoped connection"),
+      "the Host's refusal",
+    )
+
+    // The answer was read again rather than forgotten: the picks and their rows outlive the refusal,
+    // so the "Unpick every bot" the sentence asks for is a thing the user can still do.
+    await until(async () => (reads.get(at) ?? 0) > before, "the roster read again")
+    assert.equal(reads.get(at), before + 1, "one read of that connection, for the re-read")
+    assert.match(
+      find('[data-slot="seats-pill"]')?.textContent ?? "",
+      /2 of 6/,
+      "both picks are still seated",
+    )
+    await click(find('[data-slot="seats-pill"]'))
+    await until(async () => seats().length > 0, "the seat rows")
+    assert.deepEqual(
+      seats()
+        .filter((row) => row.getAttribute("aria-pressed") === "true")
+        .map((row) => row.getAttribute("data-bot")),
+      [bots[0].id, bots[1].id],
+      "and both rows are still the seats they were picked as",
+    )
+    assert.equal(posted.length, 1, "the Host was asked for the room once")
+  })
+})
+
+test("a create the Host refuses leaves the words in the field for the retry", async () => {
+  const bots = await fresh("blank-room-refused-words.test")
+  refusal =
+    "member 1 profile 'ops': only a host-scoped connection seats a served profile without an entry"
+  await mount(screen(), async () => {
+    await pick(bots)
+    await until(
+      async () => (find('[data-slot="seats-pill"]')?.textContent ?? "").includes("2 of 6"),
+      "two seats",
+    )
+
+    await type(composerField(), "Plan the next release.")
+    await click(find('button[aria-label="Send"]'))
+    await settle()
+
+    // A refused create is a send that never happened: the words go back into the field, as a room's
+    // own refused send does, rather than being lost with the request.
+    await until(
+      async () => composerField()?.value === "Plan the next release.",
+      "the message back in the field",
+    )
+    assert.equal(posted.length, 1, "the Host was asked once, and refused")
+  })
+})
+
+test("a Host that names no seats offers every bot, as an older one does", async () => {
+  const bots = await fresh("blank-room-unseated.test")
+  await mount(screen(), async () => {
+    await openSeats()
+    await click(seat(bots[0].id))
+    assert.equal(
+      seat(bots[1].id)?.getAttribute("aria-disabled"),
+      null,
+      "no roster read is no roster rule: the picker offers what it always did",
+    )
+  })
 })
 
 test("the seats sheet heads its body the way every drawer does", async () => {
