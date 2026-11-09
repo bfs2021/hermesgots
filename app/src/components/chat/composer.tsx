@@ -74,6 +74,7 @@ import { enterSends, isDoubleEscape, isInterrupt, isSendChord } from "@/lib/keys
 import { useSkills } from "@/lib/skills"
 import { midReply, steerAsked } from "@/lib/steer"
 import { runnableSkills } from "@/lib/skills-cache"
+import { useStartCommandFor } from "@/lib/threads"
 import { cn, randomId } from "@/lib/utils"
 
 const HOLD_MS = 400
@@ -125,6 +126,7 @@ export function Composer({
   onSteer,
   notice,
   main = false,
+  botChat = true,
   plain = false,
   files = !plain,
   maxAttachments,
@@ -167,6 +169,8 @@ export function Composer({
   notice?: ReactNode
   disabled?: boolean
   main?: boolean
+  /** A bot's chat: Main or one of its threads. `false` for a project session, a canvas or a room. */
+  botChat?: boolean
   onSend: (text: string, attachments: Attachment[]) => Promise<void> | void
   /** Called instead of `onSend` while a reply is streaming: a send queues the message. */
   onQueue: (text: string, attachments: Attachment[]) => Promise<void> | void
@@ -377,11 +381,12 @@ export function Composer({
     skills.status === "ok"
       ? runnableSkills(skills.skills).map((skill) => ({ kind: "skill", ...skill }))
       : []
+  const startable = useStartCommandFor(main, botChat)
   const items =
     plain || !token
       ? []
       : rankSlashItems(
-          [...localCommands(main), ...(busy ? SEND_COMMANDS : []), ...skillItems],
+          [...localCommands(startable), ...(busy ? SEND_COMMANDS : []), ...skillItems],
           token,
         )
   // Escape closes the menu until the text changes: any edit opens it again, and so does a new `/`.
@@ -425,7 +430,7 @@ export function Composer({
     // rather than doing something on the press: it lands in the field like a skill's name, and Send
     // carries it out with whatever was typed after it (ADR 0096).
     if (item.kind === "command" && !isSendMode(item.name) && !carriesMessage(item.name)) {
-      const run = localCommand(value, main)
+      const run = localCommand(value, startable)
       return runCommand(item.name, run?.command === item.name ? run.text : "")
     }
     if (!token) return
@@ -619,7 +624,7 @@ export function Composer({
 
   const submit = (event?: FormEvent) => {
     event?.preventDefault()
-    const command = plain ? null : localCommand(value, main)
+    const command = plain ? null : localCommand(value, startable)
     if (command && !disabled) return runCommand(command.command, command.text)
     if (!canSend) return
     submitText(value)

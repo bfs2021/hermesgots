@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react"
 
-import type { ModelChoice } from "@/lib/db"
+import type { ModelChoice, Profile } from "@/lib/db"
 import { getResearchWriters, getTriageModel, setTriageModel } from "@/lib/hermes"
 import { useHostRecord, type HostRoute } from "@/lib/host-record"
 import { noteFailure } from "@/lib/report"
+import { useThreadSwitches } from "@/lib/threads"
 
 const TRIAGE: HostRoute<ModelChoice | undefined> = {
   feature: "triage_model",
@@ -13,11 +14,24 @@ const TRIAGE: HostRoute<ModelChoice | undefined> = {
     (await setTriageModel(server, pick ?? null, signal)) ?? undefined,
 }
 
-export function useTriageModel(profile?: { baseUrl: string; apiKey: string } | null) {
-  const { value: pick, supported, saving, save } = useHostRecord(profile, TRIAGE, undefined)
+/**
+ * A bot's triage model as its settings draw it: the pick its host holds, and whether the field draws
+ * at all — with chat threads off it is a setting nowhere, so the host is not asked for anything and
+ * its stored pick is read again the moment the switch is on (ADR 0120). A settings read that hasn't
+ * answered counts as off: the safe direction.
+ */
+export function useTriageModel(profile?: Pick<Profile, "baseUrl" | "apiKey"> | null) {
+  const draws = useThreadSwitches()?.chatThreads ?? false
+  const {
+    value: pick,
+    supported: hostHasRoute,
+    saving,
+    save,
+  } = useHostRecord(draws ? profile : null, TRIAGE, undefined)
   const [withheld, setWithheld] = useState(false)
   const baseUrl = profile?.baseUrl ?? ""
   const apiKey = profile?.apiKey ?? ""
+  const supported = draws && hostHasRoute
   useEffect(() => {
     if (!supported) return
     let cancelled = false

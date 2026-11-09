@@ -6,6 +6,7 @@ import { matchPath, useLocation, useNavigate } from "react-router"
 import {
   createConversation,
   db,
+  ensureMainThread,
   getSettings,
   listEnabledProfiles,
   mainThreadId,
@@ -26,6 +27,8 @@ import { withDir, type Sort, type SortKey } from "@/lib/sort"
 import { useStoredSort } from "@/lib/use-sort"
 import { isUnread, threadState, type ThreadState } from "@/lib/session-work"
 import { useReadMarks } from "@/lib/read-marks"
+import type { StartCommand } from "@/lib/slash"
+import { botThreadsOn, chatThreadsOn, opensInMain, startCommandFor } from "@/lib/chat-threads"
 import {
   useAllLiveRuns,
   useLiveSubagents,
@@ -68,17 +71,33 @@ export function takeHandover(threadId: string): ThreadStart | undefined {
  * A thread a bot's Main starts with `/thread`: its record, made with the model the composer holds,
  * and the message its own screen is to send as the thread's first turn.
  */
-export async function beginThread(
-  profileId: string,
-  {
-    modelChoice,
-    text,
-    attachments = [],
-  }: { modelChoice?: ModelChoice } & Pick<ThreadStart, "text" | "attachments">,
-) {
-  const thread = await createConversation(profileId, { modelChoice })
-  if (text.trim() || attachments.length) handOver(thread.id, { text, attachments, at: Date.now() })
+export async function beginThread(profileId: string, message: NewChat = {}) {
+  const thread = await createConversation(profileId, { modelChoice: message.modelChoice })
+  handOverIfSaid(thread.id, message)
   return thread
+}
+
+/** The chat a new chat opens, and the message it is opened with when there is one. */
+export type NewChat = { modelChoice?: ModelChoice } & Partial<
+  Pick<ThreadStart, "text" | "attachments">
+>
+
+/**
+ * The chat a new chat opens: the bot's Main with chat threads off, a record otherwise, so the legacy
+ * layout still makes a plain chat and never a Main.
+ *
+ * Main's model is a synced field: the pick a blank surface held is not written onto it, since one
+ * device's press would move the bot's model on every device. A thread is still made with it.
+ */
+export async function beginChat(profileId: string, message: NewChat = {}) {
+  if (!opensInMain(await getSettings())) return beginThread(profileId, message)
+  const main = await ensureMainThread(profileId)
+  handOverIfSaid(main.id, message)
+  return main
+}
+
+function handOverIfSaid(chatId: string, { text = "", attachments = [] }: NewChat) {
+  if (text.trim() || attachments.length) handOver(chatId, { text, attachments, at: Date.now() })
 }
 
 /** The time, moved on each minute, for "5 min ago" labels. */
@@ -91,17 +110,49 @@ export function useNow() {
   return now
 }
 
-/**
- * Whether the bot-first layout is on: bots in the sidebar, each chat a thread in its bot. That is the
- * layout every device gets, so this reads the one switch that says otherwise — Developer's **Enable
- * legacy chat UX** (`Settings.legacyChat`, local) — and never the Developer switch itself.
- */
-export function botThreadsOn(settings: { legacyChat?: boolean } | undefined) {
-  return !settings?.legacyChat
-}
-
 export function useBotThreads() {
   return useLiveQuery(async () => botThreadsOn(await getSettings()), [])
+}
+
+/**
+ * The switches a screen draws two answers from — the layout's noun, and whether this bot has only its
+ * Main to offer — live, and as one string so a settings write that changes neither redraws nothing.
+ * `undefined` until the settings row answers.
+ */
+export function useThreadSwitches():
+  { botThreads: boolean; chatThreads: boolean; opensInMain: boolean } | undefined {
+  const key = useLiveQuery(async () => {
+    const settings = await getSettings()
+    return `${botThreadsOn(settings) ? 1 : 0}${chatThreadsOn(settings) ? 1 : 0}${
+      opensInMain(settings) ? 1 : 0
+    }`
+  }, [])
+  return useMemo(
+    () =>
+      key === undefined
+        ? undefined
+        : {
+            botThreads: key[0] === "1",
+            chatThreads: key[1] === "1",
+            opensInMain: key[2] === "1",
+          },
+    [key],
+  )
+}
+
+/**
+ * `startCommandFor`, kept live from the settings row, so a flip of the switch redraws a composer that is
+ * already on screen. `null` until settings answer: nothing is offered that may not run. `botChat` is
+ * false for a project session, a canvas or a room, where `/new` is a home shortcut rather than a
+ * chat this switch decides.
+ */
+export function useStartCommandFor(main: boolean | undefined, botChat = true): StartCommand | null {
+  return (
+    useLiveQuery(
+      async () => (botChat ? startCommandFor(main, await getSettings()) : "new"),
+      [main, botChat],
+    ) ?? null
+  )
 }
 
 export interface Thread {

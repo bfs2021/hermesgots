@@ -1,5 +1,5 @@
 import { wireContent } from "@/lib/attachments"
-import { db, type Attachment, type Conversation, type Profile } from "@/lib/db"
+import { db, getSettings, type Attachment, type Conversation, type Profile } from "@/lib/db"
 import { TRIAGE_MS } from "@/lib/freshness"
 import {
   hasPluginFeature,
@@ -13,6 +13,7 @@ import { chosenOf, pickFields } from "@/lib/model-pick"
 import { refreshMoves } from "@/lib/moves"
 import { quietly } from "@/lib/report"
 import { syncNow } from "@/lib/sync"
+import { chatThreadsOn } from "@/lib/chat-threads"
 import { randomId } from "@/lib/utils"
 import { toast } from "sonner"
 
@@ -22,8 +23,13 @@ import { toast } from "sonner"
  */
 export const triaging = new Set<string>()
 
-/** Whether a bot's host can triage a Main's message: it runs turns, queues them and has triage. */
+/**
+ * Whether a bot's host can triage a Main's message. It answers for this device first: with chat
+ * threads off nothing is triaged — whatever the layout — so the gate asks the host nothing (ADR
+ * 0120). The one gate both senders pass through.
+ */
 export async function canTriage(config: HermesConfig) {
+  if (!chatThreadsOn(await getSettings())) return false
   return (
     Boolean(config.apiKey) &&
     (await supportsRuns(config)) &&

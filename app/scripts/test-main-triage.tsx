@@ -116,10 +116,15 @@ function host(name: string, triage: Answer, features: string[] = ["queue", "tria
 
 async function seed(
   name: string,
-  extra: { main?: boolean; bot?: Partial<Profile>; keepMessages?: boolean } = { main: true },
+  extra: {
+    main?: boolean
+    bot?: Partial<Profile>
+    keepMessages?: boolean
+    chatThreads?: boolean
+  } = { main: true },
 ) {
   const bot = botProfile(name, extra.bot)
-  await seedSettings({ developer: true })
+  await seedSettings({ developer: true, chatThreads: extra.chatThreads ?? true })
   await db.profiles.clear()
   await db.profiles.put(bot)
   if (!extra.keepMessages) await db.messages.clear()
@@ -224,6 +229,21 @@ test("a bot whose plugin lacks the feature has a plain Main", async () => {
   assert.equal(await sendFromMain(MAIN, "hello"), undefined)
   assert.equal(triaged(seen).length, 0)
   assert.equal(runsFor(seen, MAIN_SESSION).length, 1)
+})
+
+test("with chat threads off, a Main send asks no triage and stays in Main", async () => {
+  // The capabilities and info reads this log holds are the send's own; triage adds no ask.
+  await seed("route-threads-off", { main: true, chatThreads: false })
+  const seen = host("route-threads-off", "thread")
+  assert.equal(await sendFromMain(MAIN, "hello"), undefined)
+  assert.deepEqual(triaged(seen), [], "no /triage ask")
+  const sent = await messagesOf(MAIN)
+  assert.ok(
+    sent.some((m) => m.role === "user" && m.content === "hello"),
+    "the message is in Main",
+  )
+  assert.ok(!sent.some((m) => m.status === "triaging"), "nothing was held for a decision")
+  assert.equal(runsFor(seen, MAIN_SESSION).length, 1, "its turn posted on Main's session")
 })
 
 test("a message sent while another is triaged waits behind it, untriaged", async () => {

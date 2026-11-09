@@ -36,6 +36,15 @@ export interface Settings {
   /** Alt+1 to Alt+9 start a new chat with the bot added in that place. Off by default. */
   navShortcuts?: boolean
   /**
+   * Whether a bot may start a new thread at all: Developer's switch, off by default, and the one
+   * fact that decides it. It rides the account's `settings` document as a record of its own, with
+   * `chatThreadsAt` as its clock, so a device that has not pulled yet cannot carry a stale value
+   * over it by saving an Appearance switch (ADR 0120).
+   */
+  chatThreads?: boolean
+  /** When this account last changed `chatThreads`: its own clock, apart from `appearanceAt`. */
+  chatThreadsAt?: number
+  /**
    * Enter sends the message instead of starting a new line; off by default, and then Ctrl+Enter
    * sends. Local, and never in `APPEARANCE_FIELDS`: it describes this device's keyboard, so a phone
    * and a laptop answer it separately (ADR 0078).
@@ -105,8 +114,11 @@ export interface Settings {
 
 /**
  * The Appearance section's switches, which follow the account; the colour mode isn't one of them,
- * since next-themes keeps it on the device. Sync carries them as the `settings` document's one
- * record and the fingerprint watches them, so this list is the one place that says what syncs.
+ * since next-themes keeps it on the device. Sync carries them as the `settings` document's
+ * `appearance` record and the fingerprint watches them, so this list is the one place that says
+ * which fields that record holds. A device switch the account carries without being an Appearance
+ * one — Developer's **Chat threads** — rides a record of its own instead, so its clock is its own
+ * (ADR 0120).
  */
 export const APPEARANCE_FIELDS = ["steerByDefault", "breakReminders", "navShortcuts"] as const
 
@@ -908,6 +920,7 @@ export const DEFAULT_SETTINGS: Settings & Appearance & Required<Pick<Settings, "
   steerByDefault: false,
   breakReminders: true,
   navShortcuts: false,
+  chatThreads: false,
   sendOnEnter: false,
 }
 
@@ -1120,7 +1133,7 @@ export const db = new Dexie("gots") as Dexie & {
 
 /** The messages store as this device declares it, so a test can stand a database up at an old version. */
 export const MESSAGE_STORES =
-  "id, conversationId, [conversationId+createdAt], status, [conversationId+role]"
+  "id, conversationId, [conversationId+createdAt], status, [conversationId+role], [conversationId+status]"
 
 db.version(1).stores({
   settings: "id",
@@ -1501,6 +1514,9 @@ db.version(38).stores({ canvasCss: "key, at" })
 // v39: the canvases a bot's host listed and the pages read from it, kept on this device so a canvas
 // opens with the host away. A new table: nothing older has to be moved into it.
 db.version(39).stores({ canvasCache: "key, connection, canvasId" })
+// v40: a chat's streaming turn is read by the chat and its status together — Share asks it of the
+// chat it is about to open — so the pair is indexed rather than the status set filtered in JS.
+db.version(40).stores({ messages: MESSAGE_STORES })
 
 /**
  * How many rows of one room's log this device keeps: the page a reader can scroll back through.
@@ -1547,6 +1563,22 @@ export async function saveSettings(patch: Partial<Omit<Settings, "id">>) {
 /** Saves an appearance switch; the clock moves so sync carries the change to the account's devices. */
 export async function saveAppearance(patch: Partial<Appearance>) {
   await saveSettings({ ...patch, appearanceAt: Date.now() })
+}
+
+/**
+ * Saves Developer's **Chat threads** switch. It keeps a clock of its own — its own record in the
+ * `settings` document — because a device that has not pulled yet would otherwise carry its stale
+ * value over the account's when it saves any Appearance switch, and the account would lose the
+ * choice for good (ADR 0120).
+ */
+export async function saveChatThreads(on: boolean) {
+  await saveSettings({ chatThreads: on, chatThreadsAt: Date.now() })
+}
+
+/** Takes the chat threads record another device wrote, clock and all. */
+export async function adoptChatThreads(value: unknown, at: number) {
+  if (typeof value !== "boolean") return
+  await saveSettings({ chatThreads: value, chatThreadsAt: at })
 }
 
 /**

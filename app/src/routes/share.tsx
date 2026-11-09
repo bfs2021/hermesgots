@@ -11,11 +11,10 @@ import { Popup, PopupContent, PopupHeader, PopupTitle } from "@/components/popup
 import { Spinner } from "@/components/ui/spinner"
 import { Textarea } from "@/components/ui/textarea"
 import { isPhoto } from "@/lib/attachment-caps"
-import { listsAsChat } from "@/lib/lists-as-chat"
+import { listsAsChat, listsAsThread } from "@/lib/lists-as-chat"
 import { prepareIntake } from "@/lib/attachments"
 import { queueMessage, sendMessage } from "@/lib/chat"
 import {
-  createConversation,
   db,
   getActiveProfile,
   listEnabledProfiles,
@@ -26,7 +25,7 @@ import { formatRelative } from "@/lib/format"
 import { reconcileHistory } from "@/lib/history"
 import { useNav } from "@/lib/nav"
 import { clearShare, readWebShare, shareText, useIncomingShare } from "@/lib/share"
-import { useBotThreads, useNow } from "@/lib/threads"
+import { beginChat, useNow, useThreadSwitches } from "@/lib/threads"
 
 /** How many of a bot's newest chats are offered before Show more. */
 const FIRST = 5
@@ -76,7 +75,12 @@ export function SharePage() {
   const webId = params.get("id")
   const share = useIncomingShare()
   const [opening, setOpening] = useState(Boolean(webId))
-  const botThreads = useBotThreads()
+  // A label is not a permission: an unanswered read leaves the screen as it stands.
+  const switches = useThreadSwitches()
+  const botThreads = switches?.botThreads ?? true
+  // Until the settings answer, the option is Main: a label that promises a thread nothing may start
+  // is the one guess that breaks a promise, and this one only flickers.
+  const offersMain = switches?.opensInMain ?? true
   const noun = botThreads ? "thread" : "chat"
   const now = useNow()
 
@@ -157,14 +161,18 @@ export function SharePage() {
 
   const chats = useLiveQuery(async () => {
     if (!profile) return []
-    return db.conversations
-      .where("[profileId+updatedAt]")
-      .between([profile.id, -Infinity], [profile.id, Infinity])
-      .reverse()
-      .filter((c) => listsAsChat(c) && !c.discardedAt)
-      .limit(MORE)
-      .toArray()
-  }, [profile?.id])
+    return (
+      db.conversations
+        .where("[profileId+updatedAt]")
+        .between([profile.id, -Infinity], [profile.id, Infinity])
+        .reverse()
+        // With chat threads off the first option is Main itself, so the list leaves it out where it is
+        // offered above — inside the read, so the limit counts the chats actually drawn.
+        .filter((c) => (offersMain ? listsAsThread(c) : listsAsChat(c)) && !c.discardedAt)
+        .limit(MORE)
+        .toArray()
+    )
+  }, [profile?.id, offersMain])
   const shown = showAll ? chats : chats?.slice(0, FIRST)
 
   const pickBot = (id: string) => {
@@ -200,14 +208,14 @@ export function SharePage() {
           reconcileHistory(existing.id).catch(() => undefined),
           new Promise((resolve) => setTimeout(resolve, 1500)),
         ])
-      const id = existing?.id ?? (await createConversation(profile.id)).id
-      const busy = existing
-        ? (await db.messages
-            .where("conversationId")
-            .equals(existing.id)
-            .filter((m) => m.status === "streaming")
-            .count()) > 0
-        : false
+      const chat = existing ?? (await beginChat(profile.id))
+      const id = chat.id
+      // Main is asked what any chat is: a turn still streaming there means the note waits in the
+      // queue rather than being dropped by a second send. Read through the `status` index, so the
+      // check costs the one running row rather than every message the chat holds.
+      const busy = Boolean(
+        await db.messages.where("[conversationId+status]").equals([id, "streaming"]).first(),
+      )
       void setActiveProfile(profile.id)
       leaving.current = true
       clearShare()
@@ -311,9 +319,13 @@ export function SharePage() {
               {option(
                 "new",
                 <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground">
-                  <PlusIcon className="size-5" />
+                  {offersMain ? (
+                    <MessageCircleIcon className="size-5" />
+                  ) : (
+                    <PlusIcon className="size-5" />
+                  )}
                 </span>,
-                `New ${noun}`,
+                offersMain ? "Main" : `New ${noun}`,
               )}
               {shown?.map((chat) =>
                 option(

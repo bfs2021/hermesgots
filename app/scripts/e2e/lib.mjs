@@ -12,6 +12,13 @@ export const mock = process.env.MOCK_URL ?? "http://127.0.0.1:18642"
 export const eventsUrl = /\/events(?:\?|$)/
 /** The press that sends in either state of the device's Send on Enter switch (ADR 0078). */
 export const SEND_CHORD = "Control+Enter"
+
+/**
+ * Console noise the environment makes rather than the app: the dev server ships a verification SDK
+ * that dials a local daemon this harness has none of, and the browser logs the refused socket
+ * itself. A flow that reads the console for errors asks this first.
+ */
+export const environmentNoise = (text) => /ws:\/\/localhost:\d+\/reticle/.test(text)
 const shots = process.env.SHOTS_DIR
 const headed = process.env.E2E_HEADED === "1"
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE ?? "playwright")
@@ -277,6 +284,20 @@ export async function startRun(sessionId, input) {
   })
   assert.equal(res.status, 202, `the host starts "${input}"`)
   return (await res.json()).run_id
+}
+
+/**
+ * Writes a session's transcript on a host, as Hermes's own session DB holds it. A screen that reads
+ * the host draws these rows, so a seed aimed at one writes here rather than into the device's copy.
+ * `timestamp` is Hermes's unit, seconds since the epoch.
+ */
+export async function writeTranscript(host, sessionId, rows) {
+  const res = await fetch(`${host}/__mock/transcript`, {
+    method: "POST",
+    headers: hostAuth,
+    body: JSON.stringify({ session_id: sessionId, rows }),
+  })
+  assert.equal(res.status, 200, `the host takes ${rows.length} rows for ${sessionId}`)
 }
 
 export async function runStatus(id) {
@@ -609,9 +630,41 @@ function helpers(page) {
       await composer.fill(text)
       await composer.press(SEND_CHORD)
     },
+    /**
+     * The chat's reply as the screen draws it. A chat reads its host's transcript, and this device
+     * keeps those rows rather than its own messages, so the reply is the last turn folded from them
+     * (ADR 0111). A chat the device holds messages for — one a flow seeded, or a send the host
+     * never took — answers from those instead.
+     */
     lastReply(chatId) {
       return page.evaluate(async (id) => {
-        const { getMessages } = await import("/src/lib/db.ts")
+        const { db, getMessages } = await import("/src/lib/db.ts")
+        const { readRows } = await import("/src/chat-next/store.ts")
+        const { foldTurns } = await import("/src/chat-next/fold.ts")
+        const session = (await db.conversations.get(id))?.hermesSessionId
+        const rows = session ? await readRows(db, session, "live") : []
+        if (rows.length) {
+          const turn = foldTurns(rows).at(-1)
+          if (!turn) return null
+          const words = turn.parts.flatMap((part) => (part.kind === "text" ? [part.text] : []))
+          const thoughts = turn.parts.flatMap((part) =>
+            part.kind === "text" && part.thought ? [part.thought] : [],
+          )
+          const live = (await db.sessionStates.get(session))?.live
+          return {
+            status: turn.failed ? "error" : live || !turn.done ? "streaming" : "done",
+            length: words.join("\n\n").length,
+            content: words.join("\n\n"),
+            reasoning: [...thoughts, ...(turn.pendingThought ? [turn.pendingThought] : [])].join(
+              "\n\n",
+            ),
+            runs: thoughts.map((thought) => ({ text: thought, afterToolId: null, spanMs: null })),
+            tools: turn.parts.reduce(
+              (count, part) => count + (part.kind === "tools" ? part.calls.length : 0),
+              0,
+            ),
+          }
+        }
         // The index the table already carries, not a full fetch sorted in memory: every flow polls
         // this for the reply's own fields while the run is still writing.
         const last = (await getMessages(id)).at(-1)
@@ -895,8 +948,10 @@ const centre = (box) => box.x + box.width / 2
  * row's centres, the line on the title's, and the actions ending on the row's right edge. One set
  * for both flows and every width they measure, so the gates cannot drift apart between them.
  */
-export const centred = (boxes, look) => {
-  assert.ok(boxes.line, `the header draws its line (${look})`)
+export const centred = (boxes, look, { line = true } = {}) => {
+  // A bot's thread carries its name alone: the line under Main's is the bot's thread count, and a
+  // project session's is its repos, so a header without one is asked to be centred as it is drawn.
+  if (line) assert.ok(boxes.line, `the header draws its line (${look})`)
   assert.ok(
     boxes.marginLeft >= 8 && boxes.marginRight >= 8,
     `the header keeps its margins on both sides at ${look} (${Math.round(boxes.marginLeft)}px left, ${Math.round(boxes.marginRight)}px right)`,
@@ -909,10 +964,11 @@ export const centred = (boxes, look) => {
     Math.abs(centre(boxes.title) - centre(boxes.middle)) <= 2,
     `the title is centred in that room at ${look}`,
   )
-  assert.ok(
-    Math.abs(centre(boxes.line) - centre(boxes.title)) <= 2,
-    `the line is centred under the title at ${look}`,
-  )
+  if (line)
+    assert.ok(
+      Math.abs(centre(boxes.line) - centre(boxes.title)) <= 2,
+      `the line is centred under the title at ${look}`,
+    )
   assert.ok(
     Math.abs(centre(boxes.title) - centre(boxes.row)) <= 2,
     `the title is centred on the row at ${look} (${Math.round(centre(boxes.title))} against ${Math.round(centre(boxes.row))})`,

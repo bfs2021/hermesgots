@@ -2,9 +2,9 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
-  LOCAL_COMMANDS,
   SEND_COMMANDS,
   localCommand,
+  localCommands,
   nameSpread,
   pickItem,
   pickSendMode,
@@ -20,7 +20,7 @@ const skill = (name, category = null, description = null) => ({
 })
 
 const items = [
-  ...LOCAL_COMMANDS,
+  ...localCommands("new"),
   ...SEND_COMMANDS,
   skill("grill-with-docs", "quality", "Interview relentlessly, writing docs as we go"),
   skill("grilling", "quality", "Stress-test a plan"),
@@ -220,5 +220,5 @@ test("the slash menu offers no goal command", () => {
   // Typed in full, with the caret on the word, the menu offers no command to run: it goes to the
   // agent as a message.
   assert.deepEqual(names(rankSlashItems(items, tokenAt("/goal fix the tests", 5))), [])
-  assert.equal(localCommand("/goal fix the tests"), null)
+  assert.equal(localCommand("/goal fix the tests", null), null)
 })
