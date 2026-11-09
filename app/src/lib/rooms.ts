@@ -1,5 +1,24 @@
-import type { Profile, Room } from "./db.ts"
 import { memberLabel } from "./room-log.ts"
+import { randomId } from "./utils.ts"
+import type { Profile, Room, RoomMember } from "./db.ts"
+
+/**
+ * The seats a set of bots would make, one per bot: the member id this app minted for it, its handle
+ * and the profile it answers under.
+ *
+ * The handle is the bot's profile name, because a profile name is already unique on its Host — the
+ * rule the room's answerer and its pictures are resolved by (ADR 0115) — so the app owns no naming
+ * policy the Host would have to repeat, and a reserved or colliding handle comes back in the Host's
+ * own words (ADR 0124).
+ */
+export function roomSeats(bots: Profile[]): RoomMember[] {
+  return bots.map((bot) => ({
+    memberId: randomId(),
+    profile: bot.hermesProfile ?? "",
+    handle: bot.hermesProfile ?? "",
+    displayName: bot.name,
+  }))
+}
 
 /**
  * The bot that answers for a room: the first of its members this device has a bot for, turned on.
@@ -26,6 +45,33 @@ export function roomAnswerer(
     if (bot && !bot.disabled) return bot
   }
   return undefined
+}
+
+/** How many pictures a room's row holds before it counts the rest. */
+export const FACES = 4
+
+/**
+ * The pictures a room's row draws: one per member whose bot this device holds, up to four, and how
+ * many members the row could not show.
+ *
+ * A row is one line tall, so the cluster is bounded rather than scrolled: four faces at a 20px size
+ * with an 8px overlap, and a `+N` for the rest (ADR 0126). A member whose bot this device does not
+ * hold has no picture to draw — it is still counted, so a room of two shows nothing extra for a
+ * member that happens to be unlinked here.
+ */
+export function roomFaces(
+  room: Room,
+  bots: Iterable<Profile>,
+  host?: string,
+): { shown: string[]; more: number } {
+  const seated = botsByProfile(bots, host)
+  const shown: string[] = []
+  for (const member of room.members) {
+    if (shown.length === FACES) break
+    const bot = member.profile ? seated.get(member.profile) : undefined
+    if (bot?.botId) shown.push(bot.botId)
+  }
+  return { shown, more: Math.max(0, room.members.length - shown.length) }
 }
 
 /** A room's members as its row names them: what each is called, in the order the Host seats them. */

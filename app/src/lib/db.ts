@@ -7,6 +7,7 @@ import { BOTS, LEGACY_BOT_IDS } from "@/components/bots"
 import { carriesPart } from "@/lib/attachment-caps"
 import type { Canvas, CanvasRecord } from "@/lib/canvases"
 import { connectionKey, hasServer } from "@/lib/connection"
+import { equal } from "@/lib/equal"
 import { mediaKeyPrefix } from "@/lib/media-key"
 import { forgetRead } from "@/lib/read-marks"
 import type { Compaction, ModelChange, Move, ProviderUsage, Skill, Tidied } from "@/lib/hermes"
@@ -21,6 +22,9 @@ import type { CanvasPoint } from "@/lib/point-marker"
 import type { SortDir } from "@/lib/sort"
 
 export type BotSort = "recent" | "waiting" | "name" | "added"
+
+/** The keys the sidebar's Rooms section ranks by (ADR 0127). */
+export type RoomSort = "recent" | "name" | "added"
 
 export type LibrarySort = "date" | "name"
 
@@ -85,6 +89,12 @@ export interface Settings {
    */
   botSort?: BotSort
   botSortDir?: SortDir
+  /**
+   * How the sidebar's Rooms section orders the rooms — the key it ranks by and the arrow it reads in;
+   * unset is `recent`, newest first (ADR 0091, ADR 0127). Local.
+   */
+  roomSort?: RoomSort
+  roomSortDir?: SortDir
   /** Whether the sidebar is shrunk to icons on tablet and wider; unset is expanded. Local. */
   sidebarCollapsed?: boolean
   /** How the Library tab orders folders and files; unset is newest first. Local. */
@@ -1856,6 +1866,71 @@ export async function deleteConversation(id: string, { remote = false } = {}) {
     return true
   })
   if (dropped) forgetRead(id)
+}
+
+/** The record a room's merge or write answers, as the chat list carries it (ADR 0123). */
+export interface RoomRecord {
+  /** The Host's own clock for the record, in the milliseconds the app counts in. */
+  at: number
+  deleted?: boolean
+  value?: {
+    title?: string
+    createdAt?: number
+    updatedAt?: number
+    room?: Room
+  }
+}
+
+/** The fields a room's record is allowed to say; every other field on the row is this device's. */
+const ROOM_FIELDS = ["title", "createdAt", "updatedAt", "room"] as const
+
+/**
+ * One room's row, written from the record the plugin projects or a write answers (ADR 0123).
+ *
+ * A room's record carries the Host's own clock, its name and its roster, and nothing else: no chat's
+ * field is its to say, so the row keeps this device's own — its pin (ADR 0121), what its log this
+ * device holds ends asking for, and the newest sequence it has drawn. A record that is a deletion is
+ * the Host's disband arriving (ADR 0116), so the row and the room's page go with it, and no chat
+ * tombstone is written: a room is never carried as a chat, so a tombstone would push a deletion for a
+ * row the plugin's store never had.
+ *
+ * One writer, because two would drift: the chat-list merge and a lifecycle write's answer are the same
+ * record, so they must leave the same row.
+ */
+export async function writeRoomRow(id: string, record: RoomRecord, profileId: string) {
+  const existing = await db.conversations.get(id)
+  if (record.deleted) {
+    if (existing) await deleteConversation(id, { remote: true })
+    return
+  }
+  const value = record.value
+  if (!value) return
+  // Only the fields the record names are written: one it says nothing about is this device's to
+  // keep, and writing `undefined` over a room's roster would leave a row that is no longer a room.
+  // An empty roster is not a roster either — a Host that answers no members has said nothing about
+  // them, and writing `[]` over the seats would cost the room its answering bot (ADR 0115).
+  const rosterless = Boolean(existing?.room) && !value.room?.members.length
+  const named = ROOM_FIELDS.filter(
+    (field) => value[field] !== undefined && !(field === "room" && rosterless),
+  )
+  const patch = Object.fromEntries(named.map((field) => [field, value[field]]))
+  // A room is projected unchanged on every read: writing it again would wake every live query over a
+  // chat list for news that nothing happened.
+  const same =
+    existing !== undefined &&
+    existing.changedAt === record.at &&
+    named.every((field) => equal(existing[field], patch[field]))
+  if (same) return
+  await db.transaction("rw", db.conversations, db.tombstones, async () => {
+    await db.conversations.put({
+      ...(await db.conversations.get(id)),
+      ...patch,
+      id,
+      profileId,
+      changedAt: record.at,
+    } as Conversation)
+    await db.tombstones.delete(`chat:${id}`)
+  })
 }
 
 /** Drops what chat-next keeps of a session: both reads of its rows and its state. */

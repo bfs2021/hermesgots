@@ -181,8 +181,12 @@ export function createRoomStore() {
   }
 }
 
-/** One room as the chat list carries it: what a device merges, and nothing of its transcript. */
+/**
+ * One room as the chat list carries it: what a device merges, and nothing of its transcript. A room
+ * the Host has disbanded is the row's deletion, which is what the plugin projects for one.
+ */
 function record(room) {
+  if (room.disbanded_at) return { at: room.disbanded_at, deleted: true }
   return {
     at: room.at,
     value: {
@@ -326,23 +330,28 @@ function rounds(store, room, noteEvent, text = "", image = false) {
     return
   }
 
+  // The round works the room's own roster, by position: a room the app made seats ids it minted, and
+  // the Host never invents one of its own for a member it was handed (rooms.py, ADR 0124).
+  const first = room.members[0]?.member_id ?? "m1"
+  const second = room.members[1]?.member_id ?? "m2"
   step(0, working([
-    { memberId: "m1", status: "running" },
-    { memberId: "m2", status: "queued" },
+    { memberId: first, status: "running" },
+    { memberId: second, status: "queued" },
   ]))
-  // The first round: Hermes answers, and Coder passes — silence, which the room draws as nothing.
+  // The first round: the first member answers, and the second passes — silence, which the room draws
+  // as nothing.
   // A message that carried a picture is answered with one: a member's own media is a file of the
   // store's, committed to the reply's event, so it draws exactly as the user's does.
   step(ROUND, () => {
     say(
       room,
-      "m1",
+      first,
       "I'll take the API and the routes.",
       image
         ? keepFile(store, { name: MEMBER_PHOTO, mime: "image/png", bytes: MEMBER_PHOTO_BYTES })
         : undefined,
     )
-    room.activity = [{ memberId: "m2", status: "running" }]
+    room.activity = [{ memberId: second, status: "running" }]
   })
   step(PASS, () => {
     room.events.push(
@@ -351,7 +360,7 @@ function rounds(store, room, noteEvent, text = "", image = false) {
         "turn.settled",
         { kind: "gateway", id: "gw-1" },
         {
-          member_id: "m2",
+          member_id: second,
           thread_id: "room-thread",
           passed: true,
         },
@@ -360,7 +369,7 @@ function rounds(store, room, noteEvent, text = "", image = false) {
   })
   // The second round: Coder answers the reply it read.
   step(SECOND, () => {
-    say(room, "m2", "Coder here. I'll take the screen and the tests.")
+    say(room, second, "Coder here. I'll take the screen and the tests.")
   })
   // The third round is the bound: a room works at most three rounds, and says so.
   step(BOUND, () => {
@@ -385,9 +394,73 @@ export async function handleRooms(req, res, path, { json, readBody, readRaw, not
   if (!path.startsWith("/api/plugins/gots/rooms")) return false
   const fail = (status, message) => json(res, status, { error: { message } })
   if (path === "/api/plugins/gots/rooms" && req.method === "POST") {
-    // Creating a room is a later step's (the plugin's own route is what the app will call); the
-    // mock keeps the one it hosts, which is what a device lists.
-    return (fail(405, "This host's rooms are made on its desktop."), true)
+    // A room made from the app (`rooms.create`): the id is the app's, so a retried create is the same
+    // room; the roster's rules are the Host's, and its refusal says which in its own words.
+    const body = await readBody(req)
+    const roomId = typeof body?.room_id === "string" ? body.room_id.trim() : ""
+    if (!roomId) return (fail(400, "A room needs the room_id the app minted for it."), true)
+    const name = typeof body?.name === "string" ? body.name.trim() : ""
+    if (!name) return (fail(400, "A room needs a name."), true)
+    const rows = Array.isArray(body?.members) ? body.members : []
+    if (rows.length < 2 || rows.length > 6)
+      return (fail(400, "members must contain between 2 and 6 entries"), true)
+    const handles = rows.map((one) => String(one?.handle ?? ""))
+    if (
+      new Set(handles).size !== handles.length ||
+      handles.some((handle) => handle === "all" || handle === "everyone")
+    )
+      return (fail(400, "member handles must be unique and cannot reserve @all or @everyone"), true)
+    // The Host is idempotent on the room's id: the same id twice is the same room, not a second one.
+    const known = store.rooms.get(roomId)
+    if (known) return (json(res, 200, { object: "gots.room.record", ...record(known) }), true)
+    const now = Date.now()
+    const room = {
+      room_id: roomId,
+      name,
+      members: rows.map((one) => ({
+        member_id: one?.memberId,
+        profile: one?.profile,
+        handle: one?.handle,
+        display_name: one?.displayName,
+      })),
+      seq: 0,
+      events: [],
+      working: false,
+      activity: [],
+      waiting: [],
+      at: now,
+      created_at: now,
+      timers: [],
+    }
+    store.rooms.set(roomId, room)
+    noteEvent("room", roomId)
+    return (json(res, 200, { object: "gots.room.record", ...record(room) }), true)
+  }
+  const disband = /^\/api\/plugins\/gots\/rooms\/([^/]+)\/disband$/.exec(path)
+  if (disband && req.method === "POST") {
+    const id = decodeURIComponent(disband[1])
+    const room = store.rooms.get(id)
+    if (!room) return (fail(404, "This host has no such room."), true)
+    // The Host stops the room's work and leaves a tombstone: every device's next merge reads the room
+    // as the row's deletion, which is what the plugin projects for a disbanded room.
+    for (const timer of room.timers) clearTimeout(timer)
+    room.disbanded_at = Date.now()
+    noteEvent("room", id)
+    return (json(res, 200, { object: "gots.room.record", at: room.disbanded_at, deleted: true }), true)
+  }
+  const rename = /^\/api\/plugins\/gots\/rooms\/([^/]+)$/.exec(path)
+  if (rename && req.method === "POST") {
+    const room = store.rooms.get(decodeURIComponent(rename[1]))
+    if (!room) return (fail(404, "This host has no such room."), true)
+    const body = await readBody(req)
+    const name = typeof body?.name === "string" ? body.name.trim() : ""
+    if (!name) return (fail(400, "A room needs a name."), true)
+    if (typeof body?.event_id !== "string" || !body.event_id)
+      return (fail(400, "A rename needs the event_id the app minted for it."), true)
+    room.name = name
+    room.at = Date.now()
+    noteEvent("room", room.room_id)
+    return (json(res, 200, { object: "gots.room.record", ...record(room) }), true)
   }
   const upload = /^\/api\/plugins\/gots\/rooms\/([^/]+)\/attachment$/.exec(path)
   if (upload && req.method === "POST") {

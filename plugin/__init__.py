@@ -1201,6 +1201,11 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
         room_id = minted(body.get("room_id"))
         if room_id is None:
             return _error(web, "A room needs the room_id the app minted for it.", 400)
+        # A room's name is the only thing the app can give that the Host has no way to infer: refused
+        # here, where it can be said, rather than answered as a row titled by its own id.
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return _error(web, "A room needs a name.", 400)
         home = profile_home()
         try:
             found = await asyncio.to_thread(
@@ -1208,7 +1213,7 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
             )
         except rooms.RoomError as error:
             return _error(web, str(error), error.status)
-        return web.json_response({"object": "gots.room", **found})
+        return web.json_response({"object": "gots.room.record", **found})
 
     async def rename_room(request: "web.Request") -> "web.Response":
         """A room under its new name, under the event id the app minted for the rename."""
@@ -1232,7 +1237,7 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
             )
         except rooms.RoomError as error:
             return _error(web, str(error), error.status)
-        return web.json_response({"object": "gots.room", **found})
+        return web.json_response({"object": "gots.room.record", **found})
 
     async def disband_room(request: "web.Request") -> "web.Response":
         """A room disbanded: the Host stops its work, then answers its tombstone."""
@@ -1255,7 +1260,7 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
             )
         except rooms.RoomError as error:
             return _error(web, str(error), error.status)
-        return web.json_response({"object": "gots.room.tombstone", **found})
+        return web.json_response({"object": "gots.room.record", **found})
 
     async def read_room(request: "web.Request") -> "web.Response":
         """One room: the log's delta, its live state and whether it can be written to (rooms.py).
