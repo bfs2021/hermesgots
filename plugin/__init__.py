@@ -122,6 +122,8 @@ def _chain_pool() -> concurrent.futures.ThreadPoolExecutor:
 # Gots shows 24 runs per job.
 DEFAULT_PER_JOB = 24
 MAX_PER_JOB = 200
+# What one of a canvas's free host reads answers with, at most: a page draws a list, not a store.
+CANVAS_READS_MAX = 50
 # What each shape a project AFK write names is written with: one writer per shape, named once, so
 # `afk.write_from`'s answer is handed to the writer that takes it and no shape can fall through to
 # another (`afk.py`). `on` also takes the project's folders and whether it is archived, which the
@@ -175,9 +177,47 @@ def _runs_by_job(job_id: str | None, per_job: int) -> Dict[str, List[Dict[str, A
     }
 
 
-def _error(web: Any, message: str, status: int):
-    # The API server's own error shape, so clients read every error the same way.
-    return web.json_response({"error": {"message": message}}, status=status)
+def _schedule_display(job: Dict[str, Any]) -> str:
+    """When a routine runs, in one line, by the same fallback the app's routines screen reads.
+
+    A page draws a routine as a row with a name and when it runs, so the schedule arrives as the
+    words for it — the job's own display, else the schedule's, else its expression, else nothing —
+    rather than as the object the host keeps.
+    """
+    schedule = job.get("schedule")
+    spec = schedule if isinstance(schedule, dict) else {}
+    display = job.get("schedule_display") or spec.get("display") or spec.get("expr") or ""
+    return display if isinstance(display, str) else ""
+
+
+def _routine_summaries() -> List[Dict[str, Any]]:
+    """The routines a page may list, as it draws them: a name, whether it is on, and when it runs.
+
+    Never a run ledger. ``_runs_by_job`` answers every job's newest runs by opening a connection per
+    job, which is a page's whole budget for a shape it would draw as one row each; the app's own
+    routines screen asks for runs where it shows them.
+    """
+    from cron.jobs import list_jobs
+
+    return [
+        {
+            "id": job.get("id"),
+            "name": job.get("name"),
+            "enabled": bool(job.get("enabled", True)),
+            "schedule_display": _schedule_display(job),
+        }
+        for job in list_jobs(include_disabled=True)[:CANVAS_READS_MAX]
+    ]
+
+
+def _error(web: Any, message: str, status: int, code: str | None = None):
+    # The API server's own error shape, so clients read every error the same way. `code` is there
+    # only where the refusal has one a client can act on — a canvas's four consent verdicts — so a
+    # screen never has to read the words to know what to do next.
+    error: Dict[str, Any] = {"message": message}
+    if code is not None:
+        error["code"] = code
+    return web.json_response({"error": error}, status=status)
 
 
 def _request_profile():
@@ -3287,12 +3327,29 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
         """Moves a canvas back one version, which is what the app's Undo asks (canvases.py)."""
         return await canvas_view(request, canvases.undo)
 
-    async def call_canvas(request: "web.Request") -> "web.Response":
-        """A call a canvas's page makes: the canvas's own data, put or removed on the host.
+    # One table of act locks per wiring: a lock is one server's, held in the thread the call runs
+    # on, and a table made for a server this app no longer serves is nobody's to hold.
+    canvas_locks: Dict[str, threading.Lock] = {}
 
-        The page owns that data (ADR 0113), so these shapes are answered without consent: they write
-        the canvas's own store and nothing that leaves the host. The tab is told nothing it could
-        call for any other canvas, since the id is this route's and not the body's.
+    async def call_canvas(request: "web.Request") -> "web.Response":
+        """A call a canvas's page makes: its own data, the four host reads, or a declared tool.
+
+        The page owns its data (ADR 0113) and reads the bot's own facts, so those shapes are
+        answered without consent — they write the canvas's own store and read what the app itself
+        renders. A tool named ``<server>.<tool>`` is answered only where the version the page is
+        drawn from declares it and the user allowed it (ADR 0114): ``canvases.may_call`` reads both
+        off the store, and a refusal's verdict rides back as the error's ``code``. The tab is told
+        nothing it could call for any other canvas, since the id is this route's and not the body's.
+
+        Each read answers the shape the app's own screens draw, and no more. ``sessions`` is this
+        bot's chat list — flat, newest first, tombstones dropped — and not the Host's rooms, a
+        project session or a canvas's own chat: each of those is its own screen's row, and the app's
+        own rule (``listsAsChat``) is what the answer holds to. ``routines`` is each job's name, state
+        and schedule in words, never its run ledger: a page that drew one row per routine would
+        otherwise cost one SQLite connection per job, on every call.
+
+        A canvas this store doesn't hold — one deleted since, whose tab may still be open — is a 404
+        for every shape, read before anything is dispatched.
         """
         denied = unauthorized(request)
         if denied is not None:
@@ -3302,15 +3359,84 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
         if body is None:
             return _error(web, "Body must be a JSON object", 400)
         path = store_path()
+
+        # One read of the record before anything is dispatched. A tab left open on a canvas the
+        # user deleted would otherwise keep answering its four free reads — the user's own chats
+        # among them — while every write to it is a 404.
+        if await asyncio.to_thread(canvases.record, path, canvas_id) is None:
+            return _error(web, "There is no such canvas.", 404)
+
+        async def read_usage_shape(args: Dict[str, Any]) -> Dict[str, Any]:
+            provider = str(args.get("provider") or "").strip().lower()
+            if not provider:
+                # The host's own rule, kept where the page's call reaches it: usage is one
+                # provider's account, never every provider's.
+                raise ValueError("A usage read names the provider it is for: pass one in args.")
+            return await read_usage(provider)
+
+        async def read_routines_shape(args: Dict[str, Any]) -> Dict[str, Any]:
+            return {"routines": await asyncio.to_thread(_routine_summaries)}
+
+        async def read_projects_shape(args: Dict[str, Any]) -> Dict[str, Any]:
+            return {"projects": await read_projects()}
+
+        async def read_sessions_shape(args: Dict[str, Any]) -> Dict[str, Any]:
+            return {"sessions": await asyncio.to_thread(chats.summaries, path, CANVAS_READS_MAX)}
+
         writes = {
             "data.put": lambda args: canvases.put_call(path, canvas_id, args),
             "data.remove": lambda args: canvases.remove_call(path, canvas_id, args),
         }
+        # The four names have one home (`page_calls.HOST_SHAPES`): a fifth there with no read here
+        # is a KeyError rather than a shape the guide promises and the page can never read.
+        readers = {
+            "usage": read_usage_shape,
+            "routines": read_routines_shape,
+            "projects": read_projects_shape,
+            "sessions": read_sessions_shape,
+        }
         try:
-            result = await page_calls.answer(body, writes=writes)
+            result = await page_calls.answer(
+                body,
+                reads={shape: readers[shape] for shape in page_calls.HOST_SHAPES},
+                writes=writes,
+                may_call=partial(canvases.may_call, path, canvas_id),
+                profile=_request_profile(),
+                locks=canvas_locks,
+            )
         except page_calls.CallRefused as error:
-            return _error(web, str(error), error.status)
+            return _error(web, str(error), error.status, error.reason)
         return web.json_response({"object": "gots.canvas.call", "result": result})
+
+    async def grant_canvas(request: "web.Request") -> "web.Response":
+        """The user's answer for one tool a canvas's page declares, and the canvas's answers after it.
+
+        The answer is written on the host rather than kept by the device that gave it — the page
+        calls from every device the user has — and it is the canvas's, so the version a bot writes
+        next inherits it (ADR 0114). The list comes back with the row so a screen that asked never
+        has to read the canvas again to draw the answers it now holds.
+        """
+        denied = unauthorized(request)
+        if denied is not None:
+            return denied
+        canvas_id = request.match_info["canvas_id"]
+        body = await json_body(request)
+        if body is None:
+            return _error(web, "Body must be a JSON object", 400)
+        path = store_path()
+        try:
+            found = await asyncio.to_thread(
+                canvases.grant, path, canvas_id, body.get("tool"), body.get("allow")
+            )
+        except canvases.CanvasError as error:
+            return _error(web, str(error), error.status)
+        return web.json_response(
+            {
+                "object": "gots.canvas.grant",
+                "grant": found["grant"],
+                "grants": found["grants"],
+            }
+        )
 
     async def list_research(request: "web.Request") -> "web.Response":
         denied = unauthorized(request)
@@ -3663,6 +3789,7 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
     app.router.add_get(f"{PREFIX}/canvases/{{canvas_id}}", get_canvas)
     app.router.add_post(f"{PREFIX}/canvases/{{canvas_id}}/undo", undo_canvas)
     app.router.add_post(f"{PREFIX}/canvases/{{canvas_id}}/call", call_canvas)
+    app.router.add_post(f"{PREFIX}/canvases/{{canvas_id}}/grants", grant_canvas)
     app.router.add_get(f"{PREFIX}/research/{{mission_id}}", get_research)
     app.router.add_post(f"{PREFIX}/research/{{mission_id}}/brief", research_brief)
     app.router.add_post(f"{PREFIX}/research/{{mission_id}}/edit", research_edit)

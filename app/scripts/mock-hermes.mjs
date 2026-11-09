@@ -4181,7 +4181,25 @@ http
       PLUGIN &&
       CANVAS &&
       !profile &&
-      (await handleCanvas(req, res, url.pathname, { json, readBody, noteEvent }, CANVASES))
+      (await handleCanvas(
+        req,
+        res,
+        url.pathname,
+        {
+          json,
+          readBody,
+          noteEvent,
+          // What a canvas's free `sessions` read answers: the mock's own chats, newest first, as the
+          // host projects them — an id, a title and the clock they changed at. A room, a project
+          // session and a canvas's chat are their own screens' rows, so they are not chats here.
+          sessions: () =>
+            [...pluginChats.entries()]
+              .filter(([, { value }]) => !value.room && !value.projectId && !value.canvasId)
+              .map(([id, { value }]) => ({ id, title: value.title ?? "", at: value.updatedAt ?? 0 }))
+              .sort((one, two) => two.at - one.at),
+        },
+        CANVASES,
+      ))
     )
       return
     if (
