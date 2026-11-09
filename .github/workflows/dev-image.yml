@@ -12,6 +12,8 @@ on:
       - "Dockerfile"
       - ".dockerignore"
       - ".github/workflows/dev-image.yml"
+      # The probe the publish step runs: a change to it changes what publishing proves.
+      - ".github/scripts/ghcr-public.sh"
       # The image's second-heaviest layer is the pnpm store, warmed from these four: a dependency
       # bump changes what the image carries, so it has to rebuild. Whether that is worth verifying is
       # the recipe's business rather than the lockfile's — see the verify step's condition.
@@ -24,6 +26,7 @@ on:
       - "Dockerfile"
       - ".dockerignore"
       - ".github/workflows/dev-image.yml"
+      - ".github/scripts/ghcr-public.sh"
       - "app/package.json"
       - "app/pnpm-lock.yaml"
       - "website/package.json"
@@ -123,6 +126,26 @@ jobs:
           # image itself has already been built.
           cache-to: type=gha,mode=max,ignore-error=true,timeout=30m
 
+      # `bash -lc` runs Debian's /etc/profile, which replaces PATH with a fixed list: a tool that
+      # only resolves through an ENV PATH entry — a venv's python3, anything under /opt — is one the
+      # login shell never sees, and the sandbox runs a login shell. The import is the other half of
+      # the same trap: the interpreter that resolves has to be the one carrying cryptography.
+      #
+      # Outside `.github/scripts/checks.sh` on purpose: `tests.yml` runs that script on a runner that
+      # carries neither `gh` nor `reticle`, so a PATH gate there would fail for the wrong machine.
+      - name: Verify the image's tools
+        if: github.event_name != 'pull_request' || needs.changes.outputs.image == 'true'
+        run: |
+          docker run --rm "${{ steps.subject.outputs.tag }}" bash -lc '
+            set -e
+            for tool in gh pnpm python3 playwright reticle; do
+              command -v "$tool" > /dev/null || { echo "missing from PATH: $tool"; exit 1; }
+            done
+            gh --version | head -1
+            pnpm --version
+            python3 -c "import cryptography"
+          '
+
       # The app's gates, the plugin's tests and the website's build, run inside the image against the
       # checkout: an image that cannot run them is not worth publishing. `.github/scripts/checks.sh`
       # owns that set and `tests.yml` runs the same script, so a gate added for the runner reaches
@@ -145,6 +168,20 @@ jobs:
           digest=$(docker inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' \
             "${{ steps.subject.outputs.tag }}")
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # Publishing is not the same as being obtainable. A private package answers only the
+      # credentials that own it, and the sandbox that runs Gots carries none: it keeps the copy it
+      # already has, however old, which is how a container without `gh` outlives the release that
+      # added it. So the run that publishes asks for an anonymous token and the tag's manifest, and
+      # goes red with the settings page when the registry refuses either.
+      - name: Prove the image is pullable without a login
+        if: github.event_name != 'pull_request'
+        run: |
+          tags="${{ steps.meta.outputs.tags }}"
+          [ -n "$tags" ] || { echo "no tags to verify"; exit 1; }
+          while IFS= read -r tag; do
+            if [ -n "$tag" ]; then bash .github/scripts/ghcr-public.sh "$tag"; fi
+          done <<< "$tags"
 
       - name: Summary
         if: always()

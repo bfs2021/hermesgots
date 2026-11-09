@@ -84,11 +84,13 @@ Under plain `pnpm dev`, the Sync card stays hidden and sign-in is not required.
 
 ## Development Container
 
-A Docker container image (`ghcr.io/thehaseebahmed/gots-dev:latest`) is available with all required toolchains (Node 22, pnpm 10, Python 3.13, headless Chromium, and the [Reticle](https://reticle.sh) verification CLI):
+A Docker container image (`ghcr.io/thehaseebahmed/gots-dev:latest`) is available with all required toolchains (Node 22, pnpm 10, Python 3.13, headless Chromium, the GitHub CLI, and the [Reticle](https://reticle.sh) verification CLI):
 
 ```bash
 docker pull ghcr.io/thehaseebahmed/gots-dev:latest
 ```
+
+The package is public, and the `Dev image` workflow checks it on every run that publishes: it asks the registry for an anonymous pull token and the tag's manifest, the way a machine with no login would, and goes red if either is refused. Gots's own sandbox pulls this image with no credentials, so a package turned private is one that silently keeps running an old copy — a refusal here names the page where visibility is changed. After it is changed, `docker pull` once more replaces the copy that sandbox holds.
 
 To build locally and run an interactive shell:
 
