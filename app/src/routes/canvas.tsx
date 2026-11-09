@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { useLiveQuery } from "dexie-react-hooks"
 import {
-  ArrowLeftIcon,
   EllipsisIcon,
   FrameIcon,
   MenuIcon,
@@ -9,9 +8,10 @@ import {
   PlusIcon,
   Undo2Icon,
 } from "lucide-react"
-import { Link, useNavigate, useParams } from "react-router"
+import { useNavigate, useParams } from "react-router"
 
 import { ChatBody } from "@/chat-next/chat-body"
+import { BackButton } from "@/components/back-button"
 import { Bot } from "@/components/bot"
 import {
   CanvasConsentDialog,
@@ -26,6 +26,8 @@ import { UsageSheet } from "@/components/chat/usage-sheet"
 import { useOpenDrawer } from "@/components/drawer-context"
 import { ExperimentalBadge } from "@/components/experimental-badge"
 import { ItemGroup, ItemRow } from "@/components/item-list"
+import { setBackGuard } from "@/lib/native"
+import { useNav } from "@/lib/nav"
 import { Popup, PopupContent, PopupHeader, PopupTitle } from "@/components/popup"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
@@ -196,7 +198,8 @@ const SNAPS = [0.5, 1]
 /** One canvas, drawn from the version its record points at, with its chat beside it or raised over it. */
 export function CanvasView() {
   const { id = "" } = useParams()
-  const navigate = useNavigate()
+  const { up, step } = useNav()
+  useEffect(() => setBackGuard(step("/canvas")), [step])
   const { canvas, missing, loaded, away } = useCanvas(id)
   const online = useOnline()
   // A device with no network can't reach the host either, and is told so in its own words (ADR 0071)
@@ -389,7 +392,7 @@ export function CanvasView() {
     }
     tell.success("Canvas deleted.")
     setOptionsOpen(false)
-    navigate("/canvas")
+    up("/canvas")
   }
 
   // The canvas's own session, as any chat body holds it: it edits the page with the host's tools, and
@@ -418,16 +421,7 @@ export function CanvasView() {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <header className="flex items-center gap-3 px-4 pt-[max(0.75rem,env(safe-area-inset-top))] pb-3">
-        <Button
-          variant="ghost"
-          size="icon-lg"
-          className="size-11 rounded-full"
-          aria-label="All canvases"
-          nativeButton={false}
-          render={<Link to="/canvas" />}
-        >
-          <ArrowLeftIcon />
-        </Button>
+        <BackButton label="All canvases" variant="ghost" onClick={() => up("/canvas")} />
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <h1 className="truncate font-semibold tracking-tight">{canvas?.title ?? "Canvas"}</h1>
           {canvas?.version ? (

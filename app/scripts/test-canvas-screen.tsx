@@ -12,18 +12,22 @@ import { BRIDGE_MESSAGE, type CanvasDoc } from "@/lib/canvas-bridge"
 import { SCROLL_MESSAGE } from "@/lib/canvas-document"
 import { refreshCanvas } from "@/lib/canvases"
 import { db } from "@/lib/db"
+import { pressBack } from "@/lib/native"
 import { listsAsChat } from "@/lib/lists-as-chat"
 import { connectionKey, noteChange } from "@/lib/live"
 import { CanvasView } from "@/routes/canvas"
 import { ChatPage } from "@/routes/chat"
 
 import {
+  Nav,
+  atDepth,
   atWidth,
   botProfile,
   click,
   find,
   json,
   mount,
+  nav,
   seedSettings,
   settle,
   until,
@@ -480,5 +484,88 @@ test(
         )
       },
     )
+  }),
+)
+
+test(
+  "the canvas's header control steps back to the list rather than pushing it again",
+  atWidth(390, async () => {
+    serveCanvases({ version: 3, undos: 0 })
+    await seedCanvasChat("c1")
+    await mount(
+      <MemoryRouter initialEntries={["/canvas/c1"]}>
+        <Routes>
+          <Route path="/canvas/:id" element={<CanvasView />} />
+        </Routes>
+        <Nav />
+      </MemoryRouter>,
+      async () => {
+        await until(
+          () => Boolean(document.querySelector("iframe[data-canvas-frame]")),
+          "the canvas to draw",
+        )
+        const back = document.querySelector('[aria-label="All canvases"]')
+        assert.ok(back, "the header leads back to the list")
+        await click(back as HTMLElement)
+        await until(() => nav().startsWith("REPLACE:"), "a step back, not another entry")
+        assert.equal(nav(), "REPLACE:/canvas")
+      },
+    )
+  }),
+)
+
+test(
+  "a canvas the list opened steps back to the list",
+  atWidth(390, async () => {
+    serveCanvases({ version: 3, undos: 0 })
+    await seedCanvasChat("c1")
+    const history = atDepth(1)
+    try {
+      await mount(
+        <MemoryRouter initialEntries={["/canvas/c1"]}>
+          <Routes>
+            <Route path="/canvas/:id" element={<CanvasView />} />
+          </Routes>
+        </MemoryRouter>,
+        async () => {
+          await until(
+            () => Boolean(document.querySelector("iframe[data-canvas-frame]")),
+            "the canvas to draw",
+          )
+          assert.equal(pressBack(), "screen", "the canvas takes the press")
+          assert.deepEqual(history.backs, [1], "and steps back to the list behind it")
+        },
+      )
+    } finally {
+      history.restore()
+    }
+  }),
+)
+
+test(
+  "a canvas the menu opened leaves the press to the app",
+  atWidth(390, async () => {
+    serveCanvases({ version: 3, undos: 0 })
+    await seedCanvasChat("c1")
+    const history = atDepth(0)
+    try {
+      await mount(
+        <MemoryRouter initialEntries={["/canvas/c1"]}>
+          <Routes>
+            <Route path="/canvas/:id" element={<CanvasView />} />
+          </Routes>
+        </MemoryRouter>,
+        async () => {
+          await until(
+            () => Boolean(document.querySelector("iframe[data-canvas-frame]")),
+            "the canvas to draw",
+          )
+          assert.equal(pressBack(), "app", "the press is the app's, which leaves it")
+          assert.deepEqual(history.backs, [], "nothing goes up")
+        },
+      )
+    } finally {
+      history.restore()
+    }
   }),
 )

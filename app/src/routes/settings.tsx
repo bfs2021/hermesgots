@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { useLiveQuery } from "dexie-react-hooks"
 import { useTheme } from "next-themes"
-import { Navigate, useNavigate, useParams, useSearchParams } from "react-router"
+import { Navigate, useParams, useSearchParams } from "react-router"
 import {
   ActivityIcon,
   AudioLinesIcon,
@@ -144,8 +144,7 @@ const MenuContext = createContext<{ active?: string; replace: boolean }>({ repla
 export function SettingsPage() {
   const { section, botId, tab, sub, leaf } = useParams()
   const large = useLarge()
-  const { up, root } = useNav()
-  const navigate = useNavigate()
+  const { up, step, root } = useNav()
   const { account } = useSyncState()
   const profiles = useLiveQuery(listProfiles, [])
   // The bots live on the menu itself now, so /settings/bots without a bot is the menu.
@@ -159,11 +158,18 @@ export function SettingsPage() {
   // A page's sub-screen: the row's edit or the list it drills into, named by the fourth segment —
   // and, where that segment names a list, the item behind it by the fifth.
   const botSub = botTab && sub ? botSubOf(botTab, sub, leaf) : undefined
-  // On its own screen, a page sits under its bot's list and the list under the Settings menu.
+  // A screen sits under the one that opened it: a section under the Settings menu on a phone, and a
+  // bot's list under whatever opened it, on either layout — from `lg` the list takes the menu's pane
+  // and is a step in as well. A page's own entry is its list's on a phone only: at that width the
+  // list's rows `replace` it into the list's entry, which is on screen beside it.
+  const botScreen = section === "bots" && Boolean(botId)
   useEffect(() => {
-    // A bot's own screen publishes the guard itself — it is the screen that can ask — so this one
-    // would only compete with it.
-    if (!separate || (section === "bots" && botId)) return
+    // A bot's own page on a phone publishes the guard itself — it is the screen that can ask about
+    // unsaved changes — so this one would only compete with it.
+    if (separate && botScreen && botTab) return
+    // The menu itself is a screen a chat can open, and from `lg` so is a section; each steps back to
+    // whatever opened it, and the drawer's own menu — the first entry — leaves the press to the app.
+    if (!separate && !botScreen) return setBackGuard(step("/settings"))
     const back = botSub
       ? botTabPath(botId!, botTab!)
       : botId && botTab
@@ -173,7 +179,7 @@ export function SettingsPage() {
       up(back)
       return true
     })
-  }, [separate, up, section, botId, botTab, botSub])
+  }, [separate, botScreen, up, section, botId, botTab, botSub])
 
   if (section && section !== "bots" && !SECTIONS[section])
     return <Navigate to="/settings" replace />
@@ -192,11 +198,10 @@ export function SettingsPage() {
     return <Navigate to={botSubPath(botId!, botTab!, botSub.id)} replace />
   if (sub && !botTab) return <Navigate to={botId ? botPath(botId) : "/settings"} replace />
   // A botId that isn't one of this device's bots is the menu, and nothing of a bot's screen.
-  if (section === "bots" && botId && !bot)
-    return profiles === undefined ? null : <Navigate to="/settings" replace />
+  if (botScreen && !bot) return profiles === undefined ? null : <Navigate to="/settings" replace />
 
   if (!large) {
-    if (section === "bots" && botId) {
+    if (botScreen) {
       if (!bot) return null
       return page ? (
         <BotPageScreen profile={bot} page={page} sub={botSub} />
@@ -208,19 +213,14 @@ export function SettingsPage() {
   }
 
   // A bot's settings is two panes of its own: the list where the menu was, the page beside it.
-  if (section === "bots" && botId) {
+  if (botScreen) {
     if (!bot) return null
     return (
       <div className="flex min-h-0 flex-1">
         <Screen
           title={bot.name}
           className="w-90 flex-none border-r min-[1200px]:w-103"
-          leading={
-            <BackButton
-              label="Back"
-              onClick={() => navigate("/settings", { replace: true, state: { quiet: true } })}
-            />
-          }
+          leading={<BackButton label="Back" onClick={() => up("/settings")} />}
         >
           <BotSettingsList
             profile={bot}
