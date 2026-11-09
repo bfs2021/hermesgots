@@ -8,6 +8,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -15,8 +16,19 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from plugin import alerts, chats, delegation, push
+from plugin import alerts, chats, delegation, push, sessions
 from plugin.store import connect, db_path
+
+
+def subscribed(path: Path, categories: str) -> None:
+    """A profile's push store with one device on it, asked for ``categories`` as the app sends them."""
+    conn = connect(path)
+    conn.execute(
+        "INSERT INTO push_subscriptions (endpoint, device, p256dh, auth, vapid_key, subject,"
+        " created_at, categories) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("https://push.example/1", "phone-1", "key", "auth", "vapid", "mailto:a@b.c", 1, categories),
+    )
+    conn.close()
 
 
 class Categories(unittest.TestCase):
@@ -134,14 +146,7 @@ class Delivery(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = db_path(Path(self.tmp.name))
-        conn = connect(self.path)
-        conn.execute(
-            "INSERT INTO push_subscriptions (endpoint, device, p256dh, auth, vapid_key, subject,"
-            " created_at, categories) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ("https://push.example/1", "phone-1", "key", "auth", "vapid", "mailto:a@b.c", 1,
-             '["room_input"]'),
-        )
-        conn.close()
+        subscribed(self.path, '["room_input"]')
         self.sent = []
         patch = mock.patch.object(
             push, "send", lambda row, payload, topic: self.sent.append(payload) or 201
@@ -169,6 +174,161 @@ class Delivery(unittest.TestCase):
             self.assertEqual(self.sent, [], "the app is already drawing the room")
         self.deliver()
         self.assertEqual(len(self.sent), 1, "put away, it hears it then")
+
+
+class Scope(unittest.TestCase):
+    """Which sessions a profile pushes for: the app's own chats, and no other surface's.
+
+    Gots mints every chat's Hermes session id with a prefix of its own (``sessions.ID_PREFIXES``),
+    and compression moves the chat onto a child session that carries none — so a chat is found from
+    its ancestors, the ancestry the rest of a push reads too (the chat's title, its mute, and
+    ``alerts.turn_finished`` counting its subagents as its own work).
+    """
+
+    # A push is delivered on a daemon thread; a local store answers in milliseconds, and a wait this
+    # long that hears nothing is what says nothing arrived.
+    WAIT_S = 1.0
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.path = db_path(self.home)
+        subscribed(self.path, '["chat_input"]')
+        self.sent = []
+        self.arrived = threading.Event()
+
+        def send(row, payload, topic):
+            self.sent.append(payload)
+            self.arrived.set()
+            return 201
+
+        send_patch = mock.patch.object(push, "send", send)
+        send_patch.start()
+        self.addCleanup(send_patch.stop)
+        relay = mock.patch.object(push, "_relay", lambda *args, **kwargs: None)
+        relay.start()
+        self.addCleanup(relay.stop)
+
+    def tell(self, kind, session_id):
+        """What ``notify`` answered, and the pushes that reached the wire."""
+        self.sent.clear()
+        self.arrived.clear()
+        answer = push.notify(kind, session_id, path=self.path)
+        if answer:
+            # A False answer started no thread, so nothing can still be on its way.
+            self.arrived.wait(self.WAIT_S)
+        return answer, self.sent
+
+    def lineage(self, rows):
+        """Hermes's own store, with the parent links compression leaves behind.
+
+        ``model_config`` and ``source`` are the columns ``sessions._forks`` reads, so a case can
+        make a session a fork of its parent rather than the chat's continuation.
+        """
+        conn = sqlite3.connect(self.home / "state.db")
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT,"
+            " model_config TEXT, source TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO sessions (id, parent_session_id, end_reason, model_config, source)"
+            " VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+
+    def test_a_gots_chats_session_is_pushed(self):
+        answer, sent = self.tell("question", "gots-abc")
+        self.assertTrue(answer)
+        self.assertEqual(sent, [{"kind": "question", "session_id": "gots-abc"}])
+
+    def test_a_chats_own_id_is_answered_without_opening_the_store(self):
+        # The predicate answers the app's own prefix first, and the push gate adds no branch of
+        # its own: neither opens state.db for a chat the app minted.
+        with mock.patch.object(sessions, "_open_state") as store:
+            self.assertTrue(sessions.is_chat(self.home, "gots-abc"))
+        store.assert_not_called()
+        with mock.patch.object(sessions, "_open_state") as store, mock.patch.object(push, "_run"):
+            answer = push.notify("question", "gots-abc", path=self.path)
+        self.assertTrue(answer, "the app minted the id, so the chat is its own")
+        store.assert_not_called()
+
+    def test_another_surfaces_session_is_not_pushed(self):
+        # No prefix, no chat record, no compression parent: a session Gots never started.
+        answer, sent = self.tell("question", "sess_9f2c41")
+        self.assertFalse(answer, "no device is told about a session the app doesn't own")
+        self.assertEqual(sent, [])
+
+    def test_a_compressed_chats_child_session_is_pushed(self):
+        self.lineage([
+            ("gots-abc", None, "compression", None, None),
+            ("sess_c0ffee", "gots-abc", None, None, None),
+        ])
+        answer, sent = self.tell("question", "sess_c0ffee")
+        self.assertTrue(answer, "the child's root is the chat's, so the chat is being pushed")
+        self.assertEqual(sent, [{"kind": "question", "session_id": "sess_c0ffee"}])
+
+    def test_a_subagents_session_is_pushed_as_its_chats(self):
+        chats.merge(
+            self.path,
+            {
+                "chat-1": {
+                    "at": 1,
+                    "value": {"hermesSessionId": "gots-abc", "title": "Refactor the parser"},
+                }
+            },
+        )
+        self.lineage([
+            ("gots-abc", None, "compression", None, None),
+            ("sess_de1e", "gots-abc", None, '{"_delegate_from": "gots-abc"}', "subagent"),
+        ])
+        answer, sent = self.tell("question", "sess_de1e")
+        self.assertTrue(answer, "the chat started it, so its question is the chat's news")
+        self.assertEqual(
+            sent,
+            [{"kind": "question", "session_id": "sess_de1e", "title": "Refactor the parser"}],
+            "the child's id, under the chat's own title",
+        )
+
+    def test_a_subagents_session_of_another_surface_is_not_pushed(self):
+        self.lineage([
+            ("sess_9f2c41", None, None, None, None),
+            ("sess_de1e", "sess_9f2c41", None, '{"_delegate_from": "sess_9f2c41"}', "subagent"),
+        ])
+        answer, sent = self.tell("question", "sess_de1e")
+        self.assertFalse(answer, "no ancestor is the app's, so it is no device's news")
+        self.assertEqual(sent, [])
+
+    def test_a_store_that_cannot_be_read_drops_the_push(self):
+        self.lineage([
+            ("gots-abc", None, "compression", None, None),
+            ("sess_c0ffee", "gots-abc", None, None, None),
+        ])
+        (self.home / "state.db").write_bytes(b"not a database")
+        answer, sent = self.tell("question", "sess_c0ffee")
+        self.assertFalse(answer, "a store that can't answer is not read as 'not a chat'")
+        self.assertEqual(sent, [], "fail closed: nothing is sent on a guess")
+
+    def test_a_held_store_drops_the_push_without_holding_the_hook(self):
+        self.lineage([
+            ("gots-abc", None, "compression", None, None),
+            ("sess_c0ffee", "gots-abc", None, None, None),
+        ])
+        holder = sqlite3.connect(self.home / "state.db", isolation_level=None)
+        holder.execute("BEGIN EXCLUSIVE")
+        holder.execute("INSERT INTO sessions (id) VALUES ('writer')")
+        try:
+            started = time.monotonic()
+            answer, sent = self.tell("question", "sess_c0ffee")
+            elapsed = time.monotonic() - started
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        self.assertFalse(answer, "the store won't say, so the push drops as it always did")
+        self.assertEqual(sent, [])
+        self.assertLess(elapsed, 1.0, "one short read: a held store doesn't stall the hook thread")
 
 
 class Mutes(unittest.TestCase):
@@ -354,6 +514,33 @@ class Turns(unittest.TestCase):
         alerts._started["telegram-9"] = time.monotonic() - 1000
         self.end(session="telegram-9", completed=True, failed=False, interrupted=False)
         self.assertEqual(self.told, [])
+
+    def test_a_delegated_childs_failure_is_told_as_its_chats(self):
+        # A subagent's turn ends in a session of its own, with no project record: the chat
+        # started it, so its failure is the chat's news (sessions.is_chat follows the fork).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        conn = sqlite3.connect(home / "state.db")
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT,"
+            " model_config TEXT, source TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO sessions (id, parent_session_id, end_reason, model_config, source)"
+            " VALUES (?, ?, ?, ?, ?)",
+            [
+                ("gots-1", None, "compression", None, None),
+                ("sess_de1e", "gots-1", None, '{"_delegate_from": "gots-1"}', "subagent"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+        with mock.patch.object(
+            alerts.sessions, "_paths", lambda: (Path("/nonexistent/m.db"), home)
+        ):
+            self.end(session="sess_de1e", completed=False, failed=True, interrupted=False)
+        self.assertEqual(self.told, [("run_failed", "sess_de1e")])
 
 
 class Routines(unittest.TestCase):
