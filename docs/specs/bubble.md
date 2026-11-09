@@ -153,13 +153,16 @@ leaves the host.
 
 **The phone keeps one bot.** The Bubble's own, kept the first time the app mirrors one and changed only in Bubble settings, so opening another bot's chat never moves it; while that bot is disabled or gone the selected bot answers, and nothing is written. `BubblePlugin.configure` writes the Bubble's own bot's plugin root, key, name,
 vocabulary and the host's own `wait_ms` into the phone's preferences; `useBubbleMirror` in the app shell
-rewrites it whenever the Bubble's bot, that bot's connection, or that host's own answer moves —
+rewrites it whenever the Bubble's bot, that bot's connection or name, or that host's own answer moves —
 it asks the host for the last of those itself, because the phone would otherwise hold the fallback for
 as long as the app stayed open, and give up on a cloud bot's take while the host was still hearing it.
 The Confirm is bounded by the host's number plus five seconds where there is one, and by 45 s where no
 host has said; *no host has been asked* is `-1`, never a zero that reads like an answer. A mirror that
 fails is tried again and said in the log: a phone left on the last bot it was told about would dictate
-to another host, with another key and another vocabulary.
+to another host, with another key and another vocabulary. With no bot left that can be called — the
+last one deleted leaves a placeholder with no host or key — the page says so (`Bubble.clear`), and the
+phone forgets the one it held, so its notice says *Choose a bot in Gots* rather than naming a bot that
+was deleted; the Bubble itself stays on, with nothing to dictate to.
 
 **Only a missing bot or a missing grant refuses a take.** No mirrored bot says *Choose a bot in Gots*,
 and accessibility off says *Turn on accessibility to insert text*; a field is not needed to start, only
