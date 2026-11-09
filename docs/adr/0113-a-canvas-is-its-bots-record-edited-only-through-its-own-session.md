@@ -10,12 +10,14 @@ components with no styling input and no data of their own, so they couldn't take
 a ticked box. Their builds were also parsed and saved by the device, so closing the app lost a build,
 which breaks the Plugin first rule. A canvas reverses all three.
 
-**The host owns everything a canvas is.** That is its record (title, pinned, hidden), its versions,
+**The host owns everything a canvas is.** That is its record (title, pinned, archived), its versions,
 its data and its tool grants. The device keeps a copy of each, so a canvas opens and reads with the
 host away. Writes are refused while the host is away rather than queued.
 
-**A canvas is changed only by its canvas session,** one long-lived Hermes session that belongs to the
-canvas. This reverses the old rule that an app is "changed on its own surface, never from a chat". The
+**A canvas's document is changed only by its canvas session,** one long-lived Hermes session that
+belongs to the canvas. The record's own name and placement are the user's, written from the app
+(amended 2026-11-09, #933): a record the user can't name, pin or hide is a page they can't file, and
+none of the three is the document — the session still owns what the page says. This reverses the old rule that an app is "changed on its own surface, never from a chat". The
 session's agent changes the canvas through host tools, never through its reply text, so an edit
 finishes with the app closed:
 - `read` answers the current version.
