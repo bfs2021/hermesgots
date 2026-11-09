@@ -66,20 +66,25 @@ const BENCHLM_KEY_BY_FAMILY: Record<string, string> = {
   beam: "reflection-beam",
 }
 
+const rewriteSegments = (id: string, rewrite: (segment: string) => string) =>
+  id.split("/").map(rewrite).join("/")
+
 const aliasFamily = (id: string) =>
-  id
-    .split("/")
-    .map((segment) =>
-      segment.replace(/^([a-z0-9]+)/, (token) => BENCHLM_KEY_BY_FAMILY[token] ?? token),
-    )
-    .join("/")
+  rewriteSegments(id, (segment) =>
+    segment.replace(/^([a-z0-9]+)/, (token) => BENCHLM_KEY_BY_FAMILY[token] ?? token),
+  )
+
+// BenchLM keys the K3 family without the k (`kimi-3-1-pro` for the catalog's `kimi-k3.1-pro`);
+// the K2.x rows keep it (`kimi-k2-5`, `kimi-k2-7-code`).
+const kimiFamily = (id: string) =>
+  rewriteSegments(id, (segment) => segment.replace(/^kimi-k(?=\d)/, "kimi-"))
+
+const candidateCache = new Map<string, string[]>()
 
 /**
  * Ids a catalog spelling might be stored under, most specific first. A lookup takes the first
  * candidate that has a BenchLM row, so an exact row always beats a looser reading.
  */
-const candidateCache = new Map<string, string[]>()
-
 export function benchCandidates(id: string): string[] {
   // Built once per id: a lookup runs for every row, and again for every keystroke while the
   // picker's search is typed.
@@ -97,8 +102,10 @@ export function benchCandidates(id: string): string[] {
     }
   }
   const bare = lastSegment(base)
-  const aliased = [...out, bare].map(aliasFamily)
-  const candidates = [...new Set([...out, bare, ...aliased])]
+  const derived = [...out, bare]
+  const aliased = derived.map(aliasFamily)
+  const kimiSpelled = derived.map(kimiFamily)
+  const candidates = [...new Set([...derived, ...aliased, ...kimiSpelled])]
   candidateCache.set(id, candidates)
   return candidates
 }

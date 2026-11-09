@@ -80,6 +80,26 @@ test("an exact row beats a derived one across rows", () => {
   assert.equal(scoreFor(m, "foo"), 2)
 })
 
+test("BenchLM spells the Kimi versions without the k", () => {
+  const m = scoreMapOf([
+    { modelKey: "kimi-3-1-pro", score: 74.91 },
+    { modelKey: "kimi-3", score: 69.6 },
+    { modelKey: "kimi-2-6", score: 57.6 },
+    { modelKey: "kimi-k2-5", score: 52.93 },
+  ])
+  const ids = ["kimi-k3.1-pro", "kimi-k3", "kimi-k2.6", "ollama-cloud/kimi-k3"]
+  assert.deepEqual(
+    ids.map((id) => scoreFor(m, id)),
+    [74.91, 69.6, 57.6, 69.6],
+  )
+  // the k2.x rows already carry the k, so the strip has to leave them reachable.
+  assert.equal(scoreFor(m, "kimi-k2.5"), 52.93)
+})
+
+test("a Kimi row's own spelling is not rewritten", () => {
+  assert.deepEqual(benchCandidates("kimi-3-1-pro"), ["kimi-3-1-pro"])
+})
+
 test("benchCandidates puts the id as-is first", () => {
   assert.equal(benchCandidates("gpt-oss:20b")[0], "gpt-oss:20b")
 })
