@@ -17,20 +17,20 @@ ticket that lands a family edits its own rows.
 
 ## The arithmetic, and how to check it
 
-The registry in `app/scripts/e2e/cli.mjs` holds **92 keys**, and every one of them has a row
-below. `pnpm e2e list` prints the same 92 keys, and the rows here are grouped by the ticket that
+The registry in `app/scripts/e2e/cli.mjs` holds **93 keys**, and every one of them has a row
+below. `pnpm e2e list` prints the same 93 keys, and the rows here are grouped by the ticket that
 takes them rather than by the registry's order, so the count is the thing to check:
 
 | Verdict | Keys |
 | --------- | ------ |
-| stay | 37 |
+| stay | 38 |
 | component | 51 |
 | plugin | 2 |
 | delete | 2 |
-| **total** | **92** |
+| **total** | **93** |
 
-Of those 92, 86 keys point at a script under `app/scripts/e2e/` (one of them, `todos-legacy`,
-reuses `todos.mjs`, so 85 distinct files) and 6 point at the older
+Of those 93, 87 keys point at a script under `app/scripts/e2e/` (one of them, `todos-legacy`,
+reuses `todos.mjs`, so 86 distinct files) and 6 point at the older
 `app/scripts/regression-*.mjs`.
 
 #297's plan counted **60** keys and split them **48 component / 7 stay / 3 delete / 2 plugin**.
@@ -185,18 +185,18 @@ only place the app is asked, and it fails at the base commit on the button alone
 
 `app/scripts/test-e2e-registry.mjs`, a unit test, holds the registry and this page to each other:
 a key with no row here, a row with no key, a verdict outside the four, a count in the table above
-that its rows don't add up to, or a stay beyond the thirty-four fails the app's gates. A new flow is
+that its rows don't add up to, or a stay beyond the thirty-eight fails the app's gates. A new flow is
 then an argument this page has to carry, never a default (ADR 0019).
 
 Check any of it in one line:
 
 ```bash
-grep -c '^| `' docs/e2e-flow-audit.md                           # 89 rows, one per registry key
-grep -c '^| `[a-z0-9-]*` | stay |' docs/e2e-flow-audit.md      # 34
+grep -c '^| `' docs/e2e-flow-audit.md                           # 92 rows, one per registry key
+grep -c '^| `[a-z0-9-]*` | stay |' docs/e2e-flow-audit.md      # 37
 grep -c '^| `[a-z0-9-]*` | component |' docs/e2e-flow-audit.md # 51
 grep -c '^| `[a-z0-9-]*` | delete |' docs/e2e-flow-audit.md    # 2
 grep -c '^| `[a-z0-9-]*` | plugin |' docs/e2e-flow-audit.md    # 2
-cd app && pnpm -s e2e list | wc -l                             # 89 keys in the registry
+cd app && pnpm -s e2e list | wc -l                             # 93 keys in the registry
 git show 8a4e842^:app/scripts/e2e/cli.mjs |
   sed -n '/^const FLOWS = {/,/^}$/p' | grep -c '^  [a-z"-]*: {'  # 61, before goal mode left
 ```
@@ -432,6 +432,16 @@ the real library. None of them has a module graph, or a viewport.
 | Key | Verdict | What it asserts today | Why it moves | What replaces it |
 | ----------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `openui-reference` | stay | The component reference at `/docs/open-ui`, at 390 and 768px in light and dark: every component the library registers has one entry and the entries come in the library's own order (the screen's list checked against `library.components`, read in the page); opening the screen fetches **neither** the chart's nor the map's library; scrolling the Chart entry into view fetches Recharts once and draws an axis with its labels, and the Map entry fetches Leaflet once and draws its places inside the map's box with its summary as its name; every entry's drawing takes the reference's own column at both widths in both themes — through the screen's own reveal, so an entry is measured after it has given up the box reserved for it — the map's basemap is the theme's (`World_Street_Map` in light, `World_Dark_Gray_Base` in dark, with the tiles answered locally), and nothing scrolls sideways; a pasted block draws the table it asked for; a paste the library refuses draws its error in words — naming the prop that is wrong — with its own source beside it and no frame in its place; and a reload leaves the playground empty, so a pasted block is kept nowhere. | The screen is one the component tier already proves (`test-openui-reference.tsx`: the entries, the props drift, the rules being the prompt's own words, the gate and the playground, all over the real library). What that tier cannot see is what this flow is for. `Reveal` mounts an entry only when it comes near the viewport, and a DOM without an `IntersectionObserver` mounts everything at once — so only a browser can show that opening the reference costs neither heavy library, and that each arrives once, in the chunk the build keeps it in, when its entry draws it; the build's chunk assertion reads the emitted output, this reads what a visit actually fetches. A map's fitted box, a basemap that follows the theme and a column measured at two widths are layout and Leaflet's own chrome. And a real reload is the only place "nothing pasted is kept" is a claim about the device rather than about a remount. | Nothing: a stay is replaced by itself. The entries, the props drift, the rules living once, the door and the playground's refusal are the component tier's; `scripts/check-openui-chunks.mjs` holds the build's side of the same chunk claim. |
+
+### The canvas's phone flow — #934
+
+One key, a stay (G6 of #920). A canvas is a page a bot writes, drawn in a sandboxed frame, with the
+chat that edits it raised over it on a phone; the ticket that lands the flow has nothing to hand a
+component test but the sheet's own box.
+
+| Key | Verdict | What it asserts today | Why it moves | What replaces it |
+| ----------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `canvas` | stay | A canvas on a phone at 390px, against the mock: made from a prompt on `/canvas`, the screen opening its own address at version 0 with "Your bot is building it…", the Edit pill raising the chat as a sheet that rests at exactly half the 844px screen with its composer standing in that half, the page landing under the open sheet, the sheet proving non-modal where an attribute cannot — the strip of page above its top edge taking a press as the frame, not a scrim — a box on the page ticked above the sheet's top edge with the host keeping the tick as the canvas's own data, a page whose Leave button sets `location` to an outside URL leaving the app on the canvas's address with no request to that URL and the canvas's own document drawn again in the frame, an edit sent from the sheet landing as version 2 with the box still ticked, Undo drawing version 1 with it still ticked, Point arming the page while the sheet is up with the chip carrying the tapped heading's own words, the frame and a real one-finger swipe down the sheet's handle leaving it, a press below the old stop reaching the page and Edit back on it. | Geometry a DOM without layout cannot measure, and mechanisms no lower tier has: the sheet's half stop and the strip of page above it that still takes a press, a chat laid out in the stop it rests at, a sandboxed `srcdoc` frame whose opaque origin the component tier stands in for with a fake, and a real touch swipe through Base UI's own drag. The outside-navigation leg is the browser's: ADR 0114 records the parent's `frame-src 'self'` blocking it in Chromium, checked by hand, and this is the only place it is measured — the refusal leaves the browser's error page, so the flow is also what holds the screen drawing its version again there. The host's versions landing while the sheet is up is the mock's own clock and event, which a component test hands over in one step. | Nothing: a stay is replaced by itself. The screen's draw of a version, Undo's request, the frame's attributes and policy and the point chip are `test-canvas-screen.tsx`'s; this flow is where the loop is driven by a person's taps, a real swipe and a page that tries to leave, over the mock's own host. |
 
 ## The coverage a demotion leaves with no home
 

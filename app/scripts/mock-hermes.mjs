@@ -174,7 +174,7 @@ import { tmpdir } from "node:os"
 import { basename, extname, join } from "node:path"
 
 import { handleMeetings } from "./mock-meetings.mjs"
-import { createCanvasStore, handleCanvas } from "./mock-canvas.mjs"
+import { createCanvasStore, editCanvasSession, handleCanvas } from "./mock-canvas.mjs"
 import { createRoomStore, handleRooms, roomRecords } from "./mock-rooms.mjs"
 import { handleResearch } from "./mock-research.mjs"
 import { durableUserRow } from "./host-row.mjs"
@@ -3873,6 +3873,11 @@ function startRun(req, body, options = {}) {
     // A scenario can name the final message alone, as Hermes's `final_response` carries it.
     const final = output ?? spoken
     run.output = final
+    // A turn in a canvas's own chat is the bot editing it: the plugin equips that session with
+    // `canvas_edit` and nothing else, and the mock stands in for the tool by writing the page's
+    // next version now, so the screen redraws as the turn ends.
+    if (CANVAS && !wake && !run.stopped && !failed && editCanvasSession(CANVASES, run.sessionId, last))
+      noteEvent("canvas", run.sessionId)
     run.usage = {
       input_tokens: prompt_tokens,
       output_tokens: completion_tokens,
@@ -4198,6 +4203,28 @@ http
               .filter(([, { value }]) => !value.room && !value.projectId && !value.canvasId)
               .map(([id, { value }]) => ({ id, title: value.title ?? "", at: value.updatedAt ?? 0 }))
               .sort((one, two) => two.at - one.at),
+          openChat: ({ chatId, sessionId, profileId, title, canvasId, opener, at }) => {
+            const key = pluginProfile ?? ""
+            if (!pluginChatLists.has(key)) pluginChatLists.set(key, key ? new Map() : pluginChats)
+            ;(pluginChatLists.get(key) ?? pluginChats).set(chatId, {
+              at,
+              value: {
+                id: chatId,
+                profileId,
+                title,
+                hermesSessionId: sessionId,
+                createdAt: at,
+                // Past createdAt, as the plugin writes it, so the daily cleanup doesn't read a
+                // thread whose first message is still waiting as one nothing happened in.
+                updatedAt: at + 1,
+                changedAt: at,
+                titleEdited: true,
+                canvasId,
+                ...(opener ? { opener: oneLine(opener, MAX_OPENER), openerAt: at } : {}),
+              },
+            })
+            noteEvent("chats", chatId, key)
+          },
         },
         CANVASES,
       ))

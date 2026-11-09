@@ -1,6 +1,8 @@
 // The Gots plugin's canvases (canvases.py), for the mock Hermes server. MOCK_CANVAS=0 serves a
 // plugin from before them — no routes, no `canvas` feature.
 
+import { randomUUID } from "node:crypto"
+
 import { inOrder } from "../src/lib/canvas-bridge.ts"
 
 const KEEP = 20
@@ -14,15 +16,15 @@ function titleOf(text) {
   return flat.length > TITLE_CHARS ? `${flat.slice(0, TITLE_CHARS - 1)}…` : flat
 }
 
+const escapeHtml = (text) =>
+  String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+
 /**
- * What the mock's bot writes: a page in the app's own theme tokens, as a canvas's guide asks. Its
- * count is the canvas's own data, kept through the page's bridge the way a real canvas keeps state.
+ * What the mock's bot writes: a page in the app's own theme tokens, its count and box kept in the
+ * canvas's own data through the page's bridge, and a Leave button that asks to go to an outside URL.
  */
-function page(prompt, title, version) {
-  const escaped = String(prompt)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
+function page(prompt, title, version, edited) {
+  const promptText = escapeHtml(prompt)
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -36,17 +38,26 @@ function page(prompt, title, version) {
       p { margin: 0 0 16px; color: var(--muted-foreground); }
       .card { padding: 16px; border: 1px solid var(--border); border-radius: var(--radius);
               background: var(--card); }
+      .card + .card { margin-top: 12px; }
       .value { font-size: 40px; font-weight: 600; color: var(--primary); font-variant-numeric: tabular-nums; }
+      .row { display: flex; align-items: center; gap: 12px; }
+      .row label { display: flex; min-height: 44px; flex: 1; align-items: center; gap: 10px; font-size: 16px; }
+      .row input { width: 22px; height: 22px; accent-color: var(--primary); }
       button { min-height: 44px; padding: 0 20px; border: 0; border-radius: 999px;
                background: var(--primary); color: var(--primary-foreground); font-size: 16px; }
     </style>
   </head>
   <body>
-    <h1>${title}</h1>
-    <p>${escaped}</p>
+    <h1>Deck checklist</h1>
+    <p>${promptText}</p>
+    <div class="card row">
+      <label><input type="checkbox" id="done"> Done</label>
+      <button id="leave">Leave</button>
+    </div>
     <div class="card">
       <div class="value" id="value">0</div>
       <p>Version ${version} of this canvas, drawn from what its bot wrote.</p>
+      ${edited ? `<p id="edited">${escapeHtml(edited)}</p>` : ""}
       <button id="add">Add one</button>
     </div>
     <div class="card">
@@ -76,6 +87,24 @@ function page(prompt, title, version) {
             console.error("canvas data:", error);
           });
         });
+        var box = document.getElementById("done");
+        store.list("checks").then(function (rows) {
+          for (var i = 0; i < rows.length; i += 1) {
+            if (rows[i].id === "done" && rows[i].doc && rows[i].doc.done === true) {
+              box.checked = true;
+            }
+          }
+        }).catch(function (error) {
+          console.error("canvas data:", error);
+        });
+        box.addEventListener("change", function () {
+          store.put("checks", "done", { done: box.checked }).catch(function (error) {
+            console.error("canvas data:", error);
+          });
+        });
+        document.getElementById("leave").addEventListener("click", function () {
+          location.href = "https://example.com/gone";
+        });
         // The page's one declared tool: its first call is the reader's to answer, and the answer is
         // kept on the host, so the second search never asks again.
         var found = document.getElementById("found");
@@ -95,6 +124,8 @@ function page(prompt, title, version) {
 
 export function createCanvasStore() {
   const canvases = new Map()
+  // The canvas a run's session edits, so a turn in a chat finds its canvas without walking them all.
+  const bySession = new Map()
 
   /**
    * The greatest version stored under the record's pointer, as the plugin's `_greatest_below` reads:
@@ -116,6 +147,7 @@ export function createCanvasStore() {
     version: c.version,
     pinned: c.pinned,
     archived: c.archived,
+    image: c.image ?? null,
     at: c.at,
     created_at: c.created_at,
   })
@@ -143,12 +175,58 @@ export function createCanvasStore() {
   // answers, so a client that renamed or pinned a canvas keeps the page it already draws.
   const record = (c) => ({ ...summary(c), can_undo: below(c) !== null })
 
-  return { canvases, summary, record, full, below }
+  return { canvases, bySession, summary, record, full, below }
 }
 
-export async function handleCanvas(req, res, path, { json, readBody, noteEvent, sessions }, store) {
+/**
+ * The picture a canvas's tile draws, as the plugin keeps one: a single inline image, made here from
+ * the canvas's own name and version, so a tile is visibly that canvas's rather than a shared mark.
+ */
+function picture(canvas) {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 240"><rect width="320" height="240" fill="#0d2b22"/><rect x="24" y="28" width="272" height="120" rx="12" fill="#123d2f"/><circle cx="72" cy="188" r="10" fill="#2f7d5f"/><text x="96" y="194" fill="#7ee2b8" font-family="ui-sans-serif, sans-serif" font-size="20">${escapeHtml(canvas.title).slice(0, 24)}</text></svg>`
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`
+}
+
+/**
+ * Writes the canvas's next version, as `canvases.py`'s `_commit` does: the history above the record's
+ * pointer goes first, so an undo leaves no redo and the pointer's version is the only row at its
+ * number, then the page is built from what the version was asked to say. The canvas's data — the
+ * box, the count — sits outside the versions, so a new one opens with what the reader left.
+ */
+function writeVersion(canvas, words) {
+  canvas.version += 1
+  canvas.at = Date.now()
+  canvas.versions = canvas.versions.filter((one) => one.version < canvas.version)
+  const edited = typeof words === "string" ? words.replace(/\s+/g, " ").trim().slice(0, 200) : ""
+  canvas.image = picture(canvas)
+  canvas.versions.push({
+    version: canvas.version,
+    html: page(canvas.prompt, canvas.title, canvas.version, edited),
+    tools: canvas.tools,
+  })
+  if (canvas.versions.length > KEEP) canvas.versions.shift()
+}
+
+/**
+ * The version a turn in a canvas's own chat writes: the mock's stand-in for the bot calling
+ * `canvas_edit`, the tool a real canvas session is equipped with (`canvases.py`).
+ */
+export function editCanvasSession(store, sessionId, words) {
+  const canvas = store.bySession.get(sessionId)
+  if (!canvas) return null
+  writeVersion(canvas, words)
+  return canvas
+}
+
+export async function handleCanvas(
+  req,
+  res,
+  path,
+  { json, readBody, noteEvent, sessions, openChat },
+  store,
+) {
   if (!path.startsWith("/api/plugins/gots/canvases")) return false
-  const { canvases, summary, full, below } = store
+  const { canvases, bySession, summary, full, below } = store
   const fail = (status, message, code) =>
     json(res, status, { error: { message, ...(code ? { code } : {}) } })
   /** Whether the version the pointer names declared ``tool``. */
@@ -355,14 +433,20 @@ export async function handleCanvas(req, res, path, { json, readBody, noteEvent, 
       if (!prompt) return fail(400, "A canvas needs a prompt to build it from."), true
       const now = Date.now()
       const title = titleOf(prompt)
+      // The chat the canvas is edited in is the one `triage.open_thread` makes: an app-kind id, a
+      // session named for it, the canvas's own name marked `titleEdited`, and `canvasId` so no list
+      // or card ever draws it (canvases.py's `create`).
+      const chatId = randomUUID()
       const canvas = {
-        id: `c_${Math.random().toString(16).slice(2, 18)}`,
+        id: `c_${randomUUID().slice(0, 8)}`,
         title,
-        session_id: `gots-${Math.random().toString(16).slice(2, 18)}`,
-        chat_id: Math.random().toString(16).slice(2, 18),
+        session_id: `gots-${chatId}`,
+        chat_id: chatId,
         version: 0,
         pinned: false,
         archived: false,
+        // Nothing until a version is written: a canvas still being built draws its own mark.
+        image: null,
         at: now,
         created_at: now,
         versions: [],
@@ -374,19 +458,22 @@ export async function handleCanvas(req, res, path, { json, readBody, noteEvent, 
         prompt,
       }
       canvases.set(canvas.id, canvas)
+      bySession.set(canvas.session_id, canvas)
+      openChat?.({
+        chatId,
+        sessionId: canvas.session_id,
+        profileId: body?.profile_id ?? null,
+        title,
+        canvasId: canvas.id,
+        opener: prompt,
+        at: now,
+      })
       // The gap is what lets the screen draw version 0 — "your bot is building it" — before the
-      // page lands.
+      // page lands, with room for a phone to raise its sheet in the meantime.
       setTimeout(() => {
-        canvas.version += 1
-        canvas.at = Date.now()
-        canvas.versions.push({
-          version: canvas.version,
-          html: page(prompt, title, canvas.version),
-          tools: canvas.tools,
-        })
-        if (canvas.versions.length > KEEP) canvas.versions.shift()
+        writeVersion(canvas)
         noteEvent("canvas", canvas.session_id)
-      }, 1500)
+      }, 2500)
       json(res, 202, { object: "gots.canvas", canvas: full(canvas) })
       return true
     }
@@ -425,8 +512,8 @@ export async function handleCanvas(req, res, path, { json, readBody, noteEvent, 
 
   if (req.method === "POST") {
     const body = (await readBody(req)) ?? {}
-    if (!["title", "pinned", "archived"].some((field) => field in body)) {
-      fail(400, "A canvas's update names what changes: a title, pinned, or archived.")
+    if (!["title", "pinned", "archived", "image"].some((field) => field in body)) {
+      fail(400, "A canvas's update names what changes: a title, pinned, archived, or image.")
       return true
     }
     if ("title" in body) {
@@ -445,6 +532,13 @@ export async function handleCanvas(req, res, path, { json, readBody, noteEvent, 
       }
       canvas[field] = body[field]
     }
+    if ("image" in body) {
+      if (typeof body.image !== "string" || (body.image && !body.image.startsWith("data:image/"))) {
+        fail(400, "A canvas's image is an inline picture, as a data URL.")
+        return true
+      }
+      canvas.image = body.image || null
+    }
     canvas.at = Date.now()
     noteEvent("canvas", canvas.session_id)
     json(res, 200, { object: "gots.canvas", canvas: store.record(canvas) })
@@ -453,6 +547,7 @@ export async function handleCanvas(req, res, path, { json, readBody, noteEvent, 
 
   if (req.method === "DELETE") {
     canvases.delete(canvas.id)
+    bySession.delete(canvas.session_id)
     noteEvent("canvas", canvas.session_id)
     json(res, 200, { object: "gots.canvas.deleted", deleted: true, id: canvas.id })
     return true

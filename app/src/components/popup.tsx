@@ -5,6 +5,7 @@ import {
   useEffect,
   useRef,
   type ComponentProps,
+  type CSSProperties,
   type ReactNode,
   type RefObject,
 } from "react"
@@ -224,6 +225,19 @@ const SHEET_STACK = `[transform:translateY(calc(var(--drawer-swipe-movement-y)-v
 
 const SHEET_SNAP = `[transform:translateY(calc(var(--drawer-snap-point-offset)-var(--stack-peek-offset)-var(--stack-lift)))] transition-[transform,height] duration-300 ease-[cubic-bezier(0.2,0,0,1)] ${STACK_LIFT} data-swiping:[transform:translateY(var(--drawer-swipe-movement-y))] ${SHEET_MOTION}`
 
+/**
+ * A snapped sheet's own measurements, copied onto its popup so its content can inherit them: Base UI
+ * registers the stop's offset with `inherits: false`, so only the popup element can read it, and the
+ * handle's height is stated once here rather than twice — the handle and the box under it are one
+ * measurement, and a handle of another height would push the content's last row off the screen.
+ */
+const SNAP_VISIBLE = {
+  "--sheet-visible": "calc(100dvh - var(--drawer-snap-point-offset))",
+  "--sheet-handle": "3rem",
+} as CSSProperties
+
+const SNAP_CONTENT = { height: "calc(var(--sheet-visible) - var(--sheet-handle))" } as CSSProperties
+
 export function PopupContent({
   className,
   fixedHeight,
@@ -386,6 +400,7 @@ export function PopupContent({
             data-popup-form={form}
             data-toast-above={toastAbove || undefined}
             initialFocus={focus}
+            style={snapped ? SNAP_VISIBLE : undefined}
             className={cn(
               "group/popup relative flex max-h-[85dvh] w-full max-w-[640px] flex-col overflow-hidden rounded-t-[28px] bg-popover pb-[max(1.5rem,env(safe-area-inset-bottom))] text-sm text-popover-foreground shadow-lg outline-none",
               SHEET_SIZE[size],
@@ -393,7 +408,7 @@ export function PopupContent({
               snapped ? SHEET_SNAP : SHEET_STACK,
               // The stops are fractions of the screen, so the sheet is the whole screen tall and the
               // offset Base UI sets is what holds it at the stop it was dragged to.
-              snapped && "pointer-events-auto h-dvh max-h-none",
+              snapped && "pointer-events-auto h-dvh max-h-none pb-0",
               // A bare child fills the sheet to its own edges, and its own content pads them.
               bare && "pb-0",
               className,
@@ -401,11 +416,17 @@ export function PopupContent({
           >
             <Drawer.Close
               aria-label="Close"
-              className="mx-auto flex h-12 w-16 shrink-0 cursor-grab touch-none items-center justify-center transition-opacity duration-200 outline-none group-data-nested-drawer-open/popup:opacity-0 group-data-nested-drawer-swiping/popup:opacity-100 focus-visible:[&>span]:bg-ring"
+              className="mx-auto flex h-[var(--sheet-handle,3rem)] w-16 shrink-0 cursor-grab touch-none items-center justify-center transition-opacity duration-200 outline-none group-data-nested-drawer-open/popup:opacity-0 group-data-nested-drawer-swiping/popup:opacity-100 focus-visible:[&>span]:bg-ring"
             >
               <span className="h-1 w-8 rounded-full bg-muted-foreground/60" />
             </Drawer.Close>
-            <Drawer.Content className="flex min-h-0 flex-1 flex-col transition-opacity duration-300 group-data-nested-drawer-open/popup:opacity-0 group-data-nested-drawer-swiping/popup:opacity-100">
+            <Drawer.Content
+              className={cn(
+                "flex min-h-0 flex-col transition-opacity duration-300 group-data-nested-drawer-open/popup:opacity-0 group-data-nested-drawer-swiping/popup:opacity-100",
+                !snapped && "flex-1",
+              )}
+              style={snapped ? SNAP_CONTENT : undefined}
+            >
               {bare ? (
                 children
               ) : (
