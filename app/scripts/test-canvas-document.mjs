@@ -1,12 +1,14 @@
 import assert from "node:assert/strict"
-import { readFileSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import test from "node:test"
+import vm from "node:vm"
 
 import { BRIDGE_METHODS } from "../src/lib/canvas-bridge.ts"
 import {
   CANVAS_CSP,
   LIBRARIES,
   SCROLL_MESSAGE,
+  SUBMIT_IN_PLACE,
   TOKENS,
   canvasDocument,
   readScroll,
@@ -59,6 +61,77 @@ test("RTCPeerConnection is gone before the page's scripts", () => {
   }
   // Only the page's own script is left for the page: the removal rides the head, not the body.
   assert.equal(html.slice(html.indexOf("<body")).includes("RTCPeerConnection"), false)
+})
+
+test("a form submits in place", () => {
+  // The guard is a head script of its own, so it is on the page before the page's own scripts are.
+  // A submit bubbles from the form up to the window, so every handler the page put on the form or a
+  // field has run by the time this one is reached, and it cancels the navigation only where none of
+  // them did. A handler the page puts on the window itself is registered later than the guard, so it
+  // runs after it and finds the submit already cancelled.
+  const listeners = []
+  const prevented = []
+  const seen = []
+  const context = {
+    addEventListener: (type, fn, capture) => listeners.push({ type, fn, capture }),
+    seen,
+    prevented,
+  }
+  context.window = context
+  vm.createContext(context)
+  // The page's own handler, registered first: a submit bubbling up reaches this before the guard.
+  vm.runInContext(
+    `addEventListener("submit", function () { seen.push(prevented.length) })`,
+    context,
+  )
+  vm.runInContext(SUBMIT_IN_PLACE, context)
+  assert.deepEqual(
+    listeners.map((one) => one.type),
+    ["submit", "submit"],
+  )
+  assert.equal(listeners[1].capture, false, "the guard listens in the bubble phase")
+
+  const event = {
+    defaultPrevented: false,
+    preventDefault() {
+      prevented.push(true)
+      this.defaultPrevented = true
+    },
+  }
+  for (const listener of listeners) listener.fn(event)
+  assert.deepEqual(seen, [0], "the page's handler ran, and nothing had cancelled anything yet")
+  assert.equal(prevented.length, 1, "the guard cancelled the navigation, once")
+  assert.equal(event.defaultPrevented, true)
+
+  // A page that prevented the submit itself is left alone: its decision is not cancelled twice.
+  const stopped = []
+  const second = { addEventListener: (type, fn) => stopped.push({ type, fn }) }
+  second.window = second
+  vm.createContext(second)
+  vm.runInContext(
+    `addEventListener("submit", function (event) { event.preventDefault() })`,
+    second,
+  )
+  vm.runInContext(SUBMIT_IN_PLACE, second)
+  const cancelled = []
+  const own = {
+    defaultPrevented: false,
+    preventDefault() {
+      cancelled.push(true)
+      this.defaultPrevented = true
+    },
+  }
+  for (const listener of stopped) listener.fn(own)
+  assert.equal(cancelled.length, 1, "only the page's own preventDefault ran")
+
+  // Its script is in the drawn head, ahead of the page's own, and the policy still refuses a form.
+  const html = canvasDocument(PAGE, { mode: "light", tokens: LIGHT })
+  assert.ok(html.includes(SUBMIT_IN_PLACE), "the guard rides the document's head")
+  assert.ok(
+    html.indexOf(SUBMIT_IN_PLACE) < html.indexOf('document.title = "ran"'),
+    "ahead of the page's own script",
+  )
+  assert.match(html, /form-action 'none'/, "the navigation policy is unchanged")
 })
 
 test("theme variables follow the mode", () => {
@@ -295,6 +368,22 @@ test("the canvas section names exactly the libraries and bridge methods the app 
   assert.deepEqual(named(/data-canvas-lib="([a-z]+)"/g).sort(), [...LIBRARIES].sort())
   assert.deepEqual(named(/canvas\.data\.([a-z]+)/g).sort(), [...BRIDGE_METHODS].sort())
   assert.ok(guide.length <= 4_000, `the guide is ${guide.length} characters, under the host's 4,000`)
+})
+
+test("the canvas section names the skills it can load", () => {
+  // A canvas's session only hears of these three from the guide, and a name it can't load is a dead
+  // end: each one has to be a folder the plugin really ships, sharing it with the skill's own name.
+  const guide = readFileSync(new URL("../../plugin/canvas/prompt.txt", import.meta.url), "utf8")
+  for (const name of ["impeccable", "web-design-guidelines", "transitions-dev"]) {
+    assert.ok(guide.includes(`gots:${name}`), `the guide names gots:${name}`)
+    const skill = new URL(`../../plugin/skills/${name}/SKILL.md`, import.meta.url)
+    assert.ok(existsSync(skill), `plugin/skills/${name}/SKILL.md exists`)
+    assert.match(readFileSync(skill, "utf8"), new RegExp(`^name: ${name}$`, "m"), "the folder is its name")
+  }
+  assert.match(guide, /DESIGN\.md/, "the guide points at the app's own design system")
+  // The two traps the sandbox leaves a page: its submit goes nowhere, and a link's target is the app.
+  assert.match(guide, /submit is cancelled in place/, "the guide says a form's submit is cancelled")
+  assert.match(guide, /`http\(s\)` link opens in the app/, "and that a link opens in the app")
 })
 
 test("the app's own policy keeps a canvas's frame from navigating itself away", () => {

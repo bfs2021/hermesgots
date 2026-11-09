@@ -3,9 +3,10 @@
  * being trusted (ADR 0114).
  *
  * The page is drawn in a `<iframe sandbox="allow-scripts" srcdoc>` — no `allow-same-origin`, so it
- * has an opaque origin and reaches nothing of the app's — and five things are put in its head
+ * has an opaque origin and reaches nothing of the app's — and six things are put in its head
  * before anything the bot wrote: the policy, the app's theme tokens, the script that takes WebRTC
- * away, and the scroll and data bridges the page talks to the app through. The app's own CSP
+ * away, the script that keeps a form's submit on the page, and the scroll and data bridges the page
+ * talks to the app through. The app's own CSP
  * carries `frame-src 'self'`, so the frame can't navigate itself anywhere either. The scan on the
  * host is hygiene; this is the defence (ADR 0114).
  *
@@ -59,6 +60,20 @@ export const TOKENS = [
  * sandbox that no policy covers, and a canvas has no reason to open one.
  */
 const NO_PEER = `(function(){var names=["RTCPeerConnection","webkitRTCPeerConnection","mozRTCPeerConnection"];for(var i=0;i<names.length;i++){try{delete window[names[i]]}catch(e){}try{window[names[i]]=undefined}catch(e){}}})()`
+
+/**
+ * A form's submit, kept on the page it was made on. `form-action 'none'` refuses the navigation, so
+ * without this the reader is left on a refusal with the page's state gone; the guard cancels the
+ * default instead, and the page stays whole.
+ *
+ * It listens on `window` in the bubble phase: a submit travels from the form up to the window, so every
+ * handler the page put on the form or on a field has already run and kept whatever it did, and a submit
+ * the page prevented itself arrives already prevented and is left alone. Only an unprevented submit is
+ * cancelled, so nothing the page means to happen is taken away from it. One it put on the window itself
+ * is registered after this and runs afterwards, which is the cost of being first in the head. The policy
+ * does not move: this cancels a navigation, it does not permit one.
+ */
+export const SUBMIT_IN_PLACE = `(function(){addEventListener("submit",function(event){if(event&&!event.defaultPrevented){event.preventDefault()}},false)})()`
 
 /** The name the page's scroll report carries, so the route and the script agree on one shape. */
 export const SCROLL_MESSAGE = "gots:canvas-scroll"
@@ -195,6 +210,7 @@ export function canvasDocument(
     `<style>${themeVariables(tokens, mode)}</style>` +
     (css ? `<style>${escapeStyle(css)}</style>` : "") +
     `<script>${NO_PEER}</script>` +
+    `<script>${SUBMIT_IN_PLACE}</script>` +
     `<script>${scrollBridge(scroll)}</script>` +
     `<script>${BRIDGE_SCRIPT}</script>`
   return page.slice(0, at) + prefix + page.slice(at)
