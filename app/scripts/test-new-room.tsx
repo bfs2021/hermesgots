@@ -10,11 +10,13 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { MemoryRouter, Route, Routes, useParams } from "react-router"
+import { tell } from "@/lib/tell"
 
 import { ConversationList } from "@/components/conversation-list"
 import { NewRoomScreen } from "@/components/room/new-room-screen"
 import { RoomChat } from "@/components/room/room-chat"
 import { db, type Profile } from "@/lib/db"
+import { COMPOSER_SLOT } from "@/lib/layout"
 import {
   botProfile,
   click,
@@ -22,6 +24,7 @@ import {
   find,
   findAll,
   json,
+  laptop,
   mount,
   Path,
   seedSettings,
@@ -97,9 +100,6 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 
 async function fresh(host: string, { writable = true }: { writable?: boolean } = {}) {
   offers.set(host, writable ? WRITABLE : ["chats", "rooms"])
-  posted.length = 0
-  held.id = undefined
-  held.name = ""
   const bots: Profile[] = [
     botProfile(host, {
       id: `${host}-coder`,
@@ -115,6 +115,14 @@ async function fresh(host: string, { writable = true }: { writable?: boolean } =
       botId: `${host}-writer`,
     }),
   ]
+  await resetRoom(bots)
+  return bots
+}
+
+async function resetRoom(bots: Profile[]) {
+  posted.length = 0
+  held.id = undefined
+  held.name = ""
   await seedSettings({ onboarded: true, legacyChat: true, movedChats: bots.map((bot) => bot.id) })
   await db.profiles.clear()
   await db.profiles.bulkPut(bots)
@@ -122,7 +130,40 @@ async function fresh(host: string, { writable = true }: { writable?: boolean } =
   await db.messages.clear()
   await db.roomLog.clear()
   await settle()
+}
+
+async function freshAcross() {
+  const [alpha, beta] = ["alpha", "beta"]
+  offers.set(`${alpha}.test`, WRITABLE)
+  offers.set(`${beta}.test`, WRITABLE)
+  const bots: Profile[] = [
+    botProfile(alpha, { id: "alpha-ada", name: "Ada", hermesProfile: "ada", botId: "alpha-ada" }),
+    botProfile(alpha, { id: "alpha-bo", name: "Bo", hermesProfile: "bo", botId: "alpha-bo" }),
+    botProfile(beta, { id: "beta-cy", name: "Cy", hermesProfile: "cy", botId: "beta-cy" }),
+    // The same Host reached by another key and no version path: the address is what makes it one Host.
+    botProfile(alpha, { id: "alpha-eve", name: "Eve", hermesProfile: "eve", botId: "alpha-eve" }),
+    botProfile(alpha, { id: "alpha-fay", name: "Fay", hermesProfile: "fay", botId: "alpha-fay" }),
+    botProfile(alpha, { id: "alpha-gus", name: "Gus", hermesProfile: "gus", botId: "alpha-gus" }),
+    botProfile(alpha, {
+      id: "alpha-dee",
+      name: "Dee",
+      baseUrl: "http://alpha.test",
+      apiKey: "another-key",
+      hermesProfile: "dee",
+      botId: "alpha-dee",
+    }),
+  ]
+  await resetRoom(bots)
   return bots
+}
+
+const seats = () => findAll("[data-bot]")
+const seat = (id: string) => find(`[data-bot="${id}"]`) as HTMLButtonElement | null
+
+async function openSeats() {
+  await until(async () => Boolean(find('[data-slot="seats-pill"]')), "the blank room")
+  await click(find('[data-slot="seats-pill"]'))
+  await until(async () => seats().length > 0, "the seat rows")
 }
 
 /** The blank room at its own address: the room it becomes lives at `/c/<id>`, which the create names. */
@@ -224,3 +265,159 @@ test("a host that cannot write offers no New room", async () => {
     },
   )
 })
+
+test("the blank room's composer stands in the foot every chat screen gives it", async () => {
+  await fresh("blank-room-slot.test")
+  await mount(screen(), async () => {
+    await until(async () => Boolean(find('[data-slot="seats-pill"]')), "the blank room")
+    const slot = find('[data-slot="composer-slot"]')
+    assert.equal(slot?.className, COMPOSER_SLOT, "the one foot every chat screen gives a composer")
+    assert.ok(slot?.contains(composerField()), "the field itself is inside that slot")
+    assert.ok(
+      slot?.querySelector('[data-slot="seats-pill"]'),
+      "and the seats pill shares its gutter, so the two align",
+    )
+  })
+})
+
+test("every bot the device holds is listed, whatever Host it is on", async () => {
+  await freshAcross()
+  await mount(screen(), async () => {
+    await openSeats()
+    assert.deepEqual(
+      seats().map((row) => row.getAttribute("data-bot")),
+      ["alpha-ada", "alpha-bo", "beta-cy", "alpha-dee", "alpha-eve", "alpha-fay", "alpha-gus"],
+      "one list of every bot, not one Host's slice of it",
+    )
+    assert.equal(
+      findAll("button").filter((one) => one.textContent?.includes("alpha.test")).length,
+      0,
+      "no Host picker draws",
+    )
+  })
+})
+
+test("the first bot picked chooses the Host, and another Host's bots grey out", async () => {
+  await freshAcross()
+  const said: unknown[] = []
+  const real = tell.info
+  tell.info = ((message: unknown) => said.push(message)) as typeof tell.info
+  try {
+    await mount(screen(), async () => {
+      await openSeats()
+      await click(seat("alpha-ada"))
+      assert.equal(
+        seat("alpha-bo")?.getAttribute("aria-disabled"),
+        null,
+        "Bo answers at the same address, so it stays a seat",
+      )
+      assert.equal(
+        seat("alpha-dee")?.getAttribute("aria-disabled"),
+        null,
+        "Dee reaches that address by another key and path: one Host all the same",
+      )
+      assert.equal(
+        seat("beta-cy")?.getAttribute("aria-disabled"),
+        "true",
+        "Cy is another Host's, and greys out",
+      )
+
+      await click(seat("beta-cy"))
+      assert.deepEqual(
+        said,
+        ["A room holds one Host's bots. Unpick every bot to change Host."],
+        "a greyed row answers a press with why it is greyed",
+      )
+      assert.match(
+        find('[data-slot="seats-pill"]')?.textContent ?? "",
+        /1 of 6/,
+        "and seats nothing",
+      )
+
+      await click(seat("alpha-ada"))
+      assert.equal(
+        seat("beta-cy")?.getAttribute("aria-disabled"),
+        null,
+        "unpicking the only seat frees every Host again",
+      )
+      await click(seat("beta-cy"))
+      assert.equal(
+        seat("alpha-bo")?.getAttribute("aria-disabled"),
+        "true",
+        "the first pick is what names the Host",
+      )
+    })
+  } finally {
+    tell.info = real
+  }
+})
+
+test("the seats sheet heads its body the way every drawer does", async () => {
+  await freshAcross()
+  await mount(screen(), async () => {
+    await openSeats()
+    assert.equal(
+      find('[data-slot="sheet-title"]')?.textContent?.trim(),
+      "Room bots",
+      "the drawer's heading is its title",
+    )
+    assert.equal(
+      find('[data-slot="sheet-header"]')?.textContent?.trim(),
+      "Room bots",
+      "and the header holds nothing beside it, as every other drawer's does",
+    )
+    assert.match(
+      find("[data-popup-form]")?.textContent ?? "",
+      /Two to six bots of one Host/,
+      "the rule is the body's to say",
+    )
+  })
+})
+
+test("at the room's ceiling, another Host's bot still says why it is greyed", async () => {
+  const bots = await freshAcross()
+  const said: unknown[] = []
+  const real = tell.info
+  tell.info = ((message: unknown) => said.push(message)) as typeof tell.info
+  try {
+    await mount(screen(), async () => {
+      await pick(bots.filter((bot) => bot.id !== "beta-cy"))
+      assert.match(
+        find('[data-slot="seats-pill"]')?.textContent ?? "",
+        /6 of 6/,
+        "the room holds the most it may",
+      )
+      await openSeats()
+      assert.equal(
+        seat("beta-cy")?.getAttribute("aria-disabled"),
+        "true",
+        "the other Host's bot is greyed, as it is at every count",
+      )
+      assert.equal(seat("beta-cy")?.disabled, false, "and it is still pressable, so it can say why")
+      await click(seat("beta-cy"))
+      assert.deepEqual(
+        said,
+        ["A room holds one Host's bots. Unpick every bot to change Host."],
+        "a full room does not swallow the sentence the Host lock owes",
+      )
+    })
+  } finally {
+    tell.info = real
+  }
+})
+
+test("the seats sheet heads a laptop's drawer the same way", laptop(async () => {
+  await fresh("blank-room-drawer.test")
+  await mount(screen(), async () => {
+    await openSeats()
+    assert.ok(
+      find('[data-popup-form="drawer"]'),
+      "a laptop opens the side drawer, not the phone's sheet",
+    )
+    assert.equal(
+      find('[data-slot="sheet-title"]')?.textContent?.trim(),
+      "Room bots",
+      "titled the way every drawer's heading is",
+    )
+  })
+}))

@@ -11,7 +11,7 @@ import { Popup, PopupContent, PopupHeader, PopupTitle } from "@/components/popup
 import { RoomFaces } from "@/components/room/room-faces"
 import { Group, linkRowClass, RowText } from "@/components/settings-chrome"
 import { Button } from "@/components/ui/button"
-import { connectionKey, serverConfig } from "@/lib/connection"
+import { connectionKey, hostKey, serverConfig } from "@/lib/connection"
 import {
   DEFAULT_SETTINGS,
   db,
@@ -21,15 +21,21 @@ import {
   type RoomMember,
 } from "@/lib/db"
 import { usePluginFeatureByServer } from "@/lib/features"
-import { COLUMN_BOX } from "@/lib/layout"
+import { COLUMN_BOX, COMPOSER_SLOT } from "@/lib/layout"
 import { botModel, fullModel, useModelInfo } from "@/lib/model-info"
-import { roomSeats } from "@/lib/rooms"
+import { FACES, roomSeats } from "@/lib/rooms"
 import { startRoom } from "@/lib/room-writes"
+import { tell } from "@/lib/tell"
 import { cn, randomId } from "@/lib/utils"
+
+/** Why a row refuses a seat: a full room says nothing, another Host says what to do about it. */
+type Refusal = { kind: "full" } | { kind: "host"; say: string }
 
 /** The fewest and most seats a room may hold: the Host's rule, said before it can be broken. */
 const LEAST = 2
 const MOST = 6
+
+const OTHER_HOST = "A room holds one Host's bots. Unpick every bot to change Host."
 
 /**
  * A room that does not exist yet, drawn the way a new chat is (ADR 0096, ADR 0125): no record, no
@@ -57,9 +63,6 @@ export function NewRoomScreen({ slot }: { slot?: string }) {
         .sort((one, two) => one.name.localeCompare(two.name)),
     [bots, answers],
   )
-  const hosts = [...new Set(writers.map((bot) => connectionKey(bot)))]
-  const [host, setHost] = useState("")
-  const seated = writers.filter((bot) => connectionKey(bot) === (host || hosts[0]))
   const [picked, setPicked] = useState<string[]>([])
   const [picking, setPicking] = useState(false)
   const [roomId] = useState(() => randomId())
@@ -67,8 +70,35 @@ export function NewRoomScreen({ slot }: { slot?: string }) {
   const [sending, setSending] = useState(false)
   const [failure, setFailure] = useState<string>()
 
-  const chosen = seated.filter((bot) => picked.includes(bot.id))
+  const chosen = writers.filter((bot) => picked.includes(bot.id))
   const ready = chosen.length >= LEAST && chosen.length <= MOST
+
+  const lockedHost = chosen[0] ? hostKey(chosen[0]) : null
+
+  const refusalFor = (bot: Profile): Refusal | null => {
+    if (picked.includes(bot.id)) return null
+    // Another Host before the ceiling: at six seats its row must still say the thing a press can act on.
+    if (lockedHost && hostKey(bot) !== lockedHost) return { kind: "host", say: OTHER_HOST }
+    return picked.length >= MOST ? { kind: "full" } : null
+  }
+
+  const toggle = (id: string) => {
+    if (picked.includes(id)) {
+      setPicked((held) => held.filter((one) => one !== id))
+      return
+    }
+    const bot = writers.find((one) => one.id === id)
+    if (!bot) return
+    const refusal = refusalFor(bot)
+    if (refusal) {
+      if (refusal.kind === "host") tell.info(refusal.say)
+      return
+    }
+    // The guards inside the updater too: a press that lands twice in one batch seats one bot once.
+    setPicked((held) =>
+      held.includes(id) || held.length >= MOST ? held : [...held, id],
+    )
+  }
 
   /** One seat per picked bot, minted when it is picked, so a retried create seats the same members. */
   const seatOf = (bot: Profile): RoomMember => {
@@ -89,7 +119,7 @@ export function NewRoomScreen({ slot }: { slot?: string }) {
       const members = chosen.map(seatOf)
       await startRoom(chosen[0], {
         roomId,
-        // Its name until the Host says otherwise: the seats, in the order they were picked.
+        // Its name until the Host says otherwise: its seats' own names.
         name: chosen.map((bot) => bot.name).join(", "),
         members,
       })
@@ -125,142 +155,99 @@ export function NewRoomScreen({ slot }: { slot?: string }) {
         </div>
       )}
 
-      <div className={cn(COLUMN_BOX, "px-3 pb-2 sm:px-4")}>
-        <Button
-          variant="outline"
-          className="h-10 rounded-full"
-          aria-label="Pick the room's bots"
-          data-slot="seats-pill"
-          onClick={() => setPicking(true)}
-        >
-          {faces.length ? (
-            <RoomFaces shown={faces.slice(0, 4)} more={Math.max(0, faces.length - 4)} />
-          ) : (
-            <UsersIcon className="size-4" />
-          )}
-          <span className="text-sm">
-            {chosen.length
-              ? `${chosen.length} of ${MOST} bots`
-              : `${LEAST} to ${MOST} bots`}
-          </span>
-        </Button>
-      </div>
+      <div data-slot="composer-slot" data-toast-above className={COMPOSER_SLOT}>
+        <div className={cn(COLUMN_BOX, "pb-2")}>
+          <Button
+            variant="outline"
+            className="h-11 rounded-full"
+            aria-label="Pick the room's bots"
+            data-slot="seats-pill"
+            onClick={() => setPicking(true)}
+          >
+            {faces.length ? (
+              <RoomFaces
+                shown={faces.slice(0, FACES)}
+                more={Math.max(0, faces.length - FACES)}
+              />
+            ) : (
+              <UsersIcon className="size-4" />
+            )}
+            <span className="text-sm">
+              {chosen.length
+                ? `${chosen.length} of ${MOST} bots`
+                : `${LEAST} to ${MOST} bots`}
+            </span>
+          </Button>
+        </div>
 
-      <Composer
-        plain
-        busy={false}
-        disabled={!ready || sending || !connection}
-        connection={connection}
-        botName={chosen[0]?.name ?? "Hermes"}
-        draftKey="room-new"
-        files={false}
-        filesFeature="no"
-        imagesAvailable={false}
-        placeholder={
-          ready ? "Message the room…" : `Pick at least ${LEAST} bots to start the room`
-        }
-        sendOnEnter={sendOnEnter ?? DEFAULT_SETTINGS.sendOnEnter}
-        onSend={send}
-        onQueue={send}
-        onStop={() => undefined}
-      />
+        <Composer
+          plain
+          busy={false}
+          disabled={!ready || sending || !connection}
+          connection={connection}
+          botName={chosen[0]?.name ?? "Hermes"}
+          draftKey="room-new"
+          files={false}
+          filesFeature="no"
+          imagesAvailable={false}
+          placeholder={
+            ready ? "Message the room…" : `Pick at least ${LEAST} bots to start the room`
+          }
+          sendOnEnter={sendOnEnter ?? DEFAULT_SETTINGS.sendOnEnter}
+          onSend={send}
+          onQueue={send}
+          onStop={() => undefined}
+        />
+      </div>
 
       <SeatsPicker
         open={picking}
         onOpenChange={setPicking}
-        hosts={hosts}
-        host={host || hosts[0] || ""}
-        onHost={(next) => {
-          setHost(next)
-          setPicked([])
-          setSeats({})
-        }}
         writers={writers}
-        seated={seated}
+        refusalFor={refusalFor}
         picked={picked}
-        onToggle={(id) =>
-          setPicked((held) => {
-            if (held.includes(id)) return held.filter((one) => one !== id)
-            if (held.length >= MOST) return held
-            return [...held, id]
-          })
-        }
+        onToggle={toggle}
       />
     </div>
   )
 }
 
-/**
- * The seats a room is made of: the bots of one Host, a check per seat, and the rule the Host keeps.
- *
- * One Host at a time, because a roster is one Host's profiles (ADR 0115): a device that holds two
- * writable Hosts picks which first. The most is a ceiling rather than a refusal — the seventh tap
- * does nothing — so the rule is felt while picking and not only said after.
- */
+/** No Host picker: a roster is one Host's profiles (ADR 0115), so the first seat names the Host. */
 function SeatsPicker({
   open,
   onOpenChange,
-  hosts,
-  host,
-  onHost,
   writers,
-  seated,
+  refusalFor,
   picked,
   onToggle,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
-  hosts: string[]
-  host: string
-  onHost: (host: string) => void
   writers: Profile[]
-  seated: Profile[]
+  refusalFor: (bot: Profile) => Refusal | null
   picked: string[]
   onToggle: (id: string) => void
 }) {
-  const nameOf = (key: string) => {
-    const bot = writers.find((one) => connectionKey(one) === key)
-    try {
-      return bot ? new URL(bot.baseUrl).host : key
-    } catch {
-      return bot?.baseUrl ?? key
-    }
-  }
   return (
     <Popup open={open} onOpenChange={onOpenChange}>
-      <PopupContent className="max-h-[90dvh]">
-        <PopupHeader>
+      <PopupContent className="max-h-[90dvh]" toastAbove>
+        <PopupHeader className="pb-2">
           <PopupTitle>Room bots</PopupTitle>
-          {/* The rule sits with the title, so the body is the choice and the one button that ends it. */}
+        </PopupHeader>
+        <div className="flex flex-col gap-4 px-4 pb-4 sm:px-6">
           <p className="text-sm text-muted-foreground">
             Two to six bots of one Host. Who a room holds is fixed when it is made: changing its
             members means making a new room.
           </p>
-        </PopupHeader>
-        <div className="flex flex-col gap-4 px-6 pb-6">
-          {hosts.length > 1 && (
-            <div className="flex flex-wrap gap-2">
-              {hosts.map((key) => (
-                <Button
-                  key={key}
-                  size="sm"
-                  variant={key === host ? "default" : "outline"}
-                  onClick={() => onHost(key)}
-                >
-                  {nameOf(key)}
-                </Button>
-              ))}
-            </div>
-          )}
           {/* The seats are a card of rows, the way Settings lists bots, so picking two reads as the
               same act as reading them there. */}
           <Group>
-            {seated.map((bot) => (
+            {writers.map((bot) => (
               <SeatRow
                 key={bot.id}
                 bot={bot}
                 checked={picked.includes(bot.id)}
-                full={!picked.includes(bot.id) && picked.length >= MOST}
+                refusal={refusalFor(bot)}
                 onToggle={() => onToggle(bot.id)}
               />
             ))}
@@ -284,27 +271,33 @@ function SeatsPicker({
 function SeatRow({
   bot,
   checked,
-  full,
+  refusal,
   onToggle,
 }: {
   bot: Profile
   checked: boolean
-  /** The room already holds the most it may, so this seat says so rather than doing nothing silently. */
-  full: boolean
+  refusal: Refusal | null
   onToggle: () => void
 }) {
-  const info = useModelInfo(bot)
+  // A row that can never be seated this time reads no model: its Host would be asked for one nothing
+  // on this screen can use.
+  const info = useModelInfo(refusal?.kind === "host" ? null : bot)
   const choice = botModel(bot, info)
   return (
     <button
       type="button"
       aria-pressed={checked}
+      // Never `disabled` for another Host's row: that would swallow the press the sentence answers.
+      aria-disabled={refusal ? "true" : undefined}
       data-bot={bot.id}
-      disabled={full}
+      disabled={refusal?.kind === "full"}
       onClick={onToggle}
       className={cn(
         linkRowClass,
-        "disabled:cursor-not-allowed disabled:opacity-40",
+        refusal?.kind === "full" && "cursor-not-allowed",
+        // A row that still answers a press keeps the pointer, so cursor and press tell one story.
+        refusal?.kind === "host" && "cursor-pointer",
+        refusal && "opacity-40",
         checked && "bg-muted",
       )}
     >
