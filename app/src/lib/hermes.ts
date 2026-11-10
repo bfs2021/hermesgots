@@ -34,6 +34,7 @@ import { promptEntry } from "@/lib/run-prompt"
 import type { CronSchedule } from "@/lib/schedule"
 import { readStt, type SttValue } from "@/lib/stt-settings"
 import { readGeneral } from "@/lib/general-settings"
+import { readLlmProviders, type LlmEndpointBody } from "@/lib/llm-providers"
 import {
   parseMcpAccess,
   readMcpAccessOffer,
@@ -1344,6 +1345,101 @@ export async function setSttSetting(
     signal,
   })
   return readStt(((await response.json())?.stt ?? null) as unknown)
+}
+
+/**
+ * The API-key providers and custom endpoints this bot's Hermes holds, each key as the host masked
+ * it (`llm_providers.py`): one read for the page, and every write answers this same block again.
+ * Nothing here asks for a key, and nothing builds a mask — the string drawn is the host's own.
+ */
+export async function getLlmProviders(config: HermesConfig, signal?: AbortSignal) {
+  const response = await request(`${pluginRoot(config.baseUrl)}/llm-providers`, {
+    headers: headers(config),
+    signal,
+  })
+  return readLlmProviders(((await response.json())?.llm ?? null) as unknown)
+}
+
+/**
+ * Replaces one key — a provider's catalog slug, or an endpoint's `custom:<id>` — with the key the
+ * user typed, and answers the fresh block, which is the only way the page learns the new mask. The
+ * host refuses a body whose key is a mask, and its sentence is what the screen shows. The key is
+ * never logged here: it rides the request body and nothing else.
+ */
+export async function setLlmProviderKey(
+  config: HermesConfig,
+  target: string,
+  key: string,
+  signal?: AbortSignal,
+) {
+  const response = await request(`${pluginRoot(config.baseUrl)}/llm-providers/key`, {
+    method: "POST",
+    headers: headers(config),
+    body: JSON.stringify({ target, key }),
+    signal,
+  })
+  return readLlmProviders(((await response.json())?.llm ?? null) as unknown)
+}
+
+/**
+ * Removes one provider's key — the slug the row names, which rides the address alone — and answers
+ * the fresh block, where that row is *Not set*. There is no body, because a removal has no key in it
+ * to send: nothing here holds, builds or compares one.
+ */
+export async function removeLlmProviderKey(
+  config: HermesConfig,
+  target: string,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `${pluginRoot(config.baseUrl)}/llm-providers/key/${encodeURIComponent(target)}`,
+    { method: "DELETE", headers: headers(config), signal },
+  )
+  return readLlmProviders(((await response.json())?.llm ?? null) as unknown)
+}
+
+/**
+ * Writes one custom endpoint — the whole shape of a new one, or the fields an existing one changed —
+ * and answers the block with the row as the write left it, which is how the page learns the id the
+ * host slugged, the fields it now holds and the mask it made of the key. `id` is what makes the write
+ * an edit: the host then patches that entry and keeps every field the body doesn't carry, which is
+ * why the form sends only what changed. The host validates the URL, writes `providers.<id>` and puts
+ * the key in `.env` behind the entry's `key_env`; its refusal (a URL with no host, a name an endpoint
+ * already carries) is the sentence the screen shows. The key is never logged here: it rides the
+ * request body and nothing else.
+ */
+export async function saveLlmEndpoint(
+  config: HermesConfig,
+  body: LlmEndpointBody,
+  signal?: AbortSignal,
+) {
+  const response = await request(`${pluginRoot(config.baseUrl)}/llm-providers/endpoints`, {
+    method: "POST",
+    headers: headers(config),
+    // The body as the form built it: the id where it edits, the fields that changed, and a key only
+    // where one was typed. Nothing is added here that a form didn't hold.
+    body: JSON.stringify(body),
+    signal,
+  })
+  return readLlmProviders(((await response.json())?.llm ?? null) as unknown)
+}
+
+/**
+ * Removes one custom endpoint — the endpoint and the key it was given, together — and answers the
+ * fresh block, which no longer holds that row. The endpoint's id rides the address alone: there is
+ * no body, and nothing here ever held the key. The host refuses the endpoint its model runs on, in
+ * its own sentence ("switch the model first"), which is what the screen shows.
+ */
+export async function removeLlmEndpoint(
+  config: HermesConfig,
+  target: string,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `${pluginRoot(config.baseUrl)}/llm-providers/endpoints/${encodeURIComponent(target)}`,
+    { method: "DELETE", headers: headers(config), signal },
+  )
+  return readLlmProviders(((await response.json())?.llm ?? null) as unknown)
 }
 
 // `/delegation` is the subagent model's own route, so the tab's path is separate.
