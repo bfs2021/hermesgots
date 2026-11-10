@@ -18,6 +18,7 @@ import {
   useCanvasConsent,
 } from "@/components/canvas-consent"
 import { CanvasPointsProvider, type CanvasPoints } from "@/components/chat/canvas-points"
+import { ChatHeader } from "@/components/chat/chat-header"
 import { useChatSurface } from "@/components/chat/chat-actions"
 import { BotPicker } from "@/components/chat/bot-picker"
 import { PreviewerProvider } from "@/components/chat/previewer"
@@ -58,6 +59,7 @@ import {
   type CanvasChanges,
 } from "@/lib/canvases"
 import { db, getActiveProfile } from "@/lib/db"
+import { HEADER_BUTTON } from "@/lib/layout"
 import type { CanvasPoint } from "@/lib/point-marker"
 import { hostAnswered } from "@/lib/hermes"
 import { useLarge } from "@/lib/media"
@@ -513,13 +515,11 @@ export function CanvasView() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <header className="flex items-center gap-3 px-4 pt-[max(0.75rem,env(safe-area-inset-top))] pb-3">
-        <BackButton label="All canvases" variant="ghost" onClick={() => up("/canvas")} />
-        <div className="flex min-w-0 flex-1 flex-col">
-          <h1 className="truncate font-semibold tracking-tight">{canvas?.title ?? "Canvas"}</h1>
-          {/* A place's header, as a coding session's is: the name over the one line that says where
-              the reader is — whose canvas it is, and which version of it. */}
-          <p className="flex min-w-0 items-center gap-1.5 text-[11px] leading-tight text-muted-foreground">
+      <ChatHeader
+        className="relative pb-2"
+        title={canvas?.title ?? "Canvas"}
+        subtitle={
+          <>
             {profile && <span className="truncate">{profile.name}</span>}
             {canvas?.version ? (
               <>
@@ -535,34 +535,39 @@ export function CanvasView() {
                 </span>
               </>
             ) : null}
-          </p>
-        </div>
-        {canvas?.canUndo && !awayNow ? (
-          <Button
-            variant="ghost"
-            size="icon-lg"
-            className="size-11 rounded-full"
-            aria-label="Undo"
-            disabled={undoing}
-            onClick={() => void undo()}
-          >
-            <Undo2Icon />
-          </Button>
-        ) : null}
-        {/* The menu is the row's last control, so the one button that opens a sheet is always where a
-            hand reaches for it, whatever else the canvas offers today. */}
-        {canvas ? (
-          <Button
-            variant="ghost"
-            size="icon-lg"
-            className="size-11 rounded-full"
-            aria-label="Canvas options"
-            onClick={() => setOptionsOpen(true)}
-          >
-            <EllipsisIcon />
-          </Button>
-        ) : null}
-      </header>
+          </>
+        }
+        showBot={false}
+        heading
+        leading={<BackButton label="All canvases" onClick={() => up("/canvas")} />}
+        actions={
+          <>
+            {canvas?.canUndo && !awayNow ? (
+              <Button
+                variant="outline"
+                size="icon-lg"
+                className={HEADER_BUTTON}
+                aria-label="Undo"
+                disabled={undoing}
+                onClick={() => void undo()}
+              >
+                <Undo2Icon />
+              </Button>
+            ) : null}
+            {canvas ? (
+              <Button
+                variant="outline"
+                size="icon-lg"
+                className={HEADER_BUTTON}
+                aria-label="Canvas options"
+                onClick={() => setOptionsOpen(true)}
+              >
+                <EllipsisIcon />
+              </Button>
+            ) : null}
+          </>
+        }
+      />
 
       <div className="flex min-h-0 flex-1">
         <div className="relative min-h-0 flex-1 px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
