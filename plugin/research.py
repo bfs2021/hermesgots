@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import html
+import ipaddress
 import json
 import logging
 import re
@@ -1926,6 +1927,136 @@ def decide(options: List[Dict[str, Any]], criteria: List[Dict[str, Any]], memo: 
         "leader": eligible[0]["option"] if judged and eligible else None,
         "margin": margin if judged else None,
         "close": judged and margin is not None and margin <= CLOSE_POINTS,
+    }
+
+
+# Second-level labels under a two-letter TLD that a site registers beneath (bbc.co.uk, not co.uk).
+GENERIC_SECOND = {"co", "com", "org", "net", "gov", "ac", "edu", "gob", "mil", "nic", "ltd", "plc", "sch", "nhs"}
+# A verification's labels, from its parts' stances.
+VERDICT_LABELS = ("supported", "partly_supported", "disputed", "not_supported", "refuted", "cant_tell", "thin")
+
+
+def registrable_domain(url: str) -> str:
+    """The site a page belongs to, by a rule that under-counts rather than over-counts: the last two
+    labels of the host, or three under a two-letter TLD with a generic second level. An IP is its
+    own site."""
+    try:
+        host = (urllib.parse.urlsplit(url or "").hostname or "").rstrip(".")
+    except ValueError:
+        host = ""
+    if not host:
+        return (url or "").strip().lower()
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    if host.startswith("www."):
+        host = host[4:]
+    labels = host.split(".")
+    keep = 3 if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in GENERIC_SECOND else 2
+    return ".".join(labels[-keep:])
+
+
+def _part_stance(s: int, r: int, bearing: bool) -> Tuple[str, Optional[str]]:
+    if s and r:
+        return "disputed", None
+    if s >= 2:
+        return "supported", None
+    if r >= 2:
+        return "refuted", None
+    if s == 1:
+        return "thin", "supports"
+    if r == 1:
+        return "thin", "refutes"
+    return ("cant_tell", None) if bearing else ("not_supported", None)
+
+
+def _label(stances: List[str]) -> str:
+    if "refuted" in stances:
+        return "refuted"
+    if "disputed" in stances:
+        return "disputed"
+    if all(stance == "supported" for stance in stances):
+        return "supported"
+    if "supported" in stances:
+        return "partly_supported"
+    if "thin" in stances:
+        return "thin"
+    if all(stance == "not_supported" for stance in stances):
+        return "not_supported"
+    return "cant_tell"
+
+
+def _why(label: str, parts: List[Dict[str, Any]]) -> str:
+    """One plain sentence of why, from the label and the parts' stances, never from a model."""
+    total = len(parts)
+
+    def of(stance: str) -> str:
+        count = sum(part["stance"] == stance for part in parts)
+        return "it" if total == 1 else f"{count} of {total} parts"
+
+    if label == "supported":
+        return ("Two or more independent sources back it and none refute it." if total == 1
+                else f"Two or more independent sources back all {total} parts and none refute them.")
+    if label == "partly_supported":
+        return f"Two or more independent sources back {of('supported')}, but not the rest."
+    if label == "disputed":
+        return f"Independent sources disagree on {of('disputed')}."
+    if label == "refuted":
+        return f"Two or more independent sources refute {of('refuted')}, with none backing that."
+    if label == "thin":
+        leans = {part["direction"] for part in parts if part["stance"] == "thin"}
+        if leans == {"supports"}:
+            return "Only one source bears on it, and it leans toward support."
+        if leans == {"refutes"}:
+            return "Only one source bears on it, and it leans against."
+        return "Only single sources bear on it, and they lean different ways."
+    if label == "not_supported":
+        return "No evidence was found for or against it."
+    return "Evidence was found, but none of it takes a side."
+
+
+def verdict(parts: List[Dict[str, Any]], ledger: Dict[str, Any], tags: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """A verification's verdict, by code and never by a model. A claim counts for a side on a part
+    only when it is verified and both the researcher and the judge put it on that side; sides are
+    counted in independent sites; each part takes a stance and the claim its label by a fixed
+    precedence."""
+    domains = {source["id"]: registrable_domain(source.get("url") or "") for source in ledger.get("sources") or []}
+    claims = {claim["id"]: claim for claim in ledger.get("claims") or []}
+    judged: Dict[Tuple[str, str], set] = {}
+    for tag in tags or []:
+        if tag.get("claim") in claims:
+            judged.setdefault((tag["claim"], tag.get("part")), set()).add(tag.get("stance"))
+    rows = []
+    sites: set = set()
+    for part in parts:
+        pid = part["id"]
+        bearing = any(claim.get("part") == pid for claim in claims.values()) or any(key[1] == pid for key in judged)
+        sides: Dict[str, List[str]] = {"supports": [], "refutes": []}
+        for claim in claims.values():
+            stance = claim.get("stance")
+            if (
+                claim.get("confidence") == "supported"
+                and claim.get("part") == pid
+                and stance in sides
+                and judged.get((claim["id"], pid)) == {stance}
+            ):
+                sides[stance].append(claim["id"])
+        found = {side: {domains.get(claims[cid]["source"], "") for cid in ids} for side, ids in sides.items()}
+        sites |= found["supports"] | found["refutes"]
+        s, r = len(found["supports"]), len(found["refutes"])
+        stance, direction = _part_stance(s, r, bearing)
+        rows.append(
+            {"part": pid, "stance": stance, "direction": direction, "supporting": s, "refuting": r,
+             "for": sides["supports"], "against": sides["refutes"]}
+        )
+    label = _label([row["stance"] for row in rows])
+    return {
+        "label": label,
+        "why": _why(label, rows),
+        "parts": rows,
+        "sources": len(sites),
+        "leads": sum(claim.get("confidence") == "uncertain" for claim in claims.values()),
     }
 
 
