@@ -76,6 +76,8 @@ SOURCE_NAMES = {
     "forums": "forums",
 }
 SESSION_PREFIX = "research-"
+# The name of a mission's lane when its type has only one: its session is research-<mission>.
+ONE_LANE = ""
 MAX_INPUT = 2000
 MAX_GOAL = 600
 MAX_AUDIENCE = 160
@@ -466,7 +468,6 @@ def _approve_learn_scope(path: Path, found: Dict[str, Any], body: Dict[str, Any]
         stage="reading",
         busy=None,
         error=None,
-        run_id=None,
     )
     return mission(path, mission_id)  # type: ignore[return-value]
 
@@ -495,12 +496,14 @@ def _approve_compare_scope(path: Path, found: Dict[str, Any], body: Dict[str, An
     _clear(path, mission_id)
     _update(
         path, mission_id, source_kinds=list(dict.fromkeys(kinds)), judge=judge, stage="reading", busy=None,
-        error=None, run_id=None,
+        error=None,
     )
     return mission(path, mission_id)  # type: ignore[return-value]
 
 
-RESEARCH_TABLES = ("research_sources", "research_claims", "research_outputs", "research_revisions")
+RESEARCH_TABLES = (
+    "research_sources", "research_claims", "research_outputs", "research_revisions", "research_runs",
+)
 
 
 def _clear(path: Path, mission_id: str) -> None:
@@ -564,8 +567,8 @@ def followup(path: Path, mission_id: str, body: Dict[str, Any]) -> Dict[str, Any
         stage="reading",
         busy=None,
         error=None,
-        run_id=None,
     )
+    _clear_runs(path, mission_id)
     return mission(path, mission_id)  # type: ignore[return-value]
 
 
@@ -627,6 +630,7 @@ def remove(path: Path, mission_id: str) -> Optional[Dict[str, Any]]:
     found = mission(path, mission_id)
     if found is None:
         return None
+    runs = runs_of(path, mission_id)
     conn = _open(path)
     try:
         row = _row(conn, mission_id)
@@ -637,13 +641,35 @@ def remove(path: Path, mission_id: str) -> Optional[Dict[str, Any]]:
         conn.close()
     _forget(path, mission_id)
     events.note("research", mission_id, path, True)
-    found["run_id"] = row["run_id"] if row is not None else None
+    found["runs"] = runs
     found["profile"] = row["profile"] if row is not None else None
     return found
 
 
-def set_run(path: Path, mission_id: str, run_id: Optional[str], error: Optional[str] = None) -> None:
-    _update(path, mission_id, run_id=run_id, error=error)
+def set_run(
+    path: Path, mission_id: str, run_id: Optional[str], error: Optional[str] = None, lane: str = ONE_LANE
+) -> None:
+    """Keeps the run a lane was started on, or forgets it (None), with the mission's error."""
+    conn = _open(path)
+    try:
+        if run_id is None:
+            conn.execute("DELETE FROM research_runs WHERE mission_id = ? AND lane = ?", (mission_id, lane))
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO research_runs (mission_id, lane, run_id) VALUES (?, ?, ?)",
+                (mission_id, lane, run_id),
+            )
+    finally:
+        conn.close()
+    _update(path, mission_id, error=error)
+
+
+def _clear_runs(path: Path, mission_id: str) -> None:
+    conn = _open(path)
+    try:
+        conn.execute("DELETE FROM research_runs WHERE mission_id = ?", (mission_id,))
+    finally:
+        conn.close()
 
 
 def retry(path: Path, mission_id: str) -> Dict[str, Any]:
@@ -671,11 +697,15 @@ def profile_of(path: Path, mission_id: str) -> Optional[str]:
         conn.close()
 
 
-def run_id_of(path: Path, mission_id: str) -> Optional[str]:
+def runs_of(path: Path, mission_id: str) -> Dict[str, str]:
+    """The run each of the mission's lanes was started on, by lane; a lane still being started
+    has none."""
     conn = _open(path)
     try:
-        row = _row(conn, mission_id)
-        return row["run_id"] if row is not None else None
+        return {
+            row["lane"]: row["run_id"]
+            for row in conn.execute("SELECT lane, run_id FROM research_runs WHERE mission_id = ?", (mission_id,))
+        }
     finally:
         conn.close()
 
@@ -912,8 +942,9 @@ def _compare_prompt(found: Dict[str, Any]) -> str:
     )
 
 
-def researcher_prompt(found: Dict[str, Any]) -> str:
-    return type_of(found).prompt(found)
+def researcher_prompt(found: Dict[str, Any], lane: Optional["Lane"] = None) -> str:
+    """What a lane's researcher is asked; with no lane named, the type's first."""
+    return (lane or lanes(found)[0]).prompt(found)
 
 
 def _learn_prompt(found: Dict[str, Any]) -> str:
@@ -937,18 +968,34 @@ def _learn_prompt(found: Dict[str, Any]) -> str:
     )
 
 
-def run_body(found: Dict[str, Any]) -> Dict[str, Any]:
+def run_body(found: Dict[str, Any], lane: Optional["Lane"] = None) -> Dict[str, Any]:
+    """The run a lane's researcher is started with; with no lane named, the type's first."""
+    lane = lane or lanes(found)[0]
     return {
-        "session_id": f"{SESSION_PREFIX}{found['id']}",
-        "instructions": type_of(found).instructions,
-        "input": [{"role": "user", "content": researcher_prompt(found)}],
+        "session_id": session_of(found["id"], lane.name),
+        "instructions": lane.instructions,
+        "input": [{"role": "user", "content": researcher_prompt(found, lane)}],
     }
 
 
-def mission_of_session(session_id: Optional[str]) -> Optional[str]:
+def session_of(mission_id: str, lane: str) -> str:
+    """A lane's Hermes session: ``research-<mission>``, and ``-<lane>`` after it for a named lane."""
+    return f"{SESSION_PREFIX}{mission_id}-{lane}" if lane else f"{SESSION_PREFIX}{mission_id}"
+
+
+def lane_of_session(session_id: Optional[str]) -> Optional[Tuple[str, str]]:
+    """The mission and the lane a researcher's session belongs to, or None for any other session.
+    A mission's id has no hyphen, so the first one after it starts the lane's name."""
     if isinstance(session_id, str) and session_id.startswith(SESSION_PREFIX):
-        return session_id[len(SESSION_PREFIX) :]
+        mission_id, _, lane = session_id[len(SESSION_PREFIX) :].partition("-")
+        if mission_id:
+            return mission_id, lane
     return None
+
+
+def mission_of_session(session_id: Optional[str]) -> Optional[str]:
+    found = lane_of_session(session_id)
+    return found[0] if found else None
 
 
 _page_lock = threading.Lock()
@@ -1792,6 +1839,16 @@ def _draft_compare(path: Path, found: Dict[str, Any]) -> None:
 
 
 @dataclass(frozen=True)
+class Lane:
+    """One researcher of a mission: its session (named by the lane), what it is told and what it is
+    asked. Its run, and how that run ended, are kept per lane by the store and the watcher."""
+
+    name: str
+    instructions: str
+    prompt: Callable[[Dict[str, Any]], str]
+
+
+@dataclass(frozen=True)
 class MissionType:
     """What one type of mission does at each step the shared paths take. A refusal is the
     sentence a delivered mission of the type is refused with, or None where the type allows it."""
@@ -1803,8 +1860,7 @@ class MissionType:
     approve_scope: Callable[[Path, Dict[str, Any], Dict[str, Any]], Dict[str, Any]]
     # Whether the Scope Gate's outline comes from a model call, which a retry there runs again.
     outline_call: bool
-    instructions: str
-    prompt: Callable[[Dict[str, Any]], str]
+    lanes: Tuple[Lane, ...]
     # The option and criterion a claim bears on, checked against the mission.
     bearing: Callable[[Any, Dict[str, Any]], Tuple[Optional[str], Optional[str]]]
     min_claims: Callable[[Dict[str, Any]], int]
@@ -1824,8 +1880,7 @@ MISSION_TYPES: Dict[str, MissionType] = {
         brief_text=_learn_brief_text,
         approve_scope=_approve_learn_scope,
         outline_call=True,
-        instructions=RESEARCHER_INSTRUCTIONS,
-        prompt=_learn_prompt,
+        lanes=(Lane(ONE_LANE, RESEARCHER_INSTRUCTIONS, _learn_prompt),),
         bearing=_no_bearing,
         min_claims=lambda found: MIN_CLAIMS,
         draft=_draft_learn,
@@ -1838,8 +1893,7 @@ MISSION_TYPES: Dict[str, MissionType] = {
         brief_text=_compare_brief_text,
         approve_scope=_approve_compare_scope,
         outline_call=False,
-        instructions=COMPARE_RESEARCHER_INSTRUCTIONS,
-        prompt=_compare_prompt,
+        lanes=(Lane(ONE_LANE, COMPARE_RESEARCHER_INSTRUCTIONS, _compare_prompt),),
         bearing=_compare_bearing,
         min_claims=lambda found: max(MIN_CLAIMS, 2 * len(found["options"])),
         draft=_draft_compare,
@@ -1855,6 +1909,10 @@ MISSION_TYPES: Dict[str, MissionType] = {
 
 def type_of(found: Any) -> MissionType:
     return MISSION_TYPES[found["type"]]
+
+
+def lanes(found: Any) -> Tuple[Lane, ...]:
+    return type_of(found).lanes
 
 
 def _refuse(reason: Optional[str]) -> None:
@@ -1987,12 +2045,15 @@ def _run_status(run_id: Optional[str]) -> Optional[str]:
     return status.get("status") if isinstance(status, dict) else None
 
 
-def _record_researcher(path: Path, mission_id: str) -> None:
-    """Notes the model the researcher ran on, from its Hermes session once it has stopped. Best
-    effort: a session the store can't be read for leaves the mission without one."""
+def _record_researcher(path: Path, found: Dict[str, Any]) -> None:
+    """Notes the model the researcher ran on, from its lanes' Hermes sessions once they stopped
+    (the first lane whose session names one). Best effort: a session the store can't be read for
+    leaves the mission without one."""
+    mission_id = found["id"]
     state = home_of(path) / "state.db"
     if not state.exists():
         return
+    row = None
     try:
         # Read-only, so a lookup can never lock the gateway out of its own store.
         with sqlite3.connect(f"{state.as_uri()}?mode=ro", uri=True, timeout=2) as conn:
@@ -2000,10 +2061,13 @@ def _record_researcher(path: Path, mission_id: str) -> None:
             if "model" not in columns:
                 return
             provider = "billing_provider" if "billing_provider" in columns else "NULL"
-            row = conn.execute(
-                f"SELECT model, {provider} FROM sessions WHERE id = ?",
-                (f"{SESSION_PREFIX}{mission_id}",),
-            ).fetchone()
+            for lane in lanes(found):
+                row = conn.execute(
+                    f"SELECT model, {provider} FROM sessions WHERE id = ?",
+                    (session_of(mission_id, lane.name),),
+                ).fetchone()
+                if row and row[0]:
+                    break
     except sqlite3.Error:
         logger.debug("gots: couldn't read mission %s's researcher", mission_id, exc_info=True)
         return
@@ -2035,7 +2099,7 @@ def finished_reading(path: Path, mission_id: str, status: Optional[str]) -> bool
         _update(path, mission_id, error=reason)
         _tell(path, "research_failed", mission_id, found["title"])
         return True
-    _record_researcher(path, mission_id)
+    _record_researcher(path, found)
     # A follow-up round's write-up stays on show until drafting starts it again.
     _update(path, mission_id, stage="drafting", **({} if found["pending"] else {"written": 0}))
     return True
@@ -2050,20 +2114,34 @@ def _check_watched() -> List[Tuple[Path, str, Optional[str]]]:
         if found is None or found["stage"] != "reading" or found["error"]:
             _forget(path, mission_id)
             continue
-        run_id = run_id_of(path, mission_id)
-        if run_id is None:
+        runs = runs_of(path, mission_id)
+        if any(lane.name not in runs for lane in lanes(found)):
             # Still being started.
             continue
-        status = _run_status(run_id)
-        if status in ACTIVE:
-            _seen.add(run_id)
-        elif status is None and run_id not in _seen and time.monotonic() - since < UNSEEN_GRACE_S:
+        statuses = {run_id: _run_status(run_id) for run_id in runs.values()}
+        for run_id, status in statuses.items():
+            if status in ACTIVE:
+                _seen.add(run_id)
+        unseen = any(status is None and run_id not in _seen for run_id, status in statuses.items())
+        if unseen and time.monotonic() - since < UNSEEN_GRACE_S:
             continue
-        if finished_reading(path, mission_id, status):
+        if finished_reading(path, mission_id, _reading_status(list(statuses.values()))):
             _forget(path, mission_id)
-            _seen.discard(run_id)
+            _seen.difference_update(runs.values())
             moved.append((path, mission_id, profile))
     return moved
+
+
+def _reading_status(statuses: List[Optional[str]]) -> Optional[str]:
+    """How a reading went, from how each lane's run went: going while any lane's run is, and
+    stopped short where any lane's stopped short."""
+    for status in statuses:
+        if status in ACTIVE:
+            return status
+    for status in statuses:
+        if status in ("failed", "cancelled", "interrupted"):
+            return status
+    return statuses[0] if statuses else None
 
 
 async def run(home: Path) -> None:

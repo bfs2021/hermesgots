@@ -5,14 +5,19 @@ Run: python3 -m unittest plugin.tests.test_research -v
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
+import plugin
 from plugin import research
+from plugin.store import db_path
+from plugin.tests._helpers import FakeWeb, RouteAdapter, route, temp_hermes_home, wire
 
 PAGE = (
     "<html><head><style>p{}</style><script>var x = 1</script></head><body>"
@@ -596,6 +601,137 @@ class CompareTest(unittest.TestCase):
         prompt = research.researcher_prompt(research.mission(self.path, self.mission["id"]))
         self.assertIn("o1: Bun", prompt)
         self.assertIn("k1: Speed (weight 5 of 5)", prompt)
+
+
+class ResearcherRunTest(unittest.TestCase):
+    """The researcher's run as the routes start, retry and stop it, and as the watcher follows it
+    across a store upgrade."""
+
+    def setUp(self) -> None:
+        self.home = temp_hermes_home(self)
+        self.path = db_path(self.home)
+        self.adapter = RouteAdapter()
+        self.adapter._run_statuses = {}
+        json_response = mock.patch.object(
+            FakeWeb, "json_response", staticmethod(lambda payload, status=200: SimpleNamespace(status=status, payload=payload))
+        )
+        json_response.start()
+        self.addCleanup(json_response.stop)
+        self.app = wire(self, self.adapter)
+        self.addCleanup(setattr, research, "adapter", None)
+        self.addCleanup(setattr, research, "ctx", None)
+        self.llm = FakeLlm()
+        research.ctx = SimpleNamespace(llm=self.llm)
+        notify = mock.patch.object(research.push, "notify")
+        notify.start()
+        self.addCleanup(notify.stop)
+        self.posts: list = []
+        self.runs = iter(["run_1", "run_2", "run_3"])
+
+        async def post(_adapter, _profile, url, body, authorization=None):
+            self.posts.append((url, body))
+            return {"run_id": next(self.runs)} if url == "/v1/runs" else {}
+
+        posting = mock.patch.object(plugin.outbox, "post", post)
+        posting.start()
+        self.addCleanup(posting.stop)
+
+    def tearDown(self) -> None:
+        research._forget(self.path, getattr(self, "mission", {}).get("id", ""))
+
+    claim = MissionTest.claim
+
+    def ask(self, action: str, body: Optional[dict] = None):
+        request = FakeWeb.Request()
+        request.headers = {}
+        request.match_info = {"mission_id": self.mission["id"]}
+
+        async def read():
+            return body or {}
+
+        request.json = read
+        handler = route(self.app, f"{plugin.PREFIX}/research/{{mission_id}}/{action}")
+        return asyncio.run(handler(request))
+
+    def reach_scope(self) -> None:
+        self.mission = research.create(self.path, None, "explain transformers")
+        research._job(self.path, self.mission["id"])
+        research.confirm_brief(
+            self.path, self.mission["id"], {"goal": "G", "audience": "A developer", "format": "guide", "depth": "overview"}
+        )
+        research._job(self.path, self.mission["id"])
+
+    def start(self) -> None:
+        self.reach_scope()
+        answer = self.ask("start", {"outline": ["Why attention", "Many heads"], "source_kinds": ["papers"]})
+        self.assertEqual(answer.status, 200)
+
+    def three_claims(self) -> None:
+        for snippet in ("based solely on attention mechanisms", "dispensing with recurrence and convolutions", "Multi-head attention allows the model"):
+            self.claim(snippet)
+
+    def moved(self) -> list:
+        return [mission_id for _p, mission_id, _r in research._check_watched()]
+
+    def test_start_posts_one_run_on_the_missions_session(self) -> None:
+        self.start()
+        self.assertEqual([url for url, _body in self.posts], ["/v1/runs"])
+        self.assertEqual(self.posts[0][1]["session_id"], f"research-{self.mission['id']}")
+        self.three_claims()
+        # The watcher follows the run the start was answered with.
+        self.adapter._run_statuses["run_1"] = {"run_id": "run_1", "status": "running"}
+        self.assertEqual(self.moved(), [])
+        self.adapter._run_statuses["run_1"]["status"] = "completed"
+        self.assertEqual(self.moved(), [self.mission["id"]])
+        self.assertEqual(research.mission(self.path, self.mission["id"])["stage"], "drafting")
+
+    def test_retrying_a_failed_reading_posts_it_again_on_the_same_session(self) -> None:
+        self.start()
+        self.claim("based solely on attention mechanisms")
+        research.finished_reading(self.path, self.mission["id"], "completed")
+        self.assertIn("too few sources", research.mission(self.path, self.mission["id"])["error"])
+        self.assertEqual(self.ask("retry").status, 200)
+        self.assertEqual([url for url, _body in self.posts], ["/v1/runs", "/v1/runs"])
+        self.assertEqual(self.posts[1][1]["session_id"], f"research-{self.mission['id']}")
+        self.claim("dispensing with recurrence and convolutions")
+        self.claim("Multi-head attention allows the model")
+        # The retried run is the one followed, not the one that ended.
+        self.adapter._run_statuses["run_1"] = {"run_id": "run_1", "status": "completed"}
+        self.adapter._run_statuses["run_2"] = {"run_id": "run_2", "status": "running"}
+        self.assertEqual(self.moved(), [])
+        self.adapter._run_statuses["run_2"]["status"] = "completed"
+        self.assertEqual(self.moved(), [self.mission["id"]])
+
+    def test_removing_a_mission_stops_its_active_run(self) -> None:
+        self.start()
+        self.adapter._run_statuses["run_1"] = {"run_id": "run_1", "status": "running"}
+        self.assertEqual(self.ask("remove").payload, {"object": "gots.research.removed", "removed": True})
+        self.assertEqual([url for url, _body in self.posts], ["/v1/runs", "/v1/runs/run_1/stop"])
+        self.assertIsNone(research.mission(self.path, self.mission["id"]))
+
+    def test_removing_a_mission_whose_run_ended_stops_nothing(self) -> None:
+        self.start()
+        self.adapter._run_statuses["run_1"] = {"run_id": "run_1", "status": "completed"}
+        self.ask("remove")
+        self.assertEqual([url for url, _body in self.posts], ["/v1/runs"])
+
+    def test_a_mission_mid_reading_at_the_old_schema_is_still_watched_after_the_upgrade(self) -> None:
+        self.reach_scope()
+        research.approve_scope(self.path, self.mission["id"], {"outline": ["Why attention"], "source_kinds": ["papers"]})
+        self.three_claims()
+        # The store as version 64 left it: the mission's one run on its own row.
+        conn = sqlite3.connect(self.path)
+        conn.execute("UPDATE research_missions SET run_id = 'run_old' WHERE id = ?", (self.mission["id"],))
+        conn.execute("DROP TABLE IF EXISTS research_runs")
+        conn.execute("PRAGMA user_version = 64")
+        conn.commit()
+        conn.close()
+        research.resume(self.path)
+        self.adapter._run_statuses["run_old"] = {"run_id": "run_old", "status": "running"}
+        self.assertEqual(self.moved(), [])
+        self.adapter._run_statuses["run_old"]["status"] = "completed"
+        self.assertEqual(self.moved(), [self.mission["id"]])
+        self.assertEqual(research.mission(self.path, self.mission["id"])["stage"], "drafting")
 
 
 if __name__ == "__main__":

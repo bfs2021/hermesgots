@@ -43,7 +43,9 @@ logger = logging.getLogger(__name__)
 # version or undo touches it. 62 adds the answers a canvas's page got for the tools its version
 # declared (`canvases.py`'s grants, ADR 0114) — one new table, and a pass over the names an earlier
 # build stored in `canvas_versions.tools` to drop the ones the rule refuses now.
-SCHEMA_VERSION = 64
+# 65 keeps a research mission's runs one per lane (`research.py`): one new table, and a mission's old
+# single run copied in as its one lane's, so a mission reading at the upgrade is still watched.
+SCHEMA_VERSION = 65
 
 
 def data_dir(hermes_home: Path) -> Path:
@@ -527,6 +529,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for column in ("option_id", "criterion_id"):
             if column not in claim_columns:
                 conn.execute(f"ALTER TABLE research_claims ADD COLUMN {column} TEXT")
+        # v65: a mission's runs, one per lane (research.py). A mission had one run on its own row
+        # before; that run is its one lane's, the lane named "" whose session is research-<id>.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS research_runs (
+                   mission_id TEXT NOT NULL,
+                   lane TEXT NOT NULL,
+                   run_id TEXT NOT NULL,
+                   PRIMARY KEY (mission_id, lane)
+               )"""
+        )
+        if version < 65:
+            conn.execute(
+                """INSERT OR IGNORE INTO research_runs (mission_id, lane, run_id)
+                   SELECT id, '', run_id FROM research_missions WHERE run_id IS NOT NULL"""
+            )
         # v32: the messages triage sent out of a Main thread, for its Moved markers (moves.py).
         # v33: a v32 store also had a thread_session column nothing read; it is rebuilt without it.
         move_columns = {row[1] for row in conn.execute("PRAGMA table_info(main_moves)")}

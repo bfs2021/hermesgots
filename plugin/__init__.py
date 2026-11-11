@@ -3472,29 +3472,33 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
         return await research_view(store_path(), request.match_info["mission_id"])
 
     async def start_researcher(request: "web.Request", path: Path, found: Dict[str, Any]) -> None:
-        """Starts the mission's researcher as an ordinary run, with the key the app asked with."""
+        """Starts each of the mission's lanes as an ordinary run, with the key the app asked with.
+        A lane that can't be started fails the mission and starts nothing after it."""
         profile = _request_profile()
         research.watch(path, found["id"], profile)
-        try:
-            started = await outbox.post(
-                adapter,
-                profile,
-                "/v1/runs",
-                research.run_body(found),
-                authorization=request.headers.get("Authorization"),
-            )
-        except outbox.StartError as error:
-            await asyncio.to_thread(
-                research.set_run, path, found["id"], None, f"Couldn't start the research: {error}"
-            )
-            return
-        run_id = started.get("run_id")
-        if isinstance(run_id, str) and run_id:
-            await asyncio.to_thread(research.set_run, path, found["id"], run_id)
-        else:
-            await asyncio.to_thread(
-                research.set_run, path, found["id"], None, "Hermes didn't start the research."
-            )
+        for lane in research.lanes(found):
+            try:
+                started = await outbox.post(
+                    adapter,
+                    profile,
+                    "/v1/runs",
+                    research.run_body(found, lane),
+                    authorization=request.headers.get("Authorization"),
+                )
+            except outbox.StartError as error:
+                await asyncio.to_thread(
+                    research.set_run, path, found["id"], None, f"Couldn't start the research: {error}",
+                    lane.name,
+                )
+                return
+            run_id = started.get("run_id")
+            if not (isinstance(run_id, str) and run_id):
+                await asyncio.to_thread(
+                    research.set_run, path, found["id"], None, "Hermes didn't start the research.",
+                    lane.name,
+                )
+                return
+            await asyncio.to_thread(research.set_run, path, found["id"], run_id, None, lane.name)
 
     async def research_brief(request: "web.Request") -> "web.Response":
         body = await json_body(request)
@@ -3572,12 +3576,14 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
         found = await asyncio.to_thread(research.remove, path, mission_id)
         if found is None:
             return _error(web, "No such mission.", 404)
-        if found.get("run_id") and research._run_status(found["run_id"]) in research.ACTIVE:
+        for run_id in found["runs"].values():
+            if research._run_status(run_id) not in research.ACTIVE:
+                continue
             try:
                 await outbox.post(
                     adapter,
                     _request_profile(),
-                    f"/v1/runs/{found['run_id']}/stop",
+                    f"/v1/runs/{run_id}/stop",
                     {},
                     authorization=request.headers.get("Authorization"),
                 )
