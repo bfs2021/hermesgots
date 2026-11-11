@@ -42,6 +42,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -53,7 +54,6 @@ logger = logging.getLogger(__name__)
 # The plugin context, kept by wire() so llm_gate can see whether the host offers ctx.llm.
 ctx: Any = None
 
-TYPES = ("learn", "compare")
 FORMATS = ("guide", "quiz", "glossary")
 # A comparison delivers one thing, the memo; there are no other formats to make.
 COMPARE_FORMAT = "memo"
@@ -251,8 +251,7 @@ def mission(path: Path, mission_id: str) -> Optional[Dict[str, Any]]:
                 "SELECT format, content FROM research_outputs WHERE mission_id = ?", (mission_id,)
             )
         }
-        if found["type"] == "compare":
-            found["decision"] = decide(found["options"], found["criteria"], found["outputs"].get(COMPARE_FORMAT))
+        found.update(type_of(found).derive(found))
         found["revisions"] = [
             {
                 "number": rev["number"],
@@ -313,7 +312,7 @@ def create(path: Path, profile: Optional[str], text: Any, kind: Any = "learn") -
     """A new mission at the brief, whose read-back is still being worked out."""
     text = _text(text, MAX_INPUT, "The question")
     kind = kind or "learn"
-    if kind not in TYPES:
+    if kind not in MISSION_TYPES:
         raise ResearchError("Only Learn & understand and Compare & decide missions can be started so far.")
     mission_id = f"r_{uuid.uuid4().hex[:16]}"
     now = _now()
@@ -326,7 +325,7 @@ def create(path: Path, profile: Optional[str], text: Any, kind: Any = "learn") -
                        ?, ?)""",
             (
                 mission_id, profile, kind, text, _title_from(text),
-                COMPARE_FORMAT if kind == "compare" else "guide", json.dumps(list(SOURCE_KINDS[:3])), now, now,
+                MISSION_TYPES[kind].default_format, json.dumps(list(SOURCE_KINDS[:3])), now, now,
             ),
         )
     finally:
@@ -353,8 +352,10 @@ def _need(path: Path, mission_id: str, stages: Tuple[str, ...]) -> Dict[str, Any
 def confirm_brief(path: Path, mission_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
     """The user's brief: the outline is proposed next, from it."""
     found = _need(path, mission_id, ("brief",))
-    if found["type"] == "compare":
-        return _confirm_compare_brief(path, mission_id, body)
+    return type_of(found).confirm_brief(path, mission_id, body)
+
+
+def _confirm_learn_brief(path: Path, mission_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
     fields = {
         "goal": _text(body.get("goal"), MAX_GOAL, "The goal"),
         "audience": _text(body.get("audience"), MAX_AUDIENCE, "The audience"),
@@ -440,8 +441,11 @@ def edit_brief(path: Path, mission_id: str) -> Dict[str, Any]:
 def approve_scope(path: Path, mission_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
     """The Scope Gate passed: clears any earlier reading and puts the mission at reading."""
     found = _need(path, mission_id, ("scope",))
-    if found["type"] == "compare":
-        return _approve_compare_scope(path, found, body)
+    return type_of(found).approve_scope(path, found, body)
+
+
+def _approve_learn_scope(path: Path, found: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    mission_id = found["id"]
     points = body.get("outline")
     if not isinstance(points, list):
         raise ResearchError("The outline is required.")
@@ -512,8 +516,7 @@ def _clear(path: Path, mission_id: str) -> None:
 def make_format(path: Path, mission_id: str, fmt: Any) -> Dict[str, Any]:
     """Another format from the same ledger: no new reading, only writing."""
     found = _need(path, mission_id, ("delivered",))
-    if found["type"] != "learn":
-        raise ResearchError("A comparison has one format, the memo.")
+    _refuse(type_of(found).formats_refused)
     if fmt not in FORMATS:
         raise ResearchError("Pick a format.")
     if fmt in found["formats"] or found["making"]:
@@ -526,8 +529,7 @@ def followup(path: Path, mission_id: str, body: Dict[str, Any]) -> Dict[str, Any
     """Questions the delivered mission missed: the researcher reads for them in the same session and
     ledger, then the outline is planned again around them and everything made is written again."""
     found = _need(path, mission_id, ("delivered",))
-    if found["type"] != "learn":
-        raise ResearchError("Questions can only be added to a Learn & understand mission so far.")
+    _refuse(type_of(found).followup_refused)
     if found["making"]:
         raise ResearchError("Wait for the format being made.", 409)
     raw = body.get("questions")
@@ -573,8 +575,7 @@ def rewrite(path: Path, mission_id: str, body: Dict[str, Any]) -> Dict[str, Any]
     found = mission(path, mission_id)
     if found is None:
         raise ResearchError("No such mission.", 404)
-    if found["type"] != "learn":
-        raise ResearchError("Only a Learn & understand mission can be rewritten with another model.")
+    _refuse(type_of(found).rewrite_refused)
     failed = found["error"] and (found["pending"] or {}).get("reason") == "rewrite"
     if found["stage"] != "delivered" and not failed:
         raise ResearchError("The mission isn't delivered yet.", 409)
@@ -654,7 +655,7 @@ def retry(path: Path, mission_id: str) -> Dict[str, Any]:
         raise ResearchError("Nothing failed.", 409)
     if found["stage"] == "brief":
         _update(path, mission_id, busy="brief", error=None)
-    elif found["stage"] == "scope" and found["type"] == "learn":
+    elif found["stage"] == "scope" and type_of(found).outline_call:
         _update(path, mission_id, busy="outline", error=None)
     else:
         _update(path, mission_id, error=None)
@@ -828,8 +829,10 @@ def _compare_brief(path: Path, row: Dict[str, Any]) -> None:
 
 
 def _brief(path: Path, row: Dict[str, Any]) -> None:
-    if row["type"] == "compare":
-        return _compare_brief(path, row)
+    type_of(row).read_brief(path, row)
+
+
+def _learn_brief(path: Path, row: Dict[str, Any]) -> None:
     answer = _structured("brief", BRIEF_SYSTEM, BRIEF_INSTRUCTIONS, row["input"], BRIEF_SCHEMA, 1500)
     fields = {
         "title": _clip(answer.get("title"), MAX_TITLE) or row["title"],
@@ -862,13 +865,19 @@ def _clip(value: Any, limit: int) -> str:
 
 
 def _brief_text(row: Dict[str, Any]) -> str:
-    if row["type"] == "compare":
-        return (
+    return type_of(row).brief_text(row)
+
+
+def _compare_brief_text(row: Dict[str, Any]) -> str:
+    return (
             f"Request: {row['input']}\nTitle: {row['title']}\nDecision: {row['goal']}\n"
             f"Audience: {row['audience']}\n"
             + "".join(f"Option {o['id']}: {o['name']}\n" for o in row["options"])
-            + "".join(f"Criterion {k['id']} (weight {k['weight']}): {k['name']}\n" for k in row["criteria"])
-        )
+        + "".join(f"Criterion {k['id']} (weight {k['weight']}): {k['name']}\n" for k in row["criteria"])
+    )
+
+
+def _learn_brief_text(row: Dict[str, Any]) -> str:
     return (
         f"Request: {row['input']}\nTitle: {row['title']}\nGoal: {row['goal']}\n"
         f"Audience: {row['audience']}\nDepth: {'in depth' if row['depth'] == 'deep' else 'overview'}"
@@ -904,8 +913,10 @@ def _compare_prompt(found: Dict[str, Any]) -> str:
 
 
 def researcher_prompt(found: Dict[str, Any]) -> str:
-    if found["type"] == "compare":
-        return _compare_prompt(found)
+    return type_of(found).prompt(found)
+
+
+def _learn_prompt(found: Dict[str, Any]) -> str:
     per_point = "6 to 10" if found["depth"] == "deep" else "3 to 6"
     if found["followups"]:
         latest = found["followups"][-1]
@@ -929,7 +940,7 @@ def researcher_prompt(found: Dict[str, Any]) -> str:
 def run_body(found: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "session_id": f"{SESSION_PREFIX}{found['id']}",
-        "instructions": COMPARE_RESEARCHER_INSTRUCTIONS if found["type"] == "compare" else RESEARCHER_INSTRUCTIONS,
+        "instructions": type_of(found).instructions,
         "input": [{"role": "user", "content": researcher_prompt(found)}],
     }
 
@@ -1005,6 +1016,26 @@ def _clean_url(value: Any) -> str:
     return url
 
 
+def _no_bearing(row: Any, args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    return None, None
+
+
+def _compare_bearing(row: Any, args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    # A claim says which option and criterion it bears on, so the advocates and the judge can
+    # find it; an id the mission doesn't have is refused rather than guessed at.
+    options = {o["id"] for o in _loads(row["options"], [])}
+    criteria = {k["id"] for k in _loads(row["criteria"], [])}
+    option_id = args.get("option") or None
+    criterion_id = args.get("criterion") or None
+    if option_id not in options and option_id is not None:
+        raise ResearchError(f"option must be one of: {', '.join(sorted(options))}.")
+    if criterion_id not in criteria and criterion_id is not None:
+        raise ResearchError(f"criterion must be one of: {', '.join(sorted(criteria))}.")
+    if option_id is None:
+        raise ResearchError(f"Say which option the claim is about with option ({', '.join(sorted(options))}).")
+    return option_id, criterion_id
+
+
 def record(path: Path, mission_id: str, args: Dict[str, Any],
            fetch: Callable[[str], Optional[str]] = _fetch_words) -> Dict[str, Any]:
     """Adds a claim and its source to the ledger, once the page is seen to hold the passage."""
@@ -1022,20 +1053,7 @@ def record(path: Path, mission_id: str, args: Dict[str, Any],
         raise ResearchError("snippet must be the whole passage, a full sentence at least.")
     title = _clip(args.get("title"), 300) or urllib.parse.urlparse(url).netloc
     kind = args.get("kind") if args.get("kind") in SOURCE_KINDS else "articles"
-    option_id = criterion_id = None
-    if row["type"] == "compare":
-        # A claim says which option and criterion it bears on, so the advocates and the judge can
-        # find it; an id the mission doesn't have is refused rather than guessed at.
-        options = {o["id"] for o in _loads(row["options"], [])}
-        criteria = {k["id"] for k in _loads(row["criteria"], [])}
-        option_id = args.get("option") or None
-        criterion_id = args.get("criterion") or None
-        if option_id not in options and option_id is not None:
-            raise ResearchError(f"option must be one of: {', '.join(sorted(options))}.")
-        if criterion_id not in criteria and criterion_id is not None:
-            raise ResearchError(f"criterion must be one of: {', '.join(sorted(criteria))}.")
-        if option_id is None:
-            raise ResearchError(f"Say which option the claim is about with option ({', '.join(sorted(options))}).")
+    option_id, criterion_id = type_of(row).bearing(row, args)
     held = check_passage(fetch(url), snippet)
     if held is False:
         raise ResearchError(
@@ -1433,8 +1451,10 @@ def _replan(found: Dict[str, Any], questions: List[str]) -> List[str]:
 
 
 def _draft(path: Path, found: Dict[str, Any]) -> None:
-    if found["type"] == "compare":
-        return _draft_compare(path, found)
+    type_of(found).draft(path, found)
+
+
+def _draft_learn(path: Path, found: Dict[str, Any]) -> None:
     mission_id = found["id"]
     pending = found["pending"]
     if found["stage"] == "drafting":
@@ -1771,6 +1791,77 @@ def _draft_compare(path: Path, found: Dict[str, Any]) -> None:
     _tell(path, "research_done", mission_id, found["title"])
 
 
+@dataclass(frozen=True)
+class MissionType:
+    """What one type of mission does at each step the shared paths take. A refusal is the
+    sentence a delivered mission of the type is refused with, or None where the type allows it."""
+
+    default_format: str
+    read_brief: Callable[[Path, Dict[str, Any]], None]
+    confirm_brief: Callable[[Path, str, Dict[str, Any]], Dict[str, Any]]
+    brief_text: Callable[[Dict[str, Any]], str]
+    approve_scope: Callable[[Path, Dict[str, Any], Dict[str, Any]], Dict[str, Any]]
+    # Whether the Scope Gate's outline comes from a model call, which a retry there runs again.
+    outline_call: bool
+    instructions: str
+    prompt: Callable[[Dict[str, Any]], str]
+    # The option and criterion a claim bears on, checked against the mission.
+    bearing: Callable[[Any, Dict[str, Any]], Tuple[Optional[str], Optional[str]]]
+    min_claims: Callable[[Dict[str, Any]], int]
+    draft: Callable[[Path, Dict[str, Any]], None]
+    # Fields a read of a mission works out from what it holds.
+    derive: Callable[[Dict[str, Any]], Dict[str, Any]]
+    formats_refused: Optional[str] = None
+    followup_refused: Optional[str] = None
+    rewrite_refused: Optional[str] = None
+
+
+MISSION_TYPES: Dict[str, MissionType] = {
+    "learn": MissionType(
+        default_format="guide",
+        read_brief=_learn_brief,
+        confirm_brief=_confirm_learn_brief,
+        brief_text=_learn_brief_text,
+        approve_scope=_approve_learn_scope,
+        outline_call=True,
+        instructions=RESEARCHER_INSTRUCTIONS,
+        prompt=_learn_prompt,
+        bearing=_no_bearing,
+        min_claims=lambda found: MIN_CLAIMS,
+        draft=_draft_learn,
+        derive=lambda found: {},
+    ),
+    "compare": MissionType(
+        default_format=COMPARE_FORMAT,
+        read_brief=_compare_brief,
+        confirm_brief=_confirm_compare_brief,
+        brief_text=_compare_brief_text,
+        approve_scope=_approve_compare_scope,
+        outline_call=False,
+        instructions=COMPARE_RESEARCHER_INSTRUCTIONS,
+        prompt=_compare_prompt,
+        bearing=_compare_bearing,
+        min_claims=lambda found: max(MIN_CLAIMS, 2 * len(found["options"])),
+        draft=_draft_compare,
+        derive=lambda found: {
+            "decision": decide(found["options"], found["criteria"], found["outputs"].get(COMPARE_FORMAT))
+        },
+        formats_refused="A comparison has one format, the memo.",
+        followup_refused="Questions can only be added to a Learn & understand mission so far.",
+        rewrite_refused="Only a Learn & understand mission can be rewritten with another model.",
+    ),
+}
+
+
+def type_of(found: Any) -> MissionType:
+    return MISSION_TYPES[found["type"]]
+
+
+def _refuse(reason: Optional[str]) -> None:
+    if reason:
+        raise ResearchError(reason)
+
+
 def _make(path: Path, found: Dict[str, Any]) -> None:
     fmt = found["making"]
     _write(path, found, fmt, False)
@@ -1932,9 +2023,7 @@ def finished_reading(path: Path, mission_id: str, status: Optional[str]) -> bool
     if rounds:
         enough = found["claims"] > (rounds[-1].get("claims") or 0)
     else:
-        enough = found["claims"] >= (
-            max(MIN_CLAIMS, 2 * len(found["options"])) if found["type"] == "compare" else MIN_CLAIMS
-        )
+        enough = found["claims"] >= type_of(found).min_claims(found)
     if not enough:
         stopped = status in ("failed", "cancelled", "interrupted")
         if stopped:
