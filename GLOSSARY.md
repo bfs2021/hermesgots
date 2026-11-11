@@ -787,3 +787,33 @@ _Avoid_: notification types, notification preferences, alert settings
 **Gots plugin**:
 The plugin Gots installs into a bot's Hermes host, enabled under the name `gots`. It was called `memento`; the old name survives only where older sessions still carry it.
 _Avoid_: Memento, memento plugin, the Hermes plugin
+
+## Research
+
+**Verify mission**:
+A research mission that takes one claim the user pasted and answers whether the evidence supports it, with a verdict the user can audit back to its sources. It is checked as a neutral restatement split into parts, never in the user's own wording.
+_Avoid_: fact check, verification task, claim check
+
+**Part**:
+One separate assertion a claim makes, short enough that evidence can bear on it alone; a claim has one to four, and the user confirms them before anything is read.
+_Avoid_: sub-claim, aspect, criterion, outline point
+
+**Lane**:
+One researcher's reading of a mission, in a session of its own. A verify mission has two, For and Against, each blind to the other and to the user's wording; Learn and Compare missions have one.
+_Avoid_: track, branch, side, researcher
+
+**Stance**:
+Which way a piece of evidence bears on a part: it supports it, refutes it, or is only context. The researcher records one and the judge gives one independently, and the evidence counts only where they agree.
+_Avoid_: position, polarity, sentiment, side
+
+**Search trail**:
+The web searches each lane of a verify mission made, in the order it made them, kept so a reader can see where the evidence was looked for, and where it wasn't.
+_Avoid_: query log, search history, searches
+
+**Independent source**:
+One site, as its registrable domain names it: two pages of the same site are one source, so a verdict never counts one publisher twice.
+_Avoid_: unique source, distinct URL, citation
+
+**Verdict**:
+A verify mission's answer, worked out by a fixed rule from the parts' evidence when the mission is delivered, and kept as it was then. Its label is one of seven: Supported (every part backed by two or more independent sources, none against), Partly supported (some parts backed so, not the rest), Disputed (independent sources disagree on a part), Not supported (no evidence either way), Refuted (two or more independent sources against a part, none for), Thin evidence (only one source bears on a part, with the way it leans) and Can't tell (evidence was found, but none of it takes a side).
+_Avoid_: rating, score, conclusion, fact-check result
