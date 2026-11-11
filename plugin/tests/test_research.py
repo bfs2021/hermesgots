@@ -6,6 +6,7 @@ Run: python3 -m unittest plugin.tests.test_research -v
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -745,13 +746,16 @@ class ResearcherRunTest(unittest.TestCase):
         self.llm = FakeLlm()
         research.ctx = SimpleNamespace(llm=self.llm)
         notify = mock.patch.object(research.push, "notify")
-        notify.start()
+        self.notify = notify.start()
         self.addCleanup(notify.stop)
         self.posts: list = []
-        self.runs = iter(["run_1", "run_2", "run_3"])
+        # The runs the store held for the mission as each post went out.
+        self.held: list = []
+        self.runs = iter(["run_1", "run_2", "run_3", "run_4", "run_5"])
 
         async def post(_adapter, _profile, url, body, authorization=None):
             self.posts.append((url, body))
+            self.held.append(research.runs_of(self.path, self.mission["id"]))
             return {"run_id": next(self.runs)} if url == "/v1/runs" else {}
 
         posting = mock.patch.object(plugin.outbox, "post", post)
@@ -880,6 +884,8 @@ class ResearcherRunTest(unittest.TestCase):
             answer = self.ask("start", body)
             self.assertEqual(answer.status, 400, body)
             self.assertEqual(research.mission(self.path, self.mission["id"])["stage"], "scope")
+        # Nothing is read while the gate refuses.
+        self.assertEqual(self.posts, [])
         answer = self.ask("start", good)
         self.assertEqual(answer.status, 200)
         found = research.mission(self.path, self.mission["id"])
@@ -887,10 +893,165 @@ class ResearcherRunTest(unittest.TestCase):
             (found["stage"], found["busy"], found["error"], found["source_kinds"], found["strictness"]),
             ("reading", None, None, ["papers", "articles"], "reputable"),
         )
-        # Reading starts in a later step: nothing is posted, and the mission waits rather than fails.
-        self.assertEqual(self.posts, [])
+
+    LOADED = "Coffee KILLS you: every daily cup is a heart attack waiting to happen!!"
+
+    def start_verify(self) -> None:
+        self.llm = FakeVerifyLlm()
+        research.ctx = SimpleNamespace(llm=self.llm)
+        self.mission = research.create(self.path, None, self.LOADED, "verify")
+        research._job(self.path, self.mission["id"])
+        research.confirm_brief(
+            self.path,
+            self.mission["id"],
+            {
+                "restatement": "Drinking coffee every day raises heart attack risk.",
+                "parts": ["Coffee is drunk every day", "Heart attack risk rises"],
+                "terms": ["every day"],
+            },
+        )
+        answer = self.ask("start", {"source_kinds": ["papers"], "strictness": "reputable"})
+        self.assertEqual(answer.status, 200)
+
+    def lane_claim(self, lane: str, stance: Optional[str] = "supports", part: Optional[str] = "p1") -> dict:
+        args = {"claim": "A fact.", "url": "https://example.org/a", "title": "A", "kind": "papers",
+                "snippet": "based solely on attention mechanisms", "stance": stance, "part": part}
+        session = f"research-{self.mission['id']}" + (f"-{lane}" if lane else "")
+        with mock.patch.object(research, "_fetch_words", page_words):
+            return json.loads(research.handle(args, task_id=session))
+
+    def statuses(self, **runs: str) -> None:
+        for run_id, status in runs.items():
+            self.adapter._run_statuses[run_id] = {"run_id": run_id, "status": status}
+
+    def test_two_lanes_read_blind_and_the_mission_moves_on_once_both_stopped(self) -> None:
+        self.start_verify()
+        mission_id = self.mission["id"]
+        sessions = [body["session_id"] for _url, body in self.posts]
+        self.assertEqual([url for url, _body in self.posts], ["/v1/runs", "/v1/runs"])
+        self.assertEqual(sessions, [f"research-{mission_id}-for", f"research-{mission_id}-against"])
+        bodies = [body for _url, body in self.posts]
+        for body, other in ((bodies[0], bodies[1]), (bodies[1], bodies[0])):
+            said = json.dumps(body)
+            # Neither lane sees the user's own wording, nor anything of the other lane.
+            self.assertNotIn("KILLS", said)
+            self.assertNotIn("waiting to happen", said)
+            self.assertNotIn(other["session_id"], said)
+            self.assertNotIn(other["instructions"], said)
+            prompt = body["input"][0]["content"]
+            for told in (
+                "Drinking coffee every day raises heart attack risk.",
+                "p1: Coffee is drunk every day",
+                "p2: Heart attack risk rises",
+                "every day",
+                "research papers",
+                "primary",
+            ):
+                self.assertIn(told, prompt)
+        self.assertIn("true", bodies[0]["instructions"])
+        self.assertIn("false", bodies[1]["instructions"])
+        self.assertEqual(research.runs_of(self.path, mission_id), {"for": "run_1", "against": "run_2"})
+        self.lane_claim("for")
+        # One lane stopped does not move the mission.
+        self.statuses(run_1="completed", run_2="running")
         self.assertEqual(self.moved(), [])
-        self.assertIsNone(research.mission(self.path, self.mission["id"])["error"])
+        found = research.mission(self.path, mission_id)
+        self.assertEqual((found["stage"], found["error"]), ("reading", None))
+        self.statuses(run_2="completed")
+        self.assertEqual(self.moved(), [mission_id])
+        self.assertEqual(research.mission(self.path, mission_id)["stage"], "drafting")
+
+    def test_a_verifications_claim_needs_a_stance_and_a_part_and_keeps_its_lane(self) -> None:
+        self.start_verify()
+        for stance, part, error in (
+            (None, "p1", "stance must be one of: supports, refutes, context"),
+            ("for", "p1", "stance must be one of: supports, refutes, context"),
+            ("supports", None, "part must be one of: p1, p2"),
+            ("supports", "p9", "part must be one of: p1, p2"),
+        ):
+            self.assertIn(error, self.lane_claim("for", stance, part).get("error", ""), (stance, part))
+        # Only the mission's own lanes record claims.
+        self.assertIn("error", self.lane_claim("", "supports", "p1"))
+        self.assertEqual(research.mission(self.path, self.mission["id"])["claims"], 0)
+        # Either lane may record any stance.
+        self.assertEqual(self.lane_claim("against", "supports", "p2")["id"], "c1")
+        self.assertEqual(self.lane_claim("for", "refutes", "p1")["id"], "c2")
+        self.assertEqual(self.lane_claim("for", "context", "p2")["id"], "c3")
+        claims = research.mission(self.path, self.mission["id"])["ledger"]["claims"]
+        self.assertEqual(
+            [(c["id"], c["stance"], c["part"], c["lane"]) for c in claims],
+            [("c1", "supports", "p2", "against"), ("c2", "refutes", "p1", "for"), ("c3", "context", "p2", "for")],
+        )
+
+    def test_an_empty_reading_fails_with_the_web_search_hint(self) -> None:
+        self.start_verify()
+        self.statuses(run_1="completed", run_2="completed")
+        self.assertEqual(self.moved(), [self.mission["id"]])
+        found = research.mission(self.path, self.mission["id"])
+        self.assertEqual(found["stage"], "reading")
+        self.assertEqual(
+            found["error"],
+            "The researcher found too few sources to write from. Check that web search works on the host.",
+        )
+        self.assertEqual(self.notify.call_args_list[-1].args[0], "research_failed")
+        # Both lanes completed, so Try again reads in both again.
+        self.assertEqual(self.ask("retry").status, 200)
+        self.assertEqual(
+            [body["session_id"] for _url, body in self.posts[2:]],
+            [f"research-{self.mission['id']}-for", f"research-{self.mission['id']}-against"],
+        )
+
+    def test_a_lane_that_broke_fails_the_reading_and_try_again_restarts_only_it(self) -> None:
+        self.start_verify()
+        mission_id = self.mission["id"]
+        self.lane_claim("for", "supports", "p1")
+        self.lane_claim("against", "refutes", "p2")
+        self.statuses(run_1="completed", run_2="failed")
+        self.assertEqual(self.moved(), [mission_id])
+        found = research.mission(self.path, mission_id)
+        self.assertEqual(
+            (found["stage"], found["error"], found["claims"]),
+            ("reading", "The researcher stopped before recording enough sources.", 2),
+        )
+        self.assertEqual(self.ask("retry").status, 200)
+        self.assertEqual([body["session_id"] for _url, body in self.posts[2:]], [f"research-{mission_id}-against"])
+        # The broken lane's run was let go of before its new one was posted, so the watcher can't
+        # read the old run's end as the new reading's.
+        self.assertEqual(self.held[-1], {"for": "run_1"})
+        self.assertEqual(research.runs_of(self.path, mission_id), {"for": "run_1", "against": "run_3"})
+        self.assertEqual(self.moved(), [])
+        found = research.mission(self.path, mission_id)
+        self.assertEqual((found["error"], found["claims"]), (None, 2))
+        self.statuses(run_3="completed")
+        self.assertEqual(self.moved(), [mission_id])
+        self.assertEqual(research.mission(self.path, mission_id)["stage"], "drafting")
+
+    def test_a_lane_whose_run_vanished_fails_the_reading_and_try_again_restarts_it(self) -> None:
+        self.start_verify()
+        mission_id = self.mission["id"]
+        self.lane_claim("for", "supports", "p1")
+        self.lane_claim("against", "refutes", "p2")
+        self.statuses(run_1="completed", run_2="running")
+        self.assertEqual(self.moved(), [])
+        # A host restart: the running lane's run is gone from Hermes's statuses.
+        del self.adapter._run_statuses["run_2"]
+        self.assertEqual(self.moved(), [mission_id])
+        found = research.mission(self.path, mission_id)
+        self.assertEqual(
+            (found["stage"], found["error"], found["claims"]),
+            ("reading", "The researcher stopped before recording enough sources.", 2),
+        )
+        self.assertEqual(research.ends_of(self.path, mission_id), {"for": "completed", "against": "interrupted"})
+        self.assertEqual(self.ask("retry").status, 200)
+        self.assertEqual([body["session_id"] for _url, body in self.posts[2:]], [f"research-{mission_id}-against"])
+
+    def test_removing_a_verification_stops_both_runs(self) -> None:
+        self.start_verify()
+        self.statuses(run_1="running", run_2="running")
+        self.assertEqual(self.ask("remove").payload, {"object": "gots.research.removed", "removed": True})
+        self.assertEqual(
+            sorted(url for url, _body in self.posts[2:]), ["/v1/runs/run_1/stop", "/v1/runs/run_2/stop"]
+        )
 
 
 if __name__ == "__main__":

@@ -47,7 +47,9 @@ logger = logging.getLogger(__name__)
 # single run copied in as its one lane's, so a mission reading at the upgrade is still watched.
 # 66 keeps a verification's read-back on its mission (`research.py`): four new columns.
 # 67 keeps a verification's strictness on its mission (`research.py`): one new column.
-SCHEMA_VERSION = 67
+# 68 keeps the stance, part and lane of a verification's claim, and how each lane's run ended
+# (`research.py`): four new columns.
+SCHEMA_VERSION = 68
 
 
 def data_dir(hermes_home: Path) -> Path:
@@ -553,6 +555,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for column in ("restatement", "parts", "terms", "uncheckable", "strictness"):
             if column not in mission_columns:
                 conn.execute(f"ALTER TABLE research_missions ADD COLUMN {column} TEXT")
+        # v68: a verification's claim says which way it bears on which part, and which lane read it;
+        # a lane's run keeps how it ended, so Try again restarts only the lanes that didn't complete.
+        claim_columns = {row[1] for row in conn.execute("PRAGMA table_info(research_claims)")}
+        for column in ("stance", "part_id", "lane"):
+            if column not in claim_columns:
+                conn.execute(f"ALTER TABLE research_claims ADD COLUMN {column} TEXT")
+        run_columns = {row[1] for row in conn.execute("PRAGMA table_info(research_runs)")}
+        if "ended" not in run_columns:
+            conn.execute("ALTER TABLE research_runs ADD COLUMN ended TEXT")
         # v32: the messages triage sent out of a Main thread, for its Moved markers (moves.py).
         # v33: a v32 store also had a thread_session column nothing read; it is rebuilt without it.
         move_columns = {row[1] for row in conn.execute("PRAGMA table_info(main_moves)")}

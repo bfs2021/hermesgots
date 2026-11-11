@@ -3472,11 +3472,11 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
         return await research_view(store_path(), request.match_info["mission_id"])
 
     async def start_researcher(request: "web.Request", path: Path, found: Dict[str, Any]) -> None:
-        """Starts each of the mission's lanes as an ordinary run, with the key the app asked with.
-        A lane that can't be started fails the mission and starts nothing after it."""
+        """Starts each of the mission's lanes that has no run as an ordinary run, with the key the app
+        asked with. A lane that can't be started fails the mission and starts nothing after it."""
         profile = _request_profile()
         research.watch(path, found["id"], profile)
-        for lane in research.lanes(found):
+        for lane in await asyncio.to_thread(research.unstarted_lanes, path, found):
             try:
                 started = await outbox.post(
                     adapter,
@@ -3562,7 +3562,8 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
         path, mission_id = store_path(), request.match_info["mission_id"]
         found = await asyncio.to_thread(research.mission, path, mission_id)
         if found["stage"] == "reading":
-            # The same session, so the researcher carries on from what it already recorded.
+            # The lanes that didn't complete, each in its own session, so a researcher carries on
+            # from what it already recorded.
             await start_researcher(request, path, found)
         else:
             research.spawn(path, mission_id, _request_profile())
