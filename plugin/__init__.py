@@ -689,6 +689,7 @@ def _wire_api_server(app: Any, adapter: Any) -> None:
                     "research_followup",
                     "research_rewrite",
                     "research_compare",
+                    "research_verify",
                     "meetings",
                     "meetings_ask",
                     "community",

@@ -111,6 +111,7 @@ export const MISSION_TYPES: ({
     name: "Verify a claim",
     icon: BadgeCheckIcon,
     example: "Does evidence support X?",
+    ready: true,
     ...VERIFIED,
   },
   {

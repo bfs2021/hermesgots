@@ -825,6 +825,14 @@ class ResearcherRunTest(unittest.TestCase):
     def moved(self) -> list:
         return [mission_id for _p, mission_id, _r in research._check_watched()]
 
+    def test_info_advertises_research_verify_where_research_is_ready(self) -> None:
+        self.mission = {}
+        request = FakeWeb.Request()
+        request.match_info, request.headers = {}, {}
+        answer = asyncio.run(route(self.app, plugin.PREFIX + "/info")(request))
+        self.assertTrue(answer.payload["research"]["ready"])
+        self.assertIn("research_verify", answer.payload["features"])
+
     def test_start_posts_one_run_on_the_missions_session(self) -> None:
         self.start()
         self.assertEqual([url for url, _body in self.posts], ["/v1/runs"])
