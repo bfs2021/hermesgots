@@ -140,12 +140,10 @@ const VIEWS: Partial<Record<MissionType, MissionView>> = {
 const viewOf = (type: MissionType): MissionView =>
   VIEWS[type] ?? { Brief: BriefForm, Scope: ScopeForm }
 
+/** The one format a comparison or a verification delivers, which isn't among `FORMATS`. */
+const SOLE_FORMATS: Partial<Record<OutputFormat, string>> = { memo: "Memo", verdict: "Verdict" }
 const formatName = (format: OutputFormat) =>
-  format === "memo"
-    ? "Memo"
-    : format === "verdict"
-      ? "Verdict"
-      : FORMATS.find((f) => f.id === format)!.name
+  SOLE_FORMATS[format] ?? FORMATS.find((f) => f.id === format)!.name
 
 /**
  * Research: start a mission from a question, and the missions so far by what they need. Where the

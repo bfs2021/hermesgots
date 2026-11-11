@@ -31,6 +31,7 @@ import {
   confirmVerification,
   hostOf,
   leadsLine,
+  partText,
   sourcesLine,
   stanceWord,
   type Claim,
@@ -38,6 +39,7 @@ import {
   type PartStance,
   type Strictness,
   type VerdictLabel,
+  verdictOf,
 } from "@/lib/research"
 import { cn } from "@/lib/utils"
 
@@ -267,10 +269,9 @@ export function VerdictCanvas({
   onCite: (id: string) => void
 }) {
   const output = mission.outputs?.verdict
-  const verdict = output?.verdict ?? mission.verdict
+  const verdict = verdictOf(mission)
   const claims = mission.ledger?.claims ?? []
   const sources = new Map(mission.ledger?.sources.map((s) => [s.id, s]))
-  const partText = (id: string) => mission.verify?.parts.find((p) => p.id === id)?.text ?? id
   const Icon = verdict && TONES[verdict.label].icon
 
   return (
@@ -325,7 +326,7 @@ export function VerdictCanvas({
             <tbody>
               {verdict.parts.map((part) => (
                 <tr key={part.part} className="align-top">
-                  <td className="border-t py-2.5 pr-3 leading-6">{partText(part.part)}</td>
+                  <td className="border-t py-2.5 pr-3 leading-6">{partText(mission, part.part)}</td>
                   <td className="border-t py-2.5 pr-3 leading-6">
                     <span className="inline-flex items-baseline gap-1.5">
                       <span

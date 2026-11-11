@@ -863,6 +863,8 @@ def ends_of(path: Path, mission_id: str) -> Dict[str, Optional[str]]:
 
 
 def _note_ends(path: Path, mission_id: str, ends: Dict[str, str]) -> None:
+    if not ends:
+        return
     conn = _open(path)
     try:
         for lane, ended in ends.items():
@@ -1123,9 +1125,9 @@ def _brief_text(row: Dict[str, Any]) -> str:
 
 def _compare_brief_text(row: Dict[str, Any]) -> str:
     return (
-            f"Request: {row['input']}\nTitle: {row['title']}\nDecision: {row['goal']}\n"
-            f"Audience: {row['audience']}\n"
-            + "".join(f"Option {o['id']}: {o['name']}\n" for o in row["options"])
+        f"Request: {row['input']}\nTitle: {row['title']}\nDecision: {row['goal']}\n"
+        f"Audience: {row['audience']}\n"
+        + "".join(f"Option {o['id']}: {o['name']}\n" for o in row["options"])
         + "".join(f"Criterion {k['id']} (weight {k['weight']}): {k['name']}\n" for k in row["criteria"])
     )
 
@@ -1170,21 +1172,21 @@ _VERIFY_RULES = """
 - Record what you find whichever way it points: a source that cuts the other way is recorded with that stance, and background that settles neither way is context. Take the terms the claim names literally. Mark a claim uncertain when the source is weak or hedges.
 - Never use the terminal, write files or ask the user anything. When every part is covered, reply with one line saying how many claims you recorded."""
 
-VERIFY_FOR_INSTRUCTIONS = (
-    "You are the researcher of a Gots claim check. Your output is the evidence ledger, not a verdict: a judge "
-    "works from the claims you record, and from nothing else.\n"
-    "- Find the strongest evidence that the claim is true, part by part: search with web_search for the sources "
-    "that would show it, and read the best ones in full with web_extract."
-    + _VERIFY_RULES
-)
 
-VERIFY_AGAINST_INSTRUCTIONS = (
-    "You are the researcher of a Gots claim check. Your output is the evidence ledger, not a verdict: a judge "
-    "works from the claims you record, and from nothing else.\n"
-    "- Find the strongest evidence that the claim is false, part by part: search with web_search for the sources "
-    "that would show it, and read the best ones in full with web_extract."
-    + _VERIFY_RULES
-)
+
+def _lane_instructions(side: str) -> str:
+    """A lane's instructions, which differ only in the side it looks for."""
+    return (
+        "You are the researcher of a Gots claim check. Your output is the evidence ledger, not a verdict: a judge "
+        "works from the claims you record, and from nothing else.\n"
+        f"- Find the strongest evidence that the claim is {side}, part by part: search with web_search for the "
+        "sources that would show it, and read the best ones in full with web_extract."
+        + _VERIFY_RULES
+    )
+
+
+VERIFY_FOR_INSTRUCTIONS = _lane_instructions("true")
+VERIFY_AGAINST_INSTRUCTIONS = _lane_instructions("false")
 
 STRICTNESS_WORDS = {
     "any": "Any source will do, but prefer the primary one where you can find it.",
@@ -1193,14 +1195,18 @@ STRICTNESS_WORDS = {
 }
 
 
-def _verify_prompt(found: Dict[str, Any]) -> str:
-    # Only what the user confirmed: their own wording can steer a search as surely as a judge.
+def _claim_text(found: Dict[str, Any]) -> str:
+    """The claim as the user confirmed it: restated, its parts, and the terms it takes literally."""
     parts = "\n".join(f"- {p['id']}: {p['text']}" for p in found["parts"])
     terms = ", ".join(found["terms"])
+    return f"Claim: {found['restatement']}\nParts:\n{parts}\n" + (f"Take literally: {terms}\n" if terms else "")
+
+
+def _verify_prompt(found: Dict[str, Any]) -> str:
+    # Only what the user confirmed: their own wording can steer a search as surely as a judge.
     kinds = ", ".join(SOURCE_NAMES[kind] for kind in found["source_kinds"] if kind in SOURCE_NAMES)
     return (
-        f"Claim: {found['restatement']}\nParts:\n{parts}\n"
-        + (f"Take literally: {terms}\n" if terms else "")
+        _claim_text(found)
         + f"Prefer: {kinds}\n{STRICTNESS_WORDS[found['strictness'] or 'any']}\n\n"
         "Record 2 to 4 claims for each part."
     )
@@ -2272,7 +2278,6 @@ def _draft_compare(path: Path, found: Dict[str, Any]) -> None:
 
 # --- a verification's verdict --------------------------------------------------------------------
 
-STANCES = ("supports", "refutes", "context")
 VERDICT_SYSTEM = (
     "You weigh evidence about a claim, impartially. For each part of the claim you say which "
     "claims in the evidence ledger bear on it and how: one that shows the part is true supports "
@@ -2310,7 +2315,6 @@ def _verify_ledger_text(found: Dict[str, Any]) -> str:
     """The claim as confirmed, with the terms it takes literally, and the ledger as evidence alone:
     each claim's words, its source and its passage, with nothing of the reading that found it."""
     sources = {source["id"]: source for source in found["ledger"]["sources"]}
-    parts = "\n".join(f"- {p['id']}: {p['text']}" for p in found["parts"])
     lines = []
     for claim in found["ledger"]["claims"]:
         source = sources.get(claim["source"]) or {}
@@ -2319,13 +2323,7 @@ def _verify_ledger_text(found: Dict[str, Any]) -> str:
             f"[{claim['id']}]{note} {claim['text']}\n    Source: {source.get('title', '')} "
             f"({source.get('url', '')})\n    Passage: \"{claim['snippet']}\""
         )
-    terms = ", ".join(found["terms"])
-    return (
-        f"Claim: {found['restatement']}\nParts:\n{parts}\n"
-        + (f"Take literally: {terms}\n" if terms else "")
-        + "\nLedger:\n"
-        + "\n".join(lines)
-    )
+    return _claim_text(found) + "\nLedger:\n" + "\n".join(lines)
 
 
 def judge_claim(found: Dict[str, Any]) -> Dict[str, Any]:
@@ -2418,6 +2416,10 @@ class MissionType:
     rewrite_refused: Optional[str] = None
 
 
+# What a delivered mission of a type other than Learn & understand is refused.
+FOLLOWUP_LEARN_ONLY = "Questions can only be added to a Learn & understand mission so far."
+REWRITE_LEARN_ONLY = "Only a Learn & understand mission can be rewritten with another model."
+
 MISSION_TYPES: Dict[str, MissionType] = {
     "learn": MissionType(
         default_format="guide",
@@ -2447,8 +2449,8 @@ MISSION_TYPES: Dict[str, MissionType] = {
             "decision": decide(found["options"], found["criteria"], found["outputs"].get(COMPARE_FORMAT))
         },
         formats_refused="A comparison has one format, the memo.",
-        followup_refused="Questions can only be added to a Learn & understand mission so far.",
-        rewrite_refused="Only a Learn & understand mission can be rewritten with another model.",
+        followup_refused=FOLLOWUP_LEARN_ONLY,
+        rewrite_refused=REWRITE_LEARN_ONLY,
     ),
     "verify": MissionType(
         default_format=VERIFY_FORMAT,
@@ -2471,8 +2473,8 @@ MISSION_TYPES: Dict[str, MissionType] = {
         every_lane_completes=True,
         keeps_searches=True,
         formats_refused="A verification has one format, the verdict.",
-        followup_refused="Questions can only be added to a Learn & understand mission so far.",
-        rewrite_refused="Only a Learn & understand mission can be rewritten with another model.",
+        followup_refused=FOLLOWUP_LEARN_ONLY,
+        rewrite_refused=REWRITE_LEARN_ONLY,
     ),
 }
 

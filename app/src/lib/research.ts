@@ -561,7 +561,7 @@ function toVerify(raw: Record<string, unknown>): VerifyBrief {
       id: text(p.id),
       text: text(p.text),
     })),
-    terms: list(raw.terms).filter((t): t is string => typeof t === "string"),
+    terms: ids(raw.terms),
     uncheckable: text(raw.uncheckable) || undefined,
     strictness:
       raw.strictness === "any" || raw.strictness === "reputable" ? raw.strictness : undefined,
@@ -970,14 +970,20 @@ const plural = (count: number, one: string) => `${count} ${one}${count === 1 ? "
 export const sourcesLine = (verdict: Verdict) => plural(verdict.sources, "independent source")
 export const leadsLine = (verdict: Verdict) => plural(verdict.leads, "unverifiable lead")
 
+/** The verdict a verification shows: the one stored with its output, else the mission's own. */
+export const verdictOf = (mission: Mission) => mission.outputs?.verdict?.verdict ?? mission.verdict
+
+/** A part's words, by its id. */
+export const partText = (mission: Mission, id: string) =>
+  mission.verify?.parts.find((p) => p.id === id)?.text ?? id
+
 /** The verdict as it was stored, the parts, what each lane found and searched, and its flip. */
 function verdictMarkdown(mission: Mission, cite: (ids?: string[]) => string) {
   const output = mission.outputs?.verdict
-  const verdict = output?.verdict ?? mission.verdict
+  const verdict = verdictOf(mission)
   if (!verdict) return []
   const ledger = mission.ledger ?? { sources: [], claims: [] }
   const sources = new Map(ledger.sources.map((s) => [s.id, s]))
-  const partText = (id: string) => mission.verify?.parts.find((p) => p.id === id)?.text ?? id
   const prose = (paragraphs: Span[][]) =>
     paragraphs.map((p) =>
       p.map((s) => `${s.text}${s.flagged ? " (no source)" : cite(s.cites)}`).join(""),
@@ -991,7 +997,8 @@ function verdictMarkdown(mission: Mission, cite: (ids?: string[]) => string) {
     "| Part | Stance | For | Against |",
     "|---|---|---|---|",
     ...verdict.parts.map(
-      (p) => `| ${partText(p.part)} | ${stanceWord(p)} | ${p.supporting} | ${p.refuting} |`,
+      (p) =>
+        `| ${partText(mission, p.part)} | ${stanceWord(p)} | ${p.supporting} | ${p.refuting} |`,
     ),
     "",
   )
