@@ -1045,6 +1045,72 @@ class ResearcherRunTest(unittest.TestCase):
         self.assertEqual(self.ask("retry").status, 200)
         self.assertEqual([body["session_id"] for _url, body in self.posts[2:]], [f"research-{mission_id}-against"])
 
+    def search(self, session: str, query, tool: str = "web_search"):
+        return research.before_tool(tool_name=tool, args={"query": query}, task_id=session, session_id=session)
+
+    def test_each_lanes_web_search_queries_are_recorded_capped_and_read_back_with_the_mission(self) -> None:
+        self.start_verify()
+        mission_id = self.mission["id"]
+        lane = {name: f"research-{mission_id}-{name}" for name in ("for", "against")}
+        self.assertIsNone(self.search(lane["for"], "  coffee heart attack cohort  "))
+        self.assertIsNone(self.search(lane["against"], "coffee no cardiac risk meta-analysis"))
+        self.assertIsNone(self.search(lane["for"], "coffee myocardial infarction"))
+        # A repeat in a lane is kept once; the same words in the other lane are that lane's own.
+        self.search(lane["for"], "coffee heart attack cohort")
+        self.search(lane["against"], "coffee heart attack cohort")
+        # Nothing that isn't a query is kept, and nothing from another tool.
+        for query in ("", "   ", None, 42, ["a"]):
+            self.assertIsNone(self.search(lane["for"], query))
+        self.search(lane["for"], "coffee tea", tool="web_extract")
+        # A blocked tool is still blocked, and leaves no search.
+        self.assertEqual(self.search(lane["for"], "rm -rf /", tool="terminal")["action"], "block")
+        found = research.mission(self.path, mission_id)
+        self.assertEqual(
+            found["searches"],
+            {
+                "for": ["coffee heart attack cohort", "coffee myocardial infarction"],
+                "against": ["coffee no cardiac risk meta-analysis", "coffee heart attack cohort"],
+            },
+        )
+        # A long query is cut to its first 300 characters, and a lane keeps at most 40 queries.
+        self.search(lane["against"], "x" * 500)
+        for n in range(60):
+            self.search(lane["for"], f"query {n}")
+        found = research.mission(self.path, mission_id)
+        self.assertEqual(found["searches"]["against"][-1], "x" * 300)
+        self.assertEqual(len(found["searches"]["for"]), 40)
+        self.assertEqual(found["searches"]["for"][:3], ["coffee heart attack cohort", "coffee myocardial infarction", "query 0"])
+        # Try again keeps what a restarted lane searched: those searches were really made.
+        self.lane_claim("for")
+        self.statuses(run_1="completed", run_2="failed")
+        self.moved()
+        self.assertEqual(self.ask("retry").status, 200)
+        self.assertEqual(len(research.mission(self.path, mission_id)["searches"]["against"]), 3)
+        # A fresh reading starts with no searches, and removing the mission takes them with it.
+        research._clear(self.path, mission_id)
+        self.assertEqual(research.mission(self.path, mission_id)["searches"], {"for": [], "against": []})
+        self.search(lane["for"], "coffee again")
+        self.ask("remove")
+        conn = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM research_searches").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+    def test_a_learn_researcher_and_a_chat_keep_no_searches(self) -> None:
+        self.start()
+        self.assertIsNone(self.search(f"research-{self.mission['id']}", "how attention works"))
+        self.assertIsNone(self.search("gots-chat", "how attention works"))
+        self.assertNotIn("searches", research.mission(self.path, self.mission["id"]))
+        conn = sqlite3.connect(self.path)
+        try:
+            # The read shows no trail for a Learn mission, so the store is the only place to look.
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            count = conn.execute("SELECT COUNT(*) FROM research_searches").fetchone()[0] if "research_searches" in tables else 0
+            self.assertEqual(count, 0)
+        finally:
+            conn.close()
+
     def test_removing_a_verification_stops_both_runs(self) -> None:
         self.start_verify()
         self.statuses(run_1="running", run_2="running")

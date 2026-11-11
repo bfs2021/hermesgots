@@ -49,7 +49,8 @@ logger = logging.getLogger(__name__)
 # 67 keeps a verification's strictness on its mission (`research.py`): one new column.
 # 68 keeps the stance, part and lane of a verification's claim, and how each lane's run ended
 # (`research.py`): four new columns.
-SCHEMA_VERSION = 68
+# 69 keeps what each of a verification's lanes searched (`research.py`): one new table.
+SCHEMA_VERSION = 69
 
 
 def data_dir(hermes_home: Path) -> Path:
@@ -564,6 +565,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         run_columns = {row[1] for row in conn.execute("PRAGMA table_info(research_runs)")}
         if "ended" not in run_columns:
             conn.execute("ALTER TABLE research_runs ADD COLUMN ended TEXT")
+        # v69: the queries each of a verification's lanes searched, in the order it searched them.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS research_searches (
+                   mission_id TEXT NOT NULL,
+                   lane TEXT NOT NULL,
+                   query TEXT NOT NULL,
+                   PRIMARY KEY (mission_id, lane, query)
+               )"""
+        )
         # v32: the messages triage sent out of a Main thread, for its Moved markers (moves.py).
         # v33: a v32 store also had a thread_session column nothing read; it is rebuilt without it.
         move_columns = {row[1] for row in conn.execute("PRAGMA table_info(main_moves)")}

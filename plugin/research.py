@@ -98,6 +98,9 @@ MAX_MODEL = 200
 MAX_CLAIMS = 120
 MAX_CLAIM = 600
 MIN_SNIPPET = 20
+# What a lane searched is kept for the reader, up to this many queries a lane, each cut this short.
+MAX_SEARCHES = 40
+MAX_QUERY = 300
 MAX_SNIPPET = 1200
 # Fewer than this and there is nothing worth writing from.
 MIN_CLAIMS = 3
@@ -268,6 +271,8 @@ def mission(path: Path, mission_id: str) -> Optional[Dict[str, Any]]:
             )
         }
         found.update(type_of(found).derive(found))
+        if type_of(found).keeps_searches:
+            found["searches"] = _searches(conn, found)
         found["revisions"] = [
             {
                 "number": rev["number"],
@@ -283,6 +288,38 @@ def mission(path: Path, mission_id: str) -> Optional[Dict[str, Any]]:
             )
         ]
         return found
+    finally:
+        conn.close()
+
+
+def _searches(conn: Any, found: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Each lane's searches, in the order it made them."""
+    rows = conn.execute(
+        "SELECT lane, query FROM research_searches WHERE mission_id = ? ORDER BY rowid", (found["id"],)
+    ).fetchall()
+    return {lane.name: [row["query"] for row in rows if row["lane"] == lane.name] for lane in lanes(found)}
+
+
+def note_search(path: Path, mission_id: str, lane: str, query: Any) -> None:
+    """Keeps a query a lane searched, once, while the lane has room for it, in a type that keeps them."""
+    if not isinstance(query, str) or not query.strip() or not path.exists():
+        return
+    query = query.strip()[:MAX_QUERY]
+    conn = _open(path)
+    try:
+        row = _row(conn, mission_id)
+        if row is None or not MISSION_TYPES[row["type"]].keeps_searches:
+            return
+        if lane not in {each.name for each in MISSION_TYPES[row["type"]].lanes}:
+            return
+        held = conn.execute(
+            "SELECT COUNT(*) FROM research_searches WHERE mission_id = ? AND lane = ?", (mission_id, lane)
+        ).fetchone()[0]
+        if held < MAX_SEARCHES:
+            conn.execute(
+                "INSERT OR IGNORE INTO research_searches (mission_id, lane, query) VALUES (?, ?, ?)",
+                (mission_id, lane, query),
+            )
     finally:
         conn.close()
 
@@ -591,6 +628,7 @@ def _approve_verify_scope(path: Path, found: Dict[str, Any], body: Dict[str, Any
 
 RESEARCH_TABLES = (
     "research_sources", "research_claims", "research_outputs", "research_revisions", "research_runs",
+    "research_searches",
 )
 
 
@@ -1458,13 +1496,24 @@ BLOCKED_TOOLS = {
 
 
 def before_tool(**kwargs: Any) -> Optional[Dict[str, str]]:
-    """The ``pre_tool_call`` hook: keeps a researcher to reading and recording."""
+    """The ``pre_tool_call`` hook: keeps a researcher to reading and recording, and keeps what a
+    lane searched where its type shows it."""
     session = kwargs.get("task_id") or kwargs.get("session_id")
-    if mission_of_session(session) and kwargs.get("tool_name") in BLOCKED_TOOLS:
+    found = lane_of_session(session)
+    if found and kwargs.get("tool_name") in BLOCKED_TOOLS:
         return {
             "action": "block",
             "message": "This is a research mission: search, read and record claims with claim_add only.",
         }
+    if found and kwargs.get("tool_name") == "web_search":
+        try:
+            from . import sessions
+
+            args = kwargs.get("args")
+            note_search(sessions._paths()[0], *found, args.get("query") if isinstance(args, dict) else None)
+        except Exception:
+            # A trail that can't be kept must never cost the researcher its search.
+            logger.debug("gots: couldn't keep a research search", exc_info=True)
     return None
 
 
@@ -2129,6 +2178,8 @@ class MissionType:
     # Whether a lane that stopped short fails the reading whatever was recorded: a verdict read in
     # one direction is the bias the lanes are there to remove.
     every_lane_completes: bool = False
+    # Whether each lane's web searches are kept and read back with the mission.
+    keeps_searches: bool = False
     formats_refused: Optional[str] = None
     followup_refused: Optional[str] = None
     rewrite_refused: Optional[str] = None
@@ -2184,6 +2235,7 @@ MISSION_TYPES: Dict[str, MissionType] = {
         draft=_verify_not_yet,
         derive=lambda found: {},
         every_lane_completes=True,
+        keeps_searches=True,
         formats_refused="A verification has one format, the verdict.",
         followup_refused="Questions can only be added to a Learn & understand mission so far.",
         rewrite_refused="Only a Learn & understand mission can be rewritten with another model.",
