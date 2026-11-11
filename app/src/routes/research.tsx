@@ -99,6 +99,7 @@ import {
   revisionReason,
   rewriteMission,
   toMarkdown,
+  typeOf,
   useMission,
   useMissions,
   type Mission,
@@ -120,6 +121,20 @@ const FORMAT_ICONS: Record<OutputFormat, typeof BookOpenTextIcon> = {
 /** The picture of the bot running the mission. */
 const useMissionBotId = (mission: Mission) =>
   useLiveQuery(() => db.profiles.get(mission.profileId), [mission.profileId])?.botId
+
+type MissionView = {
+  Brief: (props: { mission: Mission }) => ReactNode
+  Scope: (props: { mission: Mission; botId?: string }) => ReactNode
+  /** The one canvas a delivered mission draws; without one it draws its formats'. */
+  Canvas?: (props: { mission: Mission; onCite: (id: string) => void }) => ReactNode
+}
+
+/** The forms and canvas a type draws: a type not listed is briefed and scoped as a guide. */
+const VIEWS: Partial<Record<MissionType, MissionView>> = {
+  compare: { Brief: CompareBriefForm, Scope: CompareScopeForm, Canvas: MemoCanvas },
+}
+const viewOf = (type: MissionType): MissionView =>
+  VIEWS[type] ?? { Brief: BriefForm, Scope: ScopeForm }
 
 const formatName = (format: OutputFormat) =>
   format === "memo" ? "Memo" : FORMATS.find((f) => f.id === format)!.name
@@ -544,15 +559,16 @@ function MissionMenu({
   const [asking, setAsking] = useState(false)
   const [rewriting, setRewriting] = useState(false)
   const made = format && mission.formats.includes(format)
+  const { reworks } = typeOf(mission.type)
   const canAsk =
-    mission.type === "learn" &&
+    reworks &&
     mission.stage === "delivered" &&
     Boolean(mission.followups) &&
     mission.outline.length < MAX_OUTLINE &&
     !mission.making
-  // Learn & understand only; a rewrite that failed can be taken over by another model.
+  // A rewrite that failed can be taken over by another model.
   const canRewrite =
-    mission.type === "learn" &&
+    reworks &&
     Boolean(mission.revisions) &&
     !mission.making &&
     (mission.stage === "delivered" ||
@@ -727,7 +743,7 @@ function MissionHeader({
   onBack?: () => void
   actions?: ReactNode
 }) {
-  const type = MISSION_TYPES.find((t) => t.id === mission.type)!
+  const type = typeOf(mission.type)
   const profile = useLiveQuery(() => db.profiles.get(mission.profileId), [mission.profileId])
   const by = [profile?.name, mission.researcher?.model].filter(Boolean).join(" · ")
   return (
@@ -779,6 +795,7 @@ function Thinking({ label }: { label: string }) {
 /** What the bot took from the question, all of it editable, before anything is committed. */
 function ReadBack({ mission }: { mission: Mission }) {
   const botId = useMissionBotId(mission)
+  const { Brief } = viewOf(mission.type)
   return (
     <div className="flex flex-col gap-5 rounded-3xl border bg-card p-4 md:p-5">
       <h2 className="flex items-center gap-2.5 font-semibold">
@@ -789,12 +806,7 @@ function ReadBack({ mission }: { mission: Mission }) {
       {mission.busy === "brief" ? (
         <Thinking label="Reading your question" />
       ) : (
-        !mission.error &&
-        (mission.type === "compare" ? (
-          <CompareBriefForm key={mission.goal} mission={mission} />
-        ) : (
-          <BriefForm key={mission.goal} mission={mission} />
-        ))
+        !mission.error && <Brief key={mission.goal} mission={mission} />
       )}
     </div>
   )
@@ -894,6 +906,7 @@ const MAX_POINTS = 6
 /** The Scope Gate: the outline and the kinds of source, and nothing is researched until approved. */
 function ScopeGate({ mission }: { mission: Mission }) {
   const botId = useMissionBotId(mission)
+  const { Scope } = viewOf(mission.type)
   return (
     <div className="flex flex-col gap-5 rounded-3xl border bg-card p-4 md:p-5">
       <MissionError mission={mission} />
@@ -906,12 +919,7 @@ function ScopeGate({ mission }: { mission: Mission }) {
           <Thinking label="Proposing an outline" />
         </>
       ) : (
-        !mission.error &&
-        (mission.type === "compare" ? (
-          <CompareScopeForm key={mission.outline.join("\n")} mission={mission} botId={botId} />
-        ) : (
-          <ScopeForm key={mission.outline.join("\n")} mission={mission} botId={botId} />
-        ))
+        !mission.error && <Scope key={mission.outline.join("\n")} mission={mission} botId={botId} />
       )}
     </div>
   )
@@ -1018,7 +1026,8 @@ function WorkView({ mission, onBack }: { mission: Mission; onBack?: () => void }
   const kept: OutputFormat[] = revision
     ? FORMATS.map((f) => f.id).filter((f) => revision.outputs[f]?.length)
     : []
-  const compared = mission.type === "compare"
+  const { reworks } = typeOf(mission.type)
+  const { Canvas } = viewOf(mission.type)
   const viewed = revision && !kept.includes(format) ? (kept[0] ?? format) : format
   const canvas: OutputFormat | "making" = revision
     ? viewed
@@ -1094,7 +1103,7 @@ function WorkView({ mission, onBack }: { mission: Mission; onBack?: () => void }
               </Banner>
             ) : (
               delivered &&
-              !compared && (
+              reworks && (
                 <FormatTabs mission={mission} value={format} onChange={setFormat} onMake={make} />
               )
             )}
@@ -1105,8 +1114,8 @@ function WorkView({ mission, onBack }: { mission: Mission; onBack?: () => void }
                 {mission.audience.charAt(0).toLowerCase() + mission.audience.slice(1)}
               </p>
             </div>
-            {compared ? (
-              <MemoCanvas mission={shown} onCite={cite} />
+            {Canvas ? (
+              <Canvas mission={shown} onCite={cite} />
             ) : canvas === "making" ? (
               <MakingCanvas found={mission.found} />
             ) : canvas === "quiz" ? (

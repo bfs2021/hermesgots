@@ -30,19 +30,55 @@ import { createStore } from "@/lib/store"
 export type MissionType =
   "learn" | "compare" | "verify" | "literature" | "prepare" | "investigate" | "brainstorm"
 
-export const MISSION_TYPES: {
+/** What a mission of a type is written as, which every screen reads rather than asking the type. */
+type MissionWriting = {
+  /** The plugin feature a mission of the type needs beyond `research`, and what to call it. */
+  feature?: { id: string; name: string }
+  /** Whether a delivered mission offers other formats, follow-up questions and a rewrite. */
+  reworks: boolean
+  /** How many pieces its first format is written in. */
+  pieces: (mission: Mission) => number
+  /** What drafting has done, as the stage strip says it. */
+  drafted: (mission: Mission) => string
+  /** The claims a typical reading gathers, which the reading third of the strip fills towards. */
+  claims: (mission: Mission) => number
+}
+
+/** A section per outline point for a guide, else one piece. */
+const WRITTEN: MissionWriting = {
+  reworks: false,
+  pieces: (mission) => (mission.format === "guide" ? Math.max(1, mission.outline.length) : 1),
+  drafted: (mission) =>
+    mission.format === "guide"
+      ? `${mission.written} of ${WRITTEN.pieces(mission)} sections`
+      : `${mission.claimCount} claims`,
+  claims: (mission) => mission.outline.length * 4,
+}
+
+/** A case per option, a rebuttal per option, then the judge. */
+const COMPARED: MissionWriting = {
+  feature: { id: "research_compare", name: "Compare & decide" },
+  reworks: false,
+  pieces: (mission) => 2 * mission.options.length + 1,
+  drafted: (mission) => `${mission.written} of ${COMPARED.pieces(mission)} steps`,
+  claims: (mission) => mission.options.length * mission.criteria.length * 1.5,
+}
+
+export const MISSION_TYPES: ({
   id: MissionType
   name: string
   icon: LucideIcon
   example: string
   ready?: boolean
-}[] = [
+} & Partial<MissionWriting>)[] = [
   {
     id: "learn",
     name: "Learn & understand",
     icon: GraduationCapIcon,
     example: "Explain how transformers work, starting from the basics",
     ready: true,
+    ...WRITTEN,
+    reworks: true,
   },
   {
     id: "compare",
@@ -50,6 +86,7 @@ export const MISSION_TYPES: {
     icon: ScaleIcon,
     example: "Postgres or Cosmos DB?",
     ready: true,
+    ...COMPARED,
   },
   {
     id: "verify",
@@ -77,6 +114,12 @@ export const MISSION_TYPES: {
   },
   { id: "brainstorm", name: "Brainstorm", icon: LightbulbIcon, example: "10 novel feature ideas" },
 ]
+
+/** A type's entry, with what a type that names none of its writing is written as. */
+export const typeOf = (type: MissionType) => {
+  const entry = MISSION_TYPES.find((t) => t.id === type) ?? MISSION_TYPES[0]
+  return { ...WRITTEN, ...entry }
+}
 
 /** A comparison delivers one `memo`, which isn't one of the formats a Learn mission can make. */
 export type OutputFormat = "guide" | "quiz" | "glossary" | "memo"
@@ -573,8 +616,9 @@ async function act(
 
 /** Starts a mission on the bot; the plugin reads the question back as a brief. */
 export async function createMission(profile: Profile, input: string, type: MissionType) {
-  if (type === "compare" && !(await hasPluginFeature(profile, "research_compare")))
-    throw new Error("Its Gots plugin needs an update for Compare & decide.")
+  const { feature } = typeOf(type)
+  if (feature && !(await hasPluginFeature(profile, feature.id)))
+    throw new Error(`Its Gots plugin needs an update for ${feature.name}.`)
   const raw = await createResearch(profile, input, type)
   const mission = toMission(raw, profile.id)
   put({ ...mission, ledger: mission.ledger ?? { sources: [], claims: [] } })
@@ -663,13 +707,8 @@ export const RESEARCH_STAGES: { id: MissionStage; name: string }[] = [
   { id: "reviewing", name: "Reviewing" },
 ]
 
-/** How many pieces the first format is written in: a section per outline point, else one. */
-export const pieces = (mission: Mission) =>
-  mission.type === "compare"
-    ? 2 * mission.options.length + 1
-    : mission.format === "guide"
-      ? Math.max(1, mission.outline.length)
-      : 1
+/** How many pieces the first format is written in. */
+export const pieces = (mission: Mission) => typeOf(mission.type).pieces(mission)
 
 /** A made format as Markdown, its claims numbered and listed with their sources at the end. */
 function memoMarkdown(mission: Mission, cite: (ids?: string[]) => string) {

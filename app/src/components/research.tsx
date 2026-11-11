@@ -16,6 +16,7 @@ import {
   claimNumber,
   hostOf,
   pieces,
+  typeOf,
   type Claim,
   type GlossaryTerm,
   type Ledger,
@@ -365,12 +366,7 @@ const order: MissionStage[] = ["reading", "drafting", "reviewing", "delivered"]
 
 function stageDetail(mission: Mission, stage: MissionStage) {
   if (stage === "reading") return `${mission.found} sources · ${mission.claimCount} claims`
-  if (stage === "drafting")
-    return mission.type === "compare"
-      ? `${mission.written} of ${pieces(mission)} steps`
-      : mission.format === "guide"
-        ? `${mission.written} of ${pieces(mission)} sections`
-        : `${mission.claimCount} claims`
+  if (stage === "drafting") return typeOf(mission.type).drafted(mission)
   return mission.stage === "delivered"
     ? `${mission.claimCount} claims checked`
     : "Every claim to a source"
@@ -400,13 +396,7 @@ export function StageStrip({ mission }: { mission: Mission }) {
   // Reading has no known end, so its third fills as claims come in, up to a typical ledger.
   const progress =
     mission.stage === "reading"
-      ? Math.min(
-          1,
-          mission.claimCount /
-            ((mission.type === "compare"
-              ? mission.options.length * mission.criteria.length * 1.5
-              : mission.outline.length * 4) || 1),
-        ) / 3
+      ? Math.min(1, mission.claimCount / (typeOf(mission.type).claims(mission) || 1)) / 3
       : mission.stage === "drafting"
         ? 1 / 3 + mission.written / pieces(mission) / 3
         : 0.9
