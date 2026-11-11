@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -633,6 +634,31 @@ class FakeVerifyLlm(FakeLlm):
         return SimpleNamespace(parsed=parsed, text="")
 
 
+class FakeVerdictLlm(FakeVerifyLlm):
+    """A verification's judge: tags per part, some naming a claim or a part the mission lacks."""
+
+    TAGS = [
+        {"part": "p1", "claims": [{"claim": "c1", "stance": "supports"}, {"claim": "c2", "stance": "supports"},
+                                  {"claim": "c9", "stance": "supports"}, {"claim": "c4", "stance": "maybe"}]},
+        {"part": "p2", "claims": [{"claim": "c3", "stance": "refutes"}, {"claim": "c4", "stance": "context"}]},
+        {"part": "p9", "claims": [{"claim": "c1", "stance": "refutes"}]},
+    ]
+
+    def __init__(self, tags=None) -> None:
+        super().__init__()
+        self.tags = self.TAGS if tags is None else tags
+
+    def complete_structured(self, **kwargs):
+        if kwargs["purpose"].rsplit(".", 1)[-1] != "verdict":
+            return super().complete_structured(**kwargs)
+        self.calls.append(kwargs)
+        parsed = {
+            "parts": self.tags,
+            "change": ["A trial that tracked daily drinkers would settle it. [c1]", "Nobody has looked at it."],
+        }
+        return SimpleNamespace(parsed=parsed, text="")
+
+
 class VerifyTest(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = tempfile.TemporaryDirectory()
@@ -913,8 +939,9 @@ class ResearcherRunTest(unittest.TestCase):
         answer = self.ask("start", {"source_kinds": ["papers"], "strictness": "reputable"})
         self.assertEqual(answer.status, 200)
 
-    def lane_claim(self, lane: str, stance: Optional[str] = "supports", part: Optional[str] = "p1") -> dict:
-        args = {"claim": "A fact.", "url": "https://example.org/a", "title": "A", "kind": "papers",
+    def lane_claim(self, lane: str, stance: Optional[str] = "supports", part: Optional[str] = "p1",
+                   url: str = "https://example.org/a", title: str = "A") -> dict:
+        args = {"claim": "A fact.", "url": url, "title": title, "kind": "papers",
                 "snippet": "based solely on attention mechanisms", "stance": stance, "part": part}
         session = f"research-{self.mission['id']}" + (f"-{lane}" if lane else "")
         with mock.patch.object(research, "_fetch_words", page_words):
@@ -1110,6 +1137,115 @@ class ResearcherRunTest(unittest.TestCase):
             self.assertEqual(count, 0)
         finally:
             conn.close()
+
+    def read_verify(self, llm: Optional[FakeVerdictLlm] = None) -> str:
+        self.start_verify()
+        self.llm = llm or FakeVerdictLlm()
+        research.ctx = SimpleNamespace(llm=self.llm)
+        mission_id = self.mission["id"]
+        # The researchers' own stances: the against lane backs p1, and the for lane calls c4 context.
+        self.lane_claim("for", "supports", "p1", "https://www.example.org/cohort", "Cohort study")
+        self.lane_claim("against", "supports", "p1", "https://news.other.com/trial", "Trial report")
+        self.lane_claim("for", "refutes", "p2", "https://a.org/review", "Review")
+        self.lane_claim("against", "context", "p2", "https://b.org/background", "Background")
+        self.statuses(run_1="completed", run_2="completed")
+        self.assertEqual(self.moved(), [mission_id])
+        self.assertEqual(research.mission(self.path, mission_id)["stage"], "drafting")
+        return mission_id
+
+    def deliver_verify(self, llm: Optional[FakeVerdictLlm] = None) -> dict:
+        mission_id = self.read_verify(llm)
+        research._job(self.path, mission_id)
+        return research.mission(self.path, mission_id)
+
+    def test_a_claim_from_paste_to_verdict(self) -> None:
+        before = research._now()
+        found = self.deliver_verify()
+        after = research._now()
+        mission_id = found["id"]
+        self.assertEqual((found["stage"], found["formats"], found["error"]), ("delivered", ["verdict"], None))
+
+        # One judge call, on the profile's own model, blind to the user's wording, the researchers'
+        # stances and their lanes.
+        judged = [c for c in self.llm.calls if c["purpose"] == "gots.research.verdict"]
+        self.assertEqual(len(judged), 1)
+        self.assertNotIn("model", judged[0])
+        said = " ".join((judged[0]["system_prompt"], judged[0]["instructions"], judged[0]["input"][0]["text"])).lower()
+        told = set(re.findall(r"[a-z]+", "Drinking coffee every day raises heart attack risk.".lower()))
+        for word in set(re.findall(r"[a-z]+", self.LOADED.lower())) - told:
+            if len(word) > 3:
+                self.assertNotIn(word, said)
+        data = judged[0]["input"][0]["text"]
+        for hidden in ("stance", "lane", "supports", "refutes", "context", "against", "for:"):
+            self.assertNotIn(hidden, data.lower())
+        for shown in (
+            "Drinking coffee every day raises heart attack risk.",
+            "p1: Coffee is drunk every day",
+            "p2: Heart attack risk rises",
+            "Take literally: every day",
+            "[c1]",
+            "[c4]",
+            "Cohort study",
+            "https://www.example.org/cohort",
+            "based solely on attention mechanisms",
+        ):
+            self.assertIn(shown, data)
+
+        # The tags kept are the judge's, less any naming a claim, a part or a stance the mission lacks.
+        out = found["outputs"]["verdict"]
+        self.assertEqual(
+            out["tags"],
+            [
+                {"claim": "c1", "part": "p1", "stance": "supports"},
+                {"claim": "c2", "part": "p1", "stance": "supports"},
+                {"claim": "c3", "part": "p2", "stance": "refutes"},
+                {"claim": "c4", "part": "p2", "stance": "context"},
+            ],
+        )
+        # p1 is backed by two sites; p2 is refuted by one: some of it is supported.
+        self.assertEqual(out["verdict"]["label"], "partly_supported")
+        self.assertEqual(out["verdict"], research.verdict(found["parts"], found["ledger"], out["tags"]))
+        self.assertEqual(found["verdict"], out["verdict"])
+        self.assertEqual(
+            out["change"],
+            [[{"text": "A trial that tracked daily drinkers would settle it.", "cites": ["c1"]}],
+             [{"text": "Nobody has looked at it.", "flagged": True}]],
+        )
+        self.assertTrue(before <= out["checked_at"] <= after)
+        self.assertEqual([r["reason"] for r in found["revisions"]], ["first"])
+        self.assertEqual(found["revisions"][0]["outputs"]["verdict"], out)
+        self.assertEqual(self.notify.call_args_list[-1].args[0], "research_done")
+        self.assertEqual(self.notify.call_args_list[-1].kwargs.get("title"), found["title"])
+
+    def test_a_judge_that_tags_nothing_fails_the_step(self) -> None:
+        mission_id = self.read_verify(FakeVerdictLlm(tags=[{"part": "p1", "claims": [{"claim": "c9", "stance": "supports"}]}]))
+        with self.assertRaisesRegex(research.ResearchError, "^The judge tagged nothing.$") as failed:
+            research._job(self.path, mission_id)
+        self.assertEqual(failed.exception.status, 502)
+        found = research.mission(self.path, mission_id)
+        self.assertEqual((found["stage"], found["formats"]), ("drafting", []))
+        self.assertNotIn("verdict", found["outputs"])
+
+    def test_a_delivered_label_does_not_move_when_the_rule_changes(self) -> None:
+        found = self.deliver_verify()
+        self.assertEqual(found["verdict"]["label"], "partly_supported")
+        with mock.patch.object(research, "verdict", lambda *_: {"label": "refuted"}):
+            again = research.mission(self.path, found["id"])
+        self.assertEqual(again["verdict"]["label"], "partly_supported")
+        self.assertEqual(again["outputs"]["verdict"]["verdict"]["label"], "partly_supported")
+
+    def test_a_verification_has_no_other_formats_follow_ups_or_rewrite(self) -> None:
+        found = self.deliver_verify()
+        with self.assertRaisesRegex(research.ResearchError, "one format, the verdict"):
+            research.make_format(self.path, found["id"], "quiz")
+        with self.assertRaisesRegex(research.ResearchError, "Learn & understand"):
+            research.followup(self.path, found["id"], {"questions": ["Why?"]})
+        with self.assertRaisesRegex(research.ResearchError, "Only a Learn"):
+            research.rewrite(self.path, found["id"], {})
+        # No follow-up questions are asked for.
+        self.assertNotIn("gots.research.suggest", [c["purpose"] for c in self.llm.calls])
+        after = research.mission(self.path, found["id"])
+        self.assertEqual((after["suggestions"], after["formats"], after["stage"]), ([], ["verdict"], "delivered"))
 
     def test_removing_a_verification_stops_both_runs(self) -> None:
         self.start_verify()

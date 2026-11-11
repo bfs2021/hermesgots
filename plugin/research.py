@@ -2270,10 +2270,112 @@ def _draft_compare(path: Path, found: Dict[str, Any]) -> None:
     _tell(path, "research_done", mission_id, found["title"])
 
 
-def _verify_not_yet(*_: Any) -> Any:
-    # A verification's reading and verdict come in later steps; until then a mission waits at
-    # reading.
-    raise ResearchError("A verification can't be read yet.", 501)
+# --- a verification's verdict --------------------------------------------------------------------
+
+STANCES = ("supports", "refutes", "context")
+VERDICT_SYSTEM = (
+    "You weigh evidence about a claim, impartially. For each part of the claim you say which "
+    "claims in the evidence ledger bear on it and how: one that shows the part is true supports "
+    "it, one that shows it is false refutes it, and one that is only background settles neither "
+    "way and is context. Judge each claim by its own words and passage, never by who found it."
+)
+VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "parts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "part": {"type": "string"},
+                    "claims": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"claim": {"type": "string"}, "stance": {"type": "string", "enum": list(STANCES)}},
+                            "required": ["claim", "stance"],
+                        },
+                    },
+                },
+                "required": ["part", "claims"],
+            },
+        },
+        "change": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 2},
+    },
+    "required": ["parts", "change"],
+}
+
+
+def _verify_ledger_text(found: Dict[str, Any]) -> str:
+    """The claim as confirmed, with the terms it takes literally, and the ledger as evidence alone:
+    each claim's words, its source and its passage, with nothing of the reading that found it."""
+    sources = {source["id"]: source for source in found["ledger"]["sources"]}
+    parts = "\n".join(f"- {p['id']}: {p['text']}" for p in found["parts"])
+    lines = []
+    for claim in found["ledger"]["claims"]:
+        source = sources.get(claim["source"]) or {}
+        note = " (uncertain)" if claim["confidence"] == "uncertain" else ""
+        lines.append(
+            f"[{claim['id']}]{note} {claim['text']}\n    Source: {source.get('title', '')} "
+            f"({source.get('url', '')})\n    Passage: \"{claim['snippet']}\""
+        )
+    terms = ", ".join(found["terms"])
+    return (
+        f"Claim: {found['restatement']}\nParts:\n{parts}\n"
+        + (f"Take literally: {terms}\n" if terms else "")
+        + "\nLedger:\n"
+        + "\n".join(lines)
+    )
+
+
+def judge_claim(found: Dict[str, Any]) -> Dict[str, Any]:
+    """One judge tags the claims that bear on each part, and says what would change the answer.
+    The label is not its to give."""
+    known = {claim["id"] for claim in found["ledger"]["claims"]}
+    parts = {p["id"] for p in found["parts"]}
+    instructions = (
+        "For every part, list the ids of the claims that bear on it, each with supports, refutes or "
+        "context. Read every claim by the terms the claim takes literally, where it names any: a "
+        "passage that does not meet a term's plain meaning does not support the part. Leave out a claim that has nothing to do with a part. Then write change in 1 or 2 "
+        f"sentences saying what evidence would change the answer. In change: {CITE_RULE}"
+    )
+    answer = _structured("verdict", VERDICT_SYSTEM, instructions, _verify_ledger_text(found), VERDICT_SCHEMA, 4000)
+    tags: List[Dict[str, str]] = []
+    for item in answer.get("parts") or []:
+        if not isinstance(item, dict) or item.get("part") not in parts:
+            continue
+        for tag in item.get("claims") or []:
+            if not isinstance(tag, dict) or tag.get("claim") not in known or tag.get("stance") not in STANCES:
+                continue
+            kept = {"claim": tag["claim"], "part": item["part"], "stance": tag["stance"]}
+            if kept not in tags:
+                tags.append(kept)
+    if not tags:
+        raise ResearchError("The judge tagged nothing.", 502)
+    change = [spans(text, known) for text in answer.get("change") or [] if isinstance(text, str) and text.strip()]
+    return {"tags": tags, "change": [paragraph for paragraph in change if paragraph]}
+
+
+def _draft_verify(path: Path, found: Dict[str, Any]) -> None:
+    """The judge's tags, and the verdict worked out from them once, here: what a reader was shown is
+    what a later read shows, whatever the rule becomes."""
+    mission_id = found["id"]
+    if found["stage"] == "drafting":
+        judged = judge_claim(found)
+        content = {
+            "tags": judged["tags"],
+            "verdict": verdict(found["parts"], found["ledger"], judged["tags"]),
+            "change": judged["change"],
+            "checked_at": _now(),
+        }
+        _save_output(path, mission_id, VERIFY_FORMAT, content)
+        _update(path, mission_id, written=1, stage="reviewing")
+    found = mission(path, mission_id) or found
+    found["formats"] = [VERIFY_FORMAT]
+    if not found["revisions"]:
+        _revision(path, found, "first")
+    _update(path, mission_id, stage="delivered", formats=[VERIFY_FORMAT], pending=None)
+    _tell(path, "research_done", mission_id, found["title"])
 
 
 @dataclass(frozen=True)
@@ -2363,8 +2465,9 @@ MISSION_TYPES: Dict[str, MissionType] = {
         bearing=_verify_bearing,
         # One claim is something to judge; none is the empty reading.
         min_claims=lambda found: 1,
-        draft=_verify_not_yet,
-        derive=lambda found: {},
+        draft=_draft_verify,
+        # The verdict as it was worked out at delivery, never again on a read.
+        derive=lambda found: {"verdict": (found["outputs"].get(VERIFY_FORMAT) or {}).get("verdict")},
         every_lane_completes=True,
         keeps_searches=True,
         formats_refused="A verification has one format, the verdict.",
