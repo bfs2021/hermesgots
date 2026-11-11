@@ -58,7 +58,6 @@ ctx: Any = None
 FORMATS = ("guide", "quiz", "glossary")
 # A comparison delivers one thing, the memo; there are no other formats to make.
 COMPARE_FORMAT = "memo"
-# A verification delivers one thing, the verdict.
 VERIFY_FORMAT = "verdict"
 MIN_OPTIONS = 2
 MAX_OPTIONS = 5
@@ -87,7 +86,6 @@ MAX_AUDIENCE = 160
 MAX_TITLE = 120
 MAX_POINTS = 6
 MAX_POINT = 200
-# A claim is checked in at most this many parts.
 MAX_PARTS = 4
 MAX_TERMS = 8
 # A follow-up round adds at most this many questions, each a section of its own, and the outline
@@ -1938,7 +1936,6 @@ def decide(options: List[Dict[str, Any]], criteria: List[Dict[str, Any]], memo: 
 
 # Second-level labels under a two-letter TLD that a site registers beneath (bbc.co.uk, not co.uk).
 GENERIC_SECOND = {"co", "com", "org", "net", "gov", "ac", "edu", "gob", "mil", "nic", "ltd", "plc", "sch", "nhs"}
-# A verification's labels, from its parts' stances.
 VERDICT_LABELS = ("supported", "partly_supported", "disputed", "not_supported", "refuted", "cant_tell", "thin")
 
 
@@ -2409,7 +2406,6 @@ class MissionType:
     # Whether a lane that stopped short fails the reading whatever was recorded: a verdict read in
     # one direction is the bias the lanes are there to remove.
     every_lane_completes: bool = False
-    # Whether each lane's web searches are kept and read back with the mission.
     keeps_searches: bool = False
     formats_refused: Optional[str] = None
     followup_refused: Optional[str] = None
