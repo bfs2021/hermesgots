@@ -28,7 +28,7 @@ import { attempt } from "@/lib/attempt"
 import { Banner } from "@/components/banner"
 import { Bot } from "@/components/bot"
 import { CompareBriefForm, CompareScopeForm, MemoCanvas, SourceKinds } from "@/components/compare"
-import { VerifyBriefForm } from "@/components/verify"
+import { VerifyBriefForm, VerifyScopeForm } from "@/components/verify"
 import { BotPicker } from "@/components/chat/bot-picker"
 import { ModelPicker, PICKER_HEIGHT } from "@/components/chat/model-picker"
 import { useOpenDrawer } from "@/components/drawer-context"
@@ -133,7 +133,7 @@ type MissionView = {
 /** The forms and canvas a type draws: a type not listed is briefed and scoped as a guide. */
 const VIEWS: Partial<Record<MissionType, MissionView>> = {
   compare: { Brief: CompareBriefForm, Scope: CompareScopeForm, Canvas: MemoCanvas },
-  verify: { Brief: VerifyBriefForm, Scope: ScopeForm },
+  verify: { Brief: VerifyBriefForm, Scope: VerifyScopeForm },
 }
 const viewOf = (type: MissionType): MissionView =>
   VIEWS[type] ?? { Brief: BriefForm, Scope: ScopeForm }

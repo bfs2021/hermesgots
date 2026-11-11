@@ -233,7 +233,12 @@ export interface VerifyBrief {
   parts: Part[]
   terms: string[]
   uncheckable?: string
+  /** How strict the reading is about its sources, once the Scope Gate passed. */
+  strictness?: Strictness
 }
+
+/** Any source, or primary and reputable sources only. */
+export type Strictness = "any" | "reputable"
 
 export const MAX_PARTS = 4
 export const MAX_TERMS = 8
@@ -430,6 +435,8 @@ function toVerify(raw: Record<string, unknown>): VerifyBrief {
     })),
     terms: list(raw.terms).filter((t): t is string => typeof t === "string"),
     uncheckable: text(raw.uncheckable) || undefined,
+    strictness:
+      raw.strictness === "any" || raw.strictness === "reputable" ? raw.strictness : undefined,
   }
 }
 
@@ -693,6 +700,13 @@ export const approveScope = (mission: Mission, outline: string[], sources: Sourc
 /** A comparison's Scope Gate: the kinds of source, and the model that judges (the bot's own if none). */
 export const approveComparison = (mission: Mission, sources: SourceKind[], judge?: ModelChoice) =>
   act(mission, "start", { source_kinds: sources, ...(judge ? { judge } : {}) })
+
+/** A verification's Scope Gate: the kinds of source, and how strict the reading is about them. */
+export const approveVerification = (
+  mission: Mission,
+  sources: SourceKind[],
+  strictness: Strictness,
+) => act(mission, "start", { source_kinds: sources, strictness })
 
 /** Another format from the same ledger: no new reading, only writing. */
 export const makeFormat = (mission: Mission, format: OutputFormat) =>

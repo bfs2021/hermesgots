@@ -855,6 +855,43 @@ class ResearcherRunTest(unittest.TestCase):
         self.assertEqual(self.moved(), [self.mission["id"]])
         self.assertEqual(research.mission(self.path, self.mission["id"])["stage"], "drafting")
 
+    def test_the_scope_gate_checks_a_verification_and_nothing_is_read_before_it(self) -> None:
+        self.llm = FakeVerifyLlm()
+        research.ctx = SimpleNamespace(llm=self.llm)
+        self.mission = research.create(self.path, None, "Coffee KILLS you, every daily cup!!", "verify")
+        args = {"claim": "A fact.", "url": "https://example.org/a", "title": "A", "kind": "articles",
+                "snippet": "based solely on attention mechanisms", "stance": "for", "part": "p1"}
+        with self.assertRaisesRegex(research.ResearchError, "isn't reading"):
+            research.record(self.path, self.mission["id"], args, page_words)
+        research._job(self.path, self.mission["id"])
+        research.confirm_brief(
+            self.path, self.mission["id"], {"restatement": "Daily coffee raises heart attack risk.", "parts": ["Risk rises"]}
+        )
+        with self.assertRaisesRegex(research.ResearchError, "isn't reading"):
+            research.record(self.path, self.mission["id"], args, page_words)
+        good = {"source_kinds": ["papers", "articles"], "strictness": "reputable"}
+        for body in (
+            {**good, "source_kinds": ["tv"]},
+            {**good, "source_kinds": []},
+            {"source_kinds": ["papers"]},
+            {**good, "strictness": "strict"},
+            {**good, "strictness": None},
+        ):
+            answer = self.ask("start", body)
+            self.assertEqual(answer.status, 400, body)
+            self.assertEqual(research.mission(self.path, self.mission["id"])["stage"], "scope")
+        answer = self.ask("start", good)
+        self.assertEqual(answer.status, 200)
+        found = research.mission(self.path, self.mission["id"])
+        self.assertEqual(
+            (found["stage"], found["busy"], found["error"], found["source_kinds"], found["strictness"]),
+            ("reading", None, None, ["papers", "articles"], "reputable"),
+        )
+        # Reading starts in a later step: nothing is posted, and the mission waits rather than fails.
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.moved(), [])
+        self.assertIsNone(research.mission(self.path, self.mission["id"])["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

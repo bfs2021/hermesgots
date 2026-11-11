@@ -46,7 +46,8 @@ logger = logging.getLogger(__name__)
 # 65 keeps a research mission's runs one per lane (`research.py`): one new table, and a mission's old
 # single run copied in as its one lane's, so a mission reading at the upgrade is still watched.
 # 66 keeps a verification's read-back on its mission (`research.py`): four new columns.
-SCHEMA_VERSION = 66
+# 67 keeps a verification's strictness on its mission (`research.py`): one new column.
+SCHEMA_VERSION = 67
 
 
 def data_dir(hermes_home: Path) -> Path:
@@ -548,7 +549,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # v66: a verification's read-back (research.py): the claim restated, its parts, the terms
         # taken literally, and why it can't be checked when it can't.
         mission_columns = {row[1] for row in conn.execute("PRAGMA table_info(research_missions)")}
-        for column in ("restatement", "parts", "terms", "uncheckable"):
+        # v67: how strict its lanes are about their sources.
+        for column in ("restatement", "parts", "terms", "uncheckable", "strictness"):
             if column not in mission_columns:
                 conn.execute(f"ALTER TABLE research_missions ADD COLUMN {column} TEXT")
         # v32: the messages triage sent out of a Main thread, for its Moved markers (moves.py).

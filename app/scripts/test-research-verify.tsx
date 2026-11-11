@@ -8,7 +8,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { VerifyBriefForm } from "@/components/verify"
+import { VerifyBriefForm, VerifyScopeForm } from "@/components/verify"
 import { db } from "@/lib/db"
 import { createMission, type Mission } from "@/lib/research"
 import {
@@ -141,4 +141,32 @@ test("a verify mission is refused where the plugin lacks research_verify", async
     /needs an update for Verify a claim/,
   )
   assert.deepEqual(posts, [], "nothing is posted")
+})
+
+test("the verify Scope Gate sends the kinds and the strictness", async () => {
+  const bot = botProfile("verify-scope")
+  await db.profiles.put(bot)
+  const posts = host(["research", "research_verify"])
+  const atScope = mission({
+    stage: "scope",
+    outline: ["Coffee is drunk daily", "The risk of a heart attack rises"],
+  })
+  await mount(<VerifyScopeForm mission={atScope} />, async () => {
+    assert.match(text(), /Coffee is drunk daily/)
+    assert.match(text(), /The risk of a heart attack rises/)
+    absent('input[aria-label^="Part "]', "the parts are read-only here")
+    absent('textarea[aria-label^="Point "]', "the parts are read-only here")
+    const any = findText('[role="radio"]', "Any source")
+    assert.equal(any.getAttribute("aria-checked"), "true", "any source until another is picked")
+    await click(findText('[role="checkbox"]', "Articles and blogs"))
+    await click(findText('[role="radio"]', "Primary and reputable"))
+    await click(findText("button", "Approve and start research"))
+  })
+  assert.deepEqual(posts, [
+    {
+      path: "/api/plugins/gots/research/r_1/start",
+      body: { source_kinds: ["papers", "articles"], strictness: "reputable" },
+    },
+  ])
+  await db.profiles.delete(bot.id)
 })

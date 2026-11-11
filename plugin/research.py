@@ -204,6 +204,7 @@ def _summary(row: Any, conn: Any) -> Dict[str, Any]:
         "parts": _loads(row["parts"], []),
         "terms": _loads(row["terms"], []),
         "uncheckable": row["uncheckable"],
+        "strictness": row["strictness"],
         "found": counts[0],
         "claims": counts[1],
         "created_at": row["created_at"],
@@ -506,6 +507,14 @@ def approve_scope(path: Path, mission_id: str, body: Dict[str, Any]) -> Dict[str
     return type_of(found).approve_scope(path, found, body)
 
 
+def _source_kinds(body: Dict[str, Any]) -> List[str]:
+    """The Scope Gate's kinds of source, each known, repeats dropped; none is refused."""
+    kinds = body.get("source_kinds")
+    if not isinstance(kinds, list) or not kinds or any(kind not in SOURCE_KINDS for kind in kinds):
+        raise ResearchError("Pick the kinds of source.")
+    return list(dict.fromkeys(kinds))
+
+
 def _approve_learn_scope(path: Path, found: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
     mission_id = found["id"]
     points = body.get("outline")
@@ -516,15 +525,13 @@ def _approve_learn_scope(path: Path, found: Dict[str, Any], body: Dict[str, Any]
         raise ResearchError("The outline needs a point.")
     if len(outline) > MAX_POINTS:
         raise ResearchError(f"The outline can have {MAX_POINTS} points at most.")
-    kinds = body.get("source_kinds")
-    if not isinstance(kinds, list) or not kinds or any(kind not in SOURCE_KINDS for kind in kinds):
-        raise ResearchError("Pick the kinds of source.")
+    kinds = _source_kinds(body)
     _clear(path, mission_id)
     _update(
         path,
         mission_id,
         outline=outline,
-        source_kinds=list(dict.fromkeys(kinds)),
+        source_kinds=kinds,
         stage="reading",
         busy=None,
         error=None,
@@ -548,15 +555,31 @@ def pick_model(body: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
 
 def _approve_compare_scope(path: Path, found: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
-    kinds = body.get("source_kinds")
-    if not isinstance(kinds, list) or not kinds or any(kind not in SOURCE_KINDS for kind in kinds):
-        raise ResearchError("Pick the kinds of source.")
+    kinds = _source_kinds(body)
     judge = pick_model(body.get("judge") if isinstance(body.get("judge"), dict) else {})
     mission_id = found["id"]
     _clear(path, mission_id)
     _update(
-        path, mission_id, source_kinds=list(dict.fromkeys(kinds)), judge=judge, stage="reading", busy=None,
+        path, mission_id, source_kinds=kinds, judge=judge, stage="reading", busy=None,
         error=None,
+    )
+    return mission(path, mission_id)  # type: ignore[return-value]
+
+
+# How strict a verification's lanes are about their sources: any source, or primary and reputable only.
+STRICTNESS = ("any", "reputable")
+
+
+def _approve_verify_scope(path: Path, found: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    kinds = _source_kinds(body)
+    strictness = body.get("strictness")
+    if strictness not in STRICTNESS:
+        raise ResearchError(f"strictness must be one of: {', '.join(STRICTNESS)}.")
+    mission_id = found["id"]
+    _clear(path, mission_id)
+    _update(
+        path, mission_id, source_kinds=kinds, strictness=strictness, stage="reading",
+        busy=None, error=None,
     )
     return mission(path, mission_id)  # type: ignore[return-value]
 
@@ -1951,8 +1974,8 @@ def _draft_compare(path: Path, found: Dict[str, Any]) -> None:
 
 
 def _verify_not_yet(*_: Any) -> Any:
-    # A verification's Scope Gate, reading and verdict come in later steps; until then a mission
-    # stops at the Scope Gate.
+    # A verification's reading and verdict come in later steps; until then a mission waits at
+    # reading.
     raise ResearchError("A verification can't be read yet.", 501)
 
 
@@ -2028,7 +2051,7 @@ MISSION_TYPES: Dict[str, MissionType] = {
         confirm_brief=_confirm_verify_brief,
         brief_text=lambda row: f"Claim: {row['restatement']}\n"
         + "".join(f"Part {p['id']}: {p['text']}\n" for p in row["parts"]),
-        approve_scope=_verify_not_yet,
+        approve_scope=_approve_verify_scope,
         outline_call=False,
         lanes=(),
         bearing=_no_bearing,
@@ -2250,8 +2273,8 @@ def _check_watched() -> List[Tuple[Path, str, Optional[str]]]:
             _forget(path, mission_id)
             continue
         runs = runs_of(path, mission_id)
-        if any(lane.name not in runs for lane in lanes(found)):
-            # Still being started.
+        if not lanes(found) or any(lane.name not in runs for lane in lanes(found)):
+            # Still being started, or a type whose reading isn't started yet.
             continue
         statuses = {run_id: _run_status(run_id) for run_id in runs.values()}
         for run_id, status in statuses.items():

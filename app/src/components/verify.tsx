@@ -2,12 +2,22 @@ import { useState } from "react"
 import { PlusIcon, XIcon } from "lucide-react"
 
 import { Banner } from "@/components/banner"
+import { Bot } from "@/components/bot"
+import { SourceKinds } from "@/components/compare"
+import { Segmented } from "@/components/segmented"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
 import { Textarea } from "@/components/ui/textarea"
 import { attempt } from "@/lib/attempt"
-import { MAX_PARTS, MAX_TERMS, confirmVerification, type Mission } from "@/lib/research"
+import {
+  MAX_PARTS,
+  MAX_TERMS,
+  approveVerification,
+  confirmVerification,
+  type Mission,
+  type Strictness,
+} from "@/lib/research"
 
 function Section({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -143,6 +153,63 @@ export function VerifyBriefForm({ mission }: { mission: Mission }) {
       >
         {saving && <Spinner data-icon="inline-start" />}
         Continue
+      </Button>
+    </>
+  )
+}
+
+const STRICTNESS: { id: Strictness; label: string }[] = [
+  { id: "any", label: "Any source" },
+  { id: "reputable", label: "Primary and reputable" },
+]
+
+/** A verification's Scope Gate: its parts as confirmed, the kinds of source and how strict the
+ * reading is about them; nothing is read until it is approved. */
+export function VerifyScopeForm({ mission, botId }: { mission: Mission; botId?: string }) {
+  const [sources, setSources] = useState(mission.sources)
+  const [strictness, setStrictness] = useState<Strictness>(mission.verify?.strictness ?? "any")
+  const [starting, setStarting] = useState(false)
+
+  return (
+    <>
+      <h2 className="flex items-center gap-2.5 font-semibold">
+        <Bot id={botId} className="size-7" />
+        What I'll check
+      </h2>
+      <ol className="-mt-2 flex flex-col gap-1.5 text-sm">
+        {(mission.verify?.parts ?? []).map((part, index) => (
+          <li key={part.id} className="flex items-start gap-2">
+            <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-semibold tabular-nums">
+              {index + 1}
+            </span>
+            <span className="leading-6">{part.text}</span>
+          </li>
+        ))}
+      </ol>
+      <div className="flex flex-col gap-2">
+        <h2 className="font-semibold">Sources</h2>
+        <SourceKinds value={sources} onChange={setSources} />
+        <Segmented
+          label="Strictness"
+          options={STRICTNESS}
+          value={strictness}
+          onChange={setStrictness}
+        />
+      </div>
+      <Button
+        size="lg"
+        className="h-11 rounded-full md:self-end md:px-6"
+        disabled={!sources.length || starting}
+        onClick={async () => {
+          setStarting(true)
+          await attempt("start the research", () =>
+            approveVerification(mission, sources, strictness),
+          )
+          setStarting(false)
+        }}
+      >
+        {starting && <Spinner data-icon="inline-start" />}
+        Approve and start research
       </Button>
     </>
   )

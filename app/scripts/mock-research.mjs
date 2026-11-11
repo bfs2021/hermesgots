@@ -798,7 +798,7 @@ export async function handleResearch(req, res, path, { json, readBody, noteEvent
       title: input,
       busy: "brief",
       ...(type === "compare" ? { type, format: "memo" } : {}),
-      ...(type === "verify" ? { type, format: "verdict", restatement: null, parts: [], terms: [], uncheckable: null } : {}),
+      ...(type === "verify" ? { type, format: "verdict", restatement: null, parts: [], terms: [], uncheckable: null, strictness: null } : {}),
     })
     missions.set(m.id, m)
     note(m.id)
@@ -883,6 +883,17 @@ export async function handleResearch(req, res, path, { json, readBody, noteEvent
         m.outputs = {}
         change(m, { source_kinds: kinds, judge, stage: "reading", written: 0, formats: [], error: null }, note)
         compare(m, note)
+        break
+      }
+      if (m.type === "verify") {
+        const kinds = body.source_kinds ?? []
+        if (!kinds.length || kinds.some((k) => !SOURCE_KINDS.includes(k))) return fail(400, "Pick the kinds of source."), true
+        if (!["any", "reputable"].includes(body.strictness))
+          return fail(400, "strictness must be one of: any, reputable."), true
+        m.ledger = { sources: [], claims: [] }
+        m.outputs = {}
+        // Reading a claim comes later: the mission waits at reading.
+        change(m, { source_kinds: kinds, strictness: body.strictness, stage: "reading", written: 0, formats: [], error: null }, note)
         break
       }
       const outline = (body.outline ?? []).filter((p) => typeof p === "string" && p.trim())
