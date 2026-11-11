@@ -3,6 +3,7 @@ import { useLiveQuery } from "dexie-react-hooks"
 import { Navigate, useLocation, useNavigate, useParams } from "react-router"
 import {
   ArrowUpIcon,
+  BadgeCheckIcon,
   BookAIcon,
   BookMarkedIcon,
   BookOpenTextIcon,
@@ -28,7 +29,7 @@ import { attempt } from "@/lib/attempt"
 import { Banner } from "@/components/banner"
 import { Bot } from "@/components/bot"
 import { CompareBriefForm, CompareScopeForm, MemoCanvas, SourceKinds } from "@/components/compare"
-import { VerifyBriefForm, VerifyScopeForm } from "@/components/verify"
+import { VerdictCanvas, VerifyBriefForm, VerifyScopeForm } from "@/components/verify"
 import { BotPicker } from "@/components/chat/bot-picker"
 import { ModelPicker, PICKER_HEIGHT } from "@/components/chat/model-picker"
 import { useOpenDrawer } from "@/components/drawer-context"
@@ -117,6 +118,7 @@ const FORMAT_ICONS: Record<OutputFormat, typeof BookOpenTextIcon> = {
   quiz: ListChecksIcon,
   glossary: BookAIcon,
   memo: ScaleIcon,
+  verdict: BadgeCheckIcon,
 }
 
 /** The picture of the bot running the mission. */
@@ -133,13 +135,17 @@ type MissionView = {
 /** The forms and canvas a type draws: a type not listed is briefed and scoped as a guide. */
 const VIEWS: Partial<Record<MissionType, MissionView>> = {
   compare: { Brief: CompareBriefForm, Scope: CompareScopeForm, Canvas: MemoCanvas },
-  verify: { Brief: VerifyBriefForm, Scope: VerifyScopeForm },
+  verify: { Brief: VerifyBriefForm, Scope: VerifyScopeForm, Canvas: VerdictCanvas },
 }
 const viewOf = (type: MissionType): MissionView =>
   VIEWS[type] ?? { Brief: BriefForm, Scope: ScopeForm }
 
 const formatName = (format: OutputFormat) =>
-  format === "memo" ? "Memo" : FORMATS.find((f) => f.id === format)!.name
+  format === "memo"
+    ? "Memo"
+    : format === "verdict"
+      ? "Verdict"
+      : FORMATS.find((f) => f.id === format)!.name
 
 /**
  * Research: start a mission from a question, and the missions so far by what they need. Where the
@@ -883,10 +889,18 @@ function BriefSummary({ mission }: { mission: Mission }) {
     <div className="flex items-start gap-3 rounded-3xl border bg-card px-4 py-3">
       <Icon className="mt-0.5 size-5 shrink-0 text-muted-foreground" />
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <p className="line-clamp-2 text-sm">{mission.goal}</p>
+        <p className="line-clamp-2 text-sm">{mission.verify?.restatement || mission.goal}</p>
         <p className="truncate text-xs text-muted-foreground">
-          {formatName(mission.format)} · {mission.depth === "deep" ? "In depth" : "Overview"} ·{" "}
-          {mission.audience}
+          {(mission.verify
+            ? [formatName(mission.format)]
+            : [
+                formatName(mission.format),
+                mission.depth === "deep" ? "In depth" : "Overview",
+                mission.audience,
+              ]
+          )
+            .filter(Boolean)
+            .join(" · ")}
         </p>
       </div>
       <Button
@@ -1112,8 +1126,9 @@ function WorkView({ mission, onBack }: { mission: Mission; onBack?: () => void }
             <div className="flex flex-col gap-1">
               <h2 className="text-2xl font-semibold tracking-tight">{mission.title}</h2>
               <p className="text-sm text-muted-foreground">
-                {formatName(viewed)} · {mission.found || "…"} sources · For{" "}
-                {mission.audience.charAt(0).toLowerCase() + mission.audience.slice(1)}
+                {formatName(viewed)} · {mission.found || "…"} sources
+                {mission.audience &&
+                  ` · For ${mission.audience.charAt(0).toLowerCase() + mission.audience.slice(1)}`}
               </p>
             </div>
             {Canvas ? (

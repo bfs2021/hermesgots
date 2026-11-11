@@ -1,9 +1,19 @@
 import { useState } from "react"
-import { PlusIcon, XIcon } from "lucide-react"
+import {
+  BadgeCheckIcon,
+  BadgeXIcon,
+  CircleHelpIcon,
+  PlusIcon,
+  ScaleIcon,
+  SearchIcon,
+  XIcon,
+  type LucideIcon,
+} from "lucide-react"
 
 import { Banner } from "@/components/banner"
 import { Bot } from "@/components/bot"
 import { SourceKinds } from "@/components/compare"
+import { Bars, Spans } from "@/components/research"
 import { Segmented } from "@/components/segmented"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -11,13 +21,25 @@ import { Spinner } from "@/components/ui/spinner"
 import { Textarea } from "@/components/ui/textarea"
 import { attempt } from "@/lib/attempt"
 import {
+  LANES,
   MAX_PARTS,
   MAX_TERMS,
+  VERDICT_NAMES,
   approveVerification,
+  checkedOn,
+  claimNumber,
   confirmVerification,
+  hostOf,
+  leadsLine,
+  sourcesLine,
+  stanceWord,
+  type Claim,
   type Mission,
+  type PartStance,
   type Strictness,
+  type VerdictLabel,
 } from "@/lib/research"
+import { cn } from "@/lib/utils"
 
 function Section({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -212,5 +234,201 @@ export function VerifyScopeForm({ mission, botId }: { mission: Mission; botId?: 
         Approve and start research
       </Button>
     </>
+  )
+}
+
+/** The colour a verdict or a part's stance wears: green backed, red refuted, amber mixed or thin. */
+const TONES: Record<VerdictLabel | PartStance, { dot: string; icon: LucideIcon }> = {
+  supported: { dot: "bg-success", icon: BadgeCheckIcon },
+  partly_supported: { dot: "bg-warning", icon: ScaleIcon },
+  disputed: { dot: "bg-warning", icon: ScaleIcon },
+  thin: { dot: "bg-warning", icon: CircleHelpIcon },
+  refuted: { dot: "bg-destructive", icon: BadgeXIcon },
+  not_supported: { dot: "bg-muted-foreground", icon: CircleHelpIcon },
+  cant_tell: { dot: "bg-muted-foreground", icon: CircleHelpIcon },
+}
+
+const CLAIM_STANCES: Record<NonNullable<Claim["stance"]>, string> = {
+  supports: "Supports",
+  refutes: "Refutes",
+  context: "Context",
+}
+
+/**
+ * A verification's verdict as the plugin stored it at delivery: the label with its sentence and
+ * counts, each part's stance, what each lane found and searched, and what would change it. Nothing
+ * here is worked out; while it reads, the lanes fill and the card waits.
+ */
+export function VerdictCanvas({
+  mission,
+  onCite,
+}: {
+  mission: Mission
+  onCite: (id: string) => void
+}) {
+  const output = mission.outputs?.verdict
+  const verdict = output?.verdict ?? mission.verdict
+  const claims = mission.ledger?.claims ?? []
+  const sources = new Map(mission.ledger?.sources.map((s) => [s.id, s]))
+  const partText = (id: string) => mission.verify?.parts.find((p) => p.id === id)?.text ?? id
+  const Icon = verdict && TONES[verdict.label].icon
+
+  return (
+    <div className="flex flex-col gap-6">
+      <section data-verdict className="flex flex-col gap-2 rounded-3xl border bg-card p-4 md:p-5">
+        {verdict && Icon ? (
+          <>
+            <div className="flex items-center gap-2">
+              <span
+                className={cn(
+                  "flex size-8 shrink-0 items-center justify-center rounded-full text-background",
+                  TONES[verdict.label].dot,
+                )}
+              >
+                <Icon className="size-4.5" />
+              </span>
+              <h3 className="text-lg font-semibold tracking-tight">
+                {VERDICT_NAMES[verdict.label]}
+              </h3>
+            </div>
+            <p className="leading-7">{verdict.why}</p>
+            <p className="text-sm text-muted-foreground">
+              {[
+                sourcesLine(verdict),
+                verdict.leads ? leadsLine(verdict) : "",
+                output?.checkedAt ? `Checked ${checkedOn(output.checkedAt)}` : "",
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </p>
+          </>
+        ) : (
+          <>
+            <h3 className="text-lg font-semibold tracking-tight">Verdict</h3>
+            <Bars />
+          </>
+        )}
+      </section>
+
+      {verdict && (
+        <section className="flex flex-col gap-2">
+          <h3 className="font-semibold">Parts</h3>
+          <table data-parts className="w-full border-separate border-spacing-0 text-left text-sm">
+            <thead>
+              <tr className="text-xs text-muted-foreground">
+                <th className="py-2 pr-3 font-medium">Part</th>
+                <th className="py-2 pr-3 font-medium">Stance</th>
+                <th className="py-2 pr-2 text-right font-medium">For</th>
+                <th className="py-2 text-right font-medium">Against</th>
+              </tr>
+            </thead>
+            <tbody>
+              {verdict.parts.map((part) => (
+                <tr key={part.part} className="align-top">
+                  <td className="border-t py-2.5 pr-3 leading-6">{partText(part.part)}</td>
+                  <td className="border-t py-2.5 pr-3 leading-6">
+                    <span className="inline-flex items-baseline gap-1.5">
+                      <span
+                        className={cn(
+                          "size-2 shrink-0 translate-y-[-1px] rounded-full",
+                          TONES[part.stance].dot,
+                        )}
+                        aria-hidden
+                      />
+                      {stanceWord(part)}
+                    </span>
+                  </td>
+                  <td className="border-t py-2.5 pr-2 text-right leading-6 tabular-nums">
+                    {part.supporting}
+                  </td>
+                  <td className="border-t py-2.5 text-right leading-6 tabular-nums">
+                    {part.refuting}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+
+      <section className="flex flex-col gap-3">
+        {LANES.map((lane) => {
+          const found = claims.filter((claim) => claim.lane === lane.id)
+          const searched = mission.searches?.[lane.id] ?? []
+          return (
+            <div
+              key={lane.id}
+              data-lane={lane.id}
+              className="flex min-w-0 flex-col gap-2 rounded-3xl border bg-card p-4"
+            >
+              <h3 className="flex items-baseline gap-2 font-semibold">
+                {lane.name}
+                <span className="text-sm font-normal text-muted-foreground tabular-nums">
+                  {found.length}
+                </span>
+              </h3>
+              {found.length > 0 && (
+                <ul className="-mx-2 flex flex-col">
+                  {found.map((claim) => {
+                    const source = sources.get(claim.source)
+                    return (
+                      <li key={claim.id}>
+                        <button
+                          type="button"
+                          onClick={() => onCite(claim.id)}
+                          className="flex min-h-11 w-full items-start gap-2.5 rounded-2xl px-2 py-2 text-left text-sm transition-colors hover:bg-muted"
+                        >
+                          <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-semibold tabular-nums">
+                            {claimNumber(claim.id)}
+                          </span>
+                          <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                            <span className="leading-6">{claim.text}</span>
+                            <span className="truncate text-xs text-muted-foreground">
+                              {[
+                                claim.stance && CLAIM_STANCES[claim.stance],
+                                source && hostOf(source.url),
+                              ]
+                                .filter(Boolean)
+                                .join(" · ")}
+                            </span>
+                          </span>
+                        </button>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+              <h4 className="text-xs font-medium text-muted-foreground">Searched</h4>
+              {searched.length ? (
+                <ul className="flex flex-col gap-1.5">
+                  {searched.map((query, index) => (
+                    <li
+                      key={index}
+                      className="flex items-start gap-2 text-sm text-muted-foreground"
+                    >
+                      <SearchIcon className="mt-1 size-3.5 shrink-0" />
+                      <span className="min-w-0 break-words">{query}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-muted-foreground">None</p>
+              )}
+            </div>
+          )
+        })}
+      </section>
+
+      {output && output.change.length > 0 && (
+        <section className="flex flex-col gap-1">
+          <h3 className="font-semibold">What would change this</h3>
+          {output.change.map((paragraph, index) => (
+            <p key={index} className="leading-7 text-muted-foreground">
+              <Spans spans={paragraph} onCite={onCite} />
+            </p>
+          ))}
+        </section>
+      )}
+    </div>
   )
 }

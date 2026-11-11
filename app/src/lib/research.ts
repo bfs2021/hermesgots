@@ -42,6 +42,8 @@ type MissionWriting = {
   drafted: (mission: Mission) => string
   /** The claims a typical reading gathers, which the reading third of the strip fills towards. */
   claims: (mission: Mission) => number
+  /** What reading has found so far, as the stage strip says it. */
+  read: (mission: Mission) => string
 }
 
 /** A section per outline point for a guide, else one piece. */
@@ -53,6 +55,7 @@ const WRITTEN: MissionWriting = {
       ? `${mission.written} of ${WRITTEN.pieces(mission)} sections`
       : `${mission.claimCount} claims`,
   claims: (mission) => mission.outline.length * 4,
+  read: (mission) => `${mission.found} sources · ${mission.claimCount} claims`,
 }
 
 /** A case per option, a rebuttal per option, then the judge. */
@@ -62,6 +65,21 @@ const COMPARED: MissionWriting = {
   pieces: (mission) => 2 * mission.options.length + 1,
   drafted: (mission) => `${mission.written} of ${COMPARED.pieces(mission)} steps`,
   claims: (mission) => mission.options.length * mission.criteria.length * 1.5,
+  read: WRITTEN.read,
+}
+
+/** Two lanes read, one looking for support and one against, then one judge. */
+const VERIFIED: MissionWriting = {
+  feature: { id: "research_verify", name: "Verify a claim" },
+  reworks: false,
+  pieces: () => 1,
+  drafted: () => "Weighing the evidence",
+  claims: (mission) => Math.max(1, mission.verify?.parts.length ?? 1) * 6,
+  read: (mission) => {
+    const claims = mission.ledger?.claims ?? []
+    const of = (lane: Lane) => claims.filter((c) => c.lane === lane).length
+    return `${of("for")} for · ${of("against")} against`
+  },
 }
 
 export const MISSION_TYPES: ({
@@ -93,7 +111,7 @@ export const MISSION_TYPES: ({
     name: "Verify a claim",
     icon: BadgeCheckIcon,
     example: "Does evidence support X?",
-    feature: { id: "research_verify", name: "Verify a claim" },
+    ...VERIFIED,
   },
   {
     id: "literature",
@@ -122,9 +140,12 @@ export const typeOf = (type: MissionType) => {
   return { ...WRITTEN, ...entry }
 }
 
-/** A comparison delivers one `memo`, which isn't one of the formats a Learn mission can make. */
-export type OutputFormat = "guide" | "quiz" | "glossary" | "memo"
-export const FORMATS: { id: Exclude<OutputFormat, "memo">; name: string }[] = [
+/**
+ * A comparison delivers one `memo` and a verification one `verdict`, which aren't among the formats
+ * a Learn mission can make.
+ */
+export type OutputFormat = "guide" | "quiz" | "glossary" | "memo" | "verdict"
+export const FORMATS: { id: Exclude<OutputFormat, "memo" | "verdict">; name: string }[] = [
   { id: "guide", name: "Guide" },
   { id: "quiz", name: "Quiz" },
   { id: "glossary", name: "Glossary" },
@@ -161,7 +182,14 @@ export interface Claim {
   /** A comparison's option and criterion the claim was read for. */
   option?: string
   criterion?: string
+  /** A verification's: which way the researcher read it, the part it bears on, and its lane. */
+  stance?: "supports" | "refutes" | "context"
+  part?: string
+  lane?: Lane
 }
+
+/** A verification's two researchers: one looks for support, the other against. */
+export type Lane = "for" | "against"
 
 /** A run of text, with the claims behind it, or flagged when no claim backs it. */
 export interface Span {
@@ -240,6 +268,42 @@ export interface VerifyBrief {
 /** Any source, or primary and reputable sources only. */
 export type Strictness = "any" | "reputable"
 
+/** A part's stance, as the plugin's `verdict()` worked it out; a thin one leans one `direction`. */
+export type PartStance =
+  "supported" | "refuted" | "disputed" | "thin" | "not_supported" | "cant_tell"
+
+export type VerdictLabel =
+  "supported" | "partly_supported" | "disputed" | "not_supported" | "refuted" | "cant_tell" | "thin"
+
+export interface PartVerdict {
+  part: string
+  stance: PartStance
+  direction: "supports" | "refutes" | null
+  /** Independent sources on each side, and the claims that counted for it. */
+  supporting: number
+  refuting: number
+  for: string[]
+  against: string[]
+}
+
+/** A verification's verdict, worked out by the plugin's code at delivery and stored as it was. */
+export interface Verdict {
+  label: VerdictLabel
+  why: string
+  /** Independent sources the verdict rests on, and claims whose page couldn't be read. */
+  sources: number
+  leads: number
+  parts: PartVerdict[]
+}
+
+export interface VerdictOutput {
+  tags: { claim: string; part: string; stance: string }[]
+  verdict: Verdict
+  /** What evidence would change the answer. */
+  change: Span[][]
+  checkedAt: number
+}
+
 export const MAX_PARTS = 4
 export const MAX_TERMS = 8
 
@@ -289,6 +353,7 @@ export interface Outputs {
   guide?: Section[]
   quiz?: QuizQuestion[]
   glossary?: GlossaryTerm[]
+  verdict?: VerdictOutput
 }
 
 /** One version of what a mission delivered, kept by the plugin, and why it was written. */
@@ -352,6 +417,9 @@ export interface Mission {
   decision?: Decision
   /** A verification's read-back; absent for every other type. */
   verify?: VerifyBrief
+  /** A verification's verdict as stored at delivery, and each lane's web searches. */
+  verdict?: Verdict
+  searches?: Record<Lane, string[]>
   /** Only once the mission itself has been read, not from the list. */
   ledger?: Ledger
   outputs?: Outputs
@@ -362,7 +430,7 @@ const pick = <T extends string>(value: unknown, options: readonly T[], fallback:
 const text = (value: unknown) => (typeof value === "string" ? value : "")
 const list = (value: unknown) => (Array.isArray(value) ? value : [])
 const STAGES = ["brief", "scope", "reading", "drafting", "reviewing", "delivered"] as const
-const FORMAT_IDS = ["guide", "quiz", "glossary", "memo"] as const
+const FORMAT_IDS = ["guide", "quiz", "glossary", "memo", "verdict"] as const
 const KIND_IDS = ["papers", "docs", "articles", "videos", "forums"] as const
 
 function toOutputs(raw: unknown): Outputs | undefined {
@@ -373,8 +441,67 @@ function toOutputs(raw: unknown): Outputs | undefined {
       guide: outputs.guide && (list(outputs.guide.sections) as Section[]),
       quiz: outputs.quiz && (list(outputs.quiz.questions) as QuizQuestion[]),
       glossary: outputs.glossary && (list(outputs.glossary.terms) as GlossaryTerm[]),
+      verdict: outputs.verdict && toVerdictOutput(outputs.verdict),
     }
   )
+}
+
+const ids = (value: unknown) => list(value).filter((id): id is string => typeof id === "string")
+const LABELS: readonly VerdictLabel[] = [
+  "supported",
+  "partly_supported",
+  "disputed",
+  "not_supported",
+  "refuted",
+  "cant_tell",
+  "thin",
+]
+const PART_STANCES: readonly PartStance[] = [
+  "supported",
+  "refuted",
+  "disputed",
+  "thin",
+  "not_supported",
+  "cant_tell",
+]
+
+function toVerdict(raw: unknown): Verdict | undefined {
+  const verdict = raw as Record<string, unknown> | null | undefined
+  if (!verdict || !LABELS.includes(verdict.label as VerdictLabel)) return undefined
+  return {
+    label: verdict.label as VerdictLabel,
+    why: text(verdict.why),
+    sources: Number(verdict.sources) || 0,
+    leads: Number(verdict.leads) || 0,
+    parts: list(verdict.parts).map((row: Record<string, unknown>) => ({
+      part: text(row.part),
+      stance: pick(row.stance, PART_STANCES, "cant_tell"),
+      direction: row.direction === "supports" || row.direction === "refutes" ? row.direction : null,
+      supporting: Number(row.supporting) || 0,
+      refuting: Number(row.refuting) || 0,
+      for: ids(row.for),
+      against: ids(row.against),
+    })),
+  }
+}
+
+function toVerdictOutput(raw: Record<string, unknown>): VerdictOutput | undefined {
+  const verdict = toVerdict(raw.verdict)
+  return (
+    verdict && {
+      tags: list(raw.tags) as VerdictOutput["tags"],
+      verdict,
+      change: list(raw.change) as Span[][],
+      checkedAt: Number(raw.checked_at) || 0,
+    }
+  )
+}
+
+function toSearches(raw: unknown): Mission["searches"] {
+  const searches = raw as Record<string, unknown> | null | undefined
+  return searches && typeof searches === "object"
+    ? { for: ids(searches.for), against: ids(searches.against) }
+    : undefined
 }
 
 function toMemo(raw: Record<string, unknown>): Memo {
@@ -512,6 +639,8 @@ function toMission(raw: Record<string, unknown>, profileId: string): Mission {
     judge: toChoice(raw.judge),
     decision: toDecision(raw.decision),
     verify: raw.type === "verify" ? toVerify(raw) : undefined,
+    verdict: toVerdict(raw.verdict),
+    searches: toSearches(raw.searches),
     ledger: ledger && {
       sources: list(ledger.sources) as Source[],
       claims: list(ledger.claims) as Claim[],
@@ -811,6 +940,77 @@ function memoMarkdown(mission: Mission, cite: (ids?: string[]) => string) {
   return out
 }
 
+export const VERDICT_NAMES: Record<VerdictLabel, string> = {
+  supported: "Supported",
+  partly_supported: "Partly supported",
+  disputed: "Disputed",
+  not_supported: "Not supported",
+  refuted: "Refuted",
+  cant_tell: "Can't tell",
+  thin: "Thin evidence",
+}
+
+/** A part's stance as a word, a thin one saying which way it leans. */
+export function stanceWord(part: PartVerdict) {
+  if (part.stance === "thin")
+    return part.direction === "refutes" ? "Thin, leans against" : "Thin, leans for"
+  return VERDICT_NAMES[part.stance]
+}
+
+export const checkedOn = (at: number) =>
+  new Date(at).toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" })
+
+export const LANES: { id: Lane; name: string }[] = [
+  { id: "for", name: "For" },
+  { id: "against", name: "Against" },
+]
+
+const plural = (count: number, one: string) => `${count} ${one}${count === 1 ? "" : "s"}`
+export const sourcesLine = (verdict: Verdict) => plural(verdict.sources, "independent source")
+export const leadsLine = (verdict: Verdict) => plural(verdict.leads, "unverifiable lead")
+
+/** The verdict as it was stored, the parts, what each lane found and searched, and its flip. */
+function verdictMarkdown(mission: Mission, cite: (ids?: string[]) => string) {
+  const output = mission.outputs?.verdict
+  const verdict = output?.verdict ?? mission.verdict
+  if (!verdict) return []
+  const ledger = mission.ledger ?? { sources: [], claims: [] }
+  const sources = new Map(ledger.sources.map((s) => [s.id, s]))
+  const partText = (id: string) => mission.verify?.parts.find((p) => p.id === id)?.text ?? id
+  const prose = (paragraphs: Span[][]) =>
+    paragraphs.map((p) =>
+      p.map((s) => `${s.text}${s.flagged ? " (no source)" : cite(s.cites)}`).join(""),
+    )
+  const out = [`**${VERDICT_NAMES[verdict.label]}.** ${verdict.why}`, ""]
+  out.push(
+    [sourcesLine(verdict), verdict.leads ? leadsLine(verdict) : ""].filter(Boolean).join(" · "),
+    "",
+    "## Parts",
+    "",
+    "| Part | Stance | For | Against |",
+    "|---|---|---|---|",
+    ...verdict.parts.map(
+      (p) => `| ${partText(p.part)} | ${stanceWord(p)} | ${p.supporting} | ${p.refuting} |`,
+    ),
+    "",
+  )
+  for (const lane of LANES) {
+    out.push(`## ${lane.name}`, "")
+    for (const claim of ledger.claims.filter((c) => c.lane === lane.id)) {
+      const source = sources.get(claim.source)
+      out.push(
+        `- [${claimNumber(claim.id)}] ${claim.text}${source ? ` [${source.title}](${source.url})` : ""}`,
+      )
+    }
+    const searched = mission.searches?.[lane.id] ?? []
+    out.push("", `Searched: ${searched.length ? searched.join("; ") : "none"}`, "")
+  }
+  if (output?.change.length)
+    out.push("## What would change this", "", ...prose(output.change).flatMap((p) => [p, ""]))
+  if (output?.checkedAt) out.push(`Checked ${checkedOn(output.checkedAt)}`, "")
+  return out
+}
+
 export function toMarkdown(mission: Mission, format: OutputFormat) {
   const ledger = mission.ledger ?? { sources: [], claims: [] }
   const used = new Set<string>()
@@ -822,6 +1022,8 @@ export function toMarkdown(mission: Mission, format: OutputFormat) {
   const outputs = mission.outputs ?? {}
   if (format === "memo") {
     out.push(...memoMarkdown(mission, cite))
+  } else if (format === "verdict") {
+    out.push(...verdictMarkdown(mission, cite))
   } else if (format === "guide") {
     for (const section of outputs.guide ?? []) {
       out.push(`## ${section.title}`, "")

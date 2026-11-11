@@ -365,7 +365,7 @@ export function Evidence({ ledger, active }: { ledger?: Ledger; active?: string 
 const order: MissionStage[] = ["reading", "drafting", "reviewing", "delivered"]
 
 function stageDetail(mission: Mission, stage: MissionStage) {
-  if (stage === "reading") return `${mission.found} sources · ${mission.claimCount} claims`
+  if (stage === "reading") return typeOf(mission.type).read(mission)
   if (stage === "drafting") return typeOf(mission.type).drafted(mission)
   return mission.stage === "delivered"
     ? `${mission.claimCount} claims checked`
