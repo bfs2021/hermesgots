@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
 # build stored in `canvas_versions.tools` to drop the ones the rule refuses now.
 # 65 keeps a research mission's runs one per lane (`research.py`): one new table, and a mission's old
 # single run copied in as its one lane's, so a mission reading at the upgrade is still watched.
-SCHEMA_VERSION = 65
+# 66 keeps a verification's read-back on its mission (`research.py`): four new columns.
+SCHEMA_VERSION = 66
 
 
 def data_dir(hermes_home: Path) -> Path:
@@ -544,6 +545,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 """INSERT OR IGNORE INTO research_runs (mission_id, lane, run_id)
                    SELECT id, '', run_id FROM research_missions WHERE run_id IS NOT NULL"""
             )
+        # v66: a verification's read-back (research.py): the claim restated, its parts, the terms
+        # taken literally, and why it can't be checked when it can't.
+        mission_columns = {row[1] for row in conn.execute("PRAGMA table_info(research_missions)")}
+        for column in ("restatement", "parts", "terms", "uncheckable"):
+            if column not in mission_columns:
+                conn.execute(f"ALTER TABLE research_missions ADD COLUMN {column} TEXT")
         # v32: the messages triage sent out of a Main thread, for its Moved markers (moves.py).
         # v33: a v32 store also had a thread_session column nothing read; it is rebuilt without it.
         move_columns = {row[1] for row in conn.execute("PRAGMA table_info(main_moves)")}

@@ -93,6 +93,7 @@ export const MISSION_TYPES: ({
     name: "Verify a claim",
     icon: BadgeCheckIcon,
     example: "Does evidence support X?",
+    feature: { id: "research_verify", name: "Verify a claim" },
   },
   {
     id: "literature",
@@ -217,6 +218,26 @@ export interface Criterion {
   weight: number
 }
 
+/** One assertion a claim to verify makes, checked on its own. */
+export interface Part {
+  id: string
+  text: string
+}
+
+/**
+ * A claim as the plugin read it back: in one neutral sentence, its parts, and the words it takes
+ * literally; `uncheckable` is why it can't be settled by evidence, when it can't.
+ */
+export interface VerifyBrief {
+  restatement: string
+  parts: Part[]
+  terms: string[]
+  uncheckable?: string
+}
+
+export const MAX_PARTS = 4
+export const MAX_TERMS = 8
+
 export const MIN_OPTIONS = 2
 export const MAX_OPTIONS = 5
 export const MIN_CRITERIA = 2
@@ -324,6 +345,8 @@ export interface Mission {
   criteria: Criterion[]
   judge?: ModelChoice
   decision?: Decision
+  /** A verification's read-back; absent for every other type. */
+  verify?: VerifyBrief
   /** Only once the mission itself has been read, not from the list. */
   ledger?: Ledger
   outputs?: Outputs
@@ -398,6 +421,18 @@ const toCriteria = (raw: unknown): Criterion[] =>
     weight: Number(k.weight) || 1,
   }))
 
+function toVerify(raw: Record<string, unknown>): VerifyBrief {
+  return {
+    restatement: text(raw.restatement),
+    parts: list(raw.parts).map((p: Record<string, unknown>) => ({
+      id: text(p.id),
+      text: text(p.text),
+    })),
+    terms: list(raw.terms).filter((t): t is string => typeof t === "string"),
+    uncheckable: text(raw.uncheckable) || undefined,
+  }
+}
+
 function toChoice(raw: unknown): ModelChoice | undefined {
   const choice = raw as Record<string, unknown> | null | undefined
   return choice && typeof choice.model === "string"
@@ -469,6 +504,7 @@ function toMission(raw: Record<string, unknown>, profileId: string): Mission {
     criteria: toCriteria(raw.criteria),
     judge: toChoice(raw.judge),
     decision: toDecision(raw.decision),
+    verify: raw.type === "verify" ? toVerify(raw) : undefined,
     ledger: ledger && {
       sources: list(ledger.sources) as Source[],
       claims: list(ledger.claims) as Claim[],
@@ -640,6 +676,12 @@ export const confirmComparison = (
     options: string[]
     criteria: { name: string; weight: number }[]
   },
+) => act(mission, "brief", brief)
+
+/** A verification's brief: the claim restated and the parts it is checked in, as edited. */
+export const confirmVerification = (
+  mission: Mission,
+  brief: { restatement: string; parts: string[]; terms: string[] },
 ) => act(mission, "brief", brief)
 
 export const editBrief = (mission: Mission) => act(mission, "edit")

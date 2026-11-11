@@ -57,6 +57,8 @@ ctx: Any = None
 FORMATS = ("guide", "quiz", "glossary")
 # A comparison delivers one thing, the memo; there are no other formats to make.
 COMPARE_FORMAT = "memo"
+# A verification delivers one thing, the verdict.
+VERIFY_FORMAT = "verdict"
 MIN_OPTIONS = 2
 MAX_OPTIONS = 5
 MIN_CRITERIA = 2
@@ -84,6 +86,9 @@ MAX_AUDIENCE = 160
 MAX_TITLE = 120
 MAX_POINTS = 6
 MAX_POINT = 200
+# A claim is checked in at most this many parts.
+MAX_PARTS = 4
+MAX_TERMS = 8
 # A follow-up round adds at most this many questions, each a section of its own, and the outline
 # grows to at most MAX_OUTLINE points that way.
 MAX_FOLLOWUPS = 3
@@ -195,6 +200,10 @@ def _summary(row: Any, conn: Any) -> Dict[str, Any]:
         "options": _loads(row["options"], []),
         "criteria": _loads(row["criteria"], []),
         "judge": _loads(row["judge"], None),
+        "restatement": row["restatement"],
+        "parts": _loads(row["parts"], []),
+        "terms": _loads(row["terms"], []),
+        "uncheckable": row["uncheckable"],
         "found": counts[0],
         "claims": counts[1],
         "created_at": row["created_at"],
@@ -209,7 +218,7 @@ def _row(conn: Any, mission_id: str) -> Any:
 def _update(path: Path, mission_id: str, **fields: Any) -> None:
     for key in (
         "outline", "source_kinds", "formats", "followups", "suggestions", "pending", "writer", "researcher",
-        "options", "criteria", "judge",
+        "options", "criteria", "judge", "parts", "terms",
     ):
         if key in fields and fields[key] is not None and not isinstance(fields[key], str):
             fields[key] = json.dumps(fields[key])
@@ -315,7 +324,7 @@ def create(path: Path, profile: Optional[str], text: Any, kind: Any = "learn") -
     text = _text(text, MAX_INPUT, "The question")
     kind = kind or "learn"
     if kind not in MISSION_TYPES:
-        raise ResearchError("Only Learn & understand and Compare & decide missions can be started so far.")
+        raise ResearchError("Only Learn & understand, Compare & decide and Verify a claim missions can be started so far.")
     mission_id = f"r_{uuid.uuid4().hex[:16]}"
     now = _now()
     conn = _open(path)
@@ -431,6 +440,57 @@ def _confirm_compare_brief(path: Path, mission_id: str, body: Dict[str, Any]) ->
     )
     _tell(path, "research_scope", mission_id)
     return mission(path, mission_id)  # type: ignore[return-value]
+
+
+def _confirm_verify_brief(path: Path, mission_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    found = mission(path, mission_id)
+    if found and found["uncheckable"]:
+        raise ResearchError("This claim can't be checked; start another.", 409)
+    restatement = _text(body.get("restatement"), MAX_GOAL, "The restatement")
+    parts = verify_parts(body.get("parts"))
+    if not parts:
+        raise ResearchError(f"Check 1 to {MAX_PARTS} parts.")
+    terms = verify_terms(body.get("terms"))
+    # The parts are what gets researched, so they are the Scope Gate's outline: no model call.
+    _update(
+        path, mission_id, restatement=restatement, parts=parts, terms=terms, stage="scope", busy=None,
+        outline=[part["text"] for part in parts], error=None,
+    )
+    _tell(path, "research_scope", mission_id)
+    return mission(path, mission_id)  # type: ignore[return-value]
+
+
+def verify_parts(raw: Any) -> List[Dict[str, str]]:
+    """A claim's parts as given, blank ones dropped, numbered p1.. in order; more than
+    ``MAX_PARTS`` is refused."""
+    if not isinstance(raw, list):
+        raise ResearchError("The parts are required.")
+    texts = []
+    for item in raw:
+        text = item.get("text") if isinstance(item, dict) else item
+        if isinstance(text, str) and text.strip():
+            texts.append(_text(text, MAX_POINT, "A part"))
+    if len(texts) > MAX_PARTS:
+        raise ResearchError(f"Check 1 to {MAX_PARTS} parts.")
+    return [{"id": f"p{i + 1}", "text": text} for i, text in enumerate(texts)]
+
+
+def verify_terms(raw: Any) -> List[str]:
+    """The words a claim takes literally, as edited: trimmed, blank ones and repeats (whatever their
+    case) dropped; more than ``MAX_TERMS`` is refused."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ResearchError("The terms are a list.")
+    terms: List[str] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            term = _text(item, MAX_NAME, "A term")
+            if term.casefold() not in {other.casefold() for other in terms}:
+                terms.append(term)
+    if len(terms) > MAX_TERMS:
+        raise ResearchError(f"Take {MAX_TERMS} terms at most literally.")
+    return terms
 
 
 def edit_brief(path: Path, mission_id: str) -> Dict[str, Any]:
@@ -853,6 +913,58 @@ def _compare_brief(path: Path, row: Dict[str, Any]) -> None:
         "depth": answer.get("depth") if answer.get("depth") in DEPTHS else "overview",
         "options": [{"id": f"o{i + 1}", "name": name} for i, name in enumerate(names)],
         "criteria": [{"id": f"k{i + 1}", **criterion} for i, criterion in enumerate(criteria)],
+    }
+    _update(path, row["id"], **fields, busy=None)
+    _tell(path, "research_brief", row["id"], fields["title"])
+
+
+VERIFY_BRIEF_SYSTEM = (
+    "You read back a claim someone wants checked, so they can correct it before any research "
+    "starts. Never judge whether it is true, and never carry over its tone: loaded words, "
+    "exaggeration and emphasis are dropped, not repeated."
+)
+VERIFY_BRIEF_INSTRUCTIONS = (
+    f"Read the claim below and fill in the brief. title: what the claim is about in at most six "
+    f"words, neutral, no trailing punctuation. restatement: the claim in one plain, neutral "
+    f"sentence that says what it asserts and no more or less, leaning neither way. parts: 1 to "
+    f"{MAX_PARTS} separate assertions the claim makes, each a short statement that can be found "
+    f"true or false on its own. terms: the words in it that are taken literally, as the claim uses "
+    f"them (a number, a name, a word like always or every). checkable: false when the claim is an "
+    f"opinion, a matter of taste, a prediction or otherwise can't be settled by evidence, with "
+    f"reason saying why in one short sentence; otherwise true and reason empty."
+)
+VERIFY_BRIEF_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "restatement": {"type": "string"},
+        "parts": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": MAX_PARTS},
+        "terms": {"type": "array", "items": {"type": "string"}},
+        "checkable": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["title", "restatement", "parts", "terms", "checkable", "reason"],
+}
+UNCHECKABLE = "It can't be settled by evidence."
+
+
+def _verify_brief(path: Path, row: Dict[str, Any]) -> None:
+    answer = _structured(
+        "brief", VERIFY_BRIEF_SYSTEM, VERIFY_BRIEF_INSTRUCTIONS, row["input"], VERIFY_BRIEF_SCHEMA, 1500
+    )
+    texts = [_clip(p, MAX_POINT) for p in answer.get("parts") or [] if isinstance(p, str)]
+    texts = list(dict.fromkeys(t for t in texts if t))[:MAX_PARTS]
+    restatement = _clip(answer.get("restatement"), MAX_GOAL)
+    checkable = answer.get("checkable") is not False
+    if checkable and (not restatement or not texts):
+        raise ResearchError("The model couldn't read a claim in that. Try again.", 502)
+    terms = [_clip(t, MAX_NAME) for t in answer.get("terms") or [] if isinstance(t, str)]
+    fields = {
+        "title": _clip(answer.get("title"), MAX_TITLE) or row["title"],
+        "restatement": restatement or _clip(row["input"], MAX_GOAL),
+        "parts": [{"id": f"p{i + 1}", "text": text} for i, text in enumerate(texts)],
+        "terms": list(dict.fromkeys(t for t in terms if t))[:MAX_TERMS],
+        "uncheckable": None if checkable else (_clip(answer.get("reason"), MAX_GOAL) or UNCHECKABLE),
     }
     _update(path, row["id"], **fields, busy=None)
     _tell(path, "research_brief", row["id"], fields["title"])
@@ -1838,6 +1950,12 @@ def _draft_compare(path: Path, found: Dict[str, Any]) -> None:
     _tell(path, "research_done", mission_id, found["title"])
 
 
+def _verify_not_yet(*_: Any) -> Any:
+    # A verification's Scope Gate, reading and verdict come in later steps; until then a mission
+    # stops at the Scope Gate.
+    raise ResearchError("A verification can't be read yet.", 501)
+
+
 @dataclass(frozen=True)
 class Lane:
     """One researcher of a mission: its session (named by the lane), what it is told and what it is
@@ -1901,6 +2019,23 @@ MISSION_TYPES: Dict[str, MissionType] = {
             "decision": decide(found["options"], found["criteria"], found["outputs"].get(COMPARE_FORMAT))
         },
         formats_refused="A comparison has one format, the memo.",
+        followup_refused="Questions can only be added to a Learn & understand mission so far.",
+        rewrite_refused="Only a Learn & understand mission can be rewritten with another model.",
+    ),
+    "verify": MissionType(
+        default_format=VERIFY_FORMAT,
+        read_brief=_verify_brief,
+        confirm_brief=_confirm_verify_brief,
+        brief_text=lambda row: f"Claim: {row['restatement']}\n"
+        + "".join(f"Part {p['id']}: {p['text']}\n" for p in row["parts"]),
+        approve_scope=_verify_not_yet,
+        outline_call=False,
+        lanes=(),
+        bearing=_no_bearing,
+        min_claims=lambda found: MIN_CLAIMS,
+        draft=_verify_not_yet,
+        derive=lambda found: {},
+        formats_refused="A verification has one format, the verdict.",
         followup_refused="Questions can only be added to a Learn & understand mission so far.",
         rewrite_refused="Only a Learn & understand mission can be rewritten with another model.",
     ),

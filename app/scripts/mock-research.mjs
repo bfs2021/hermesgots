@@ -600,6 +600,38 @@ function readComparison(m, note) {
   })
 }
 
+/** A claim read back as neutral parts; an opinion is read back as not checkable. */
+function readClaim(m, note) {
+  later(1500, () => {
+    if (!missions.has(m.id)) return
+    const opinion = /\b(best|worst|better|worse|ugly|beautiful)\b/i.test(m.input)
+    change(
+      m,
+      opinion
+        ? {
+            busy: null,
+            title: "A matter of taste",
+            restatement: m.input.trim().replace(/[!]+$/, "."),
+            parts: [{ id: "p1", text: m.input.trim().replace(/[.!?]+$/, "") }],
+            terms: [],
+            uncheckable: "It is a matter of taste, which evidence can't settle.",
+          }
+        : {
+            busy: null,
+            title: "Coffee and heart attacks",
+            restatement: "Drinking coffee every day raises the risk of a heart attack.",
+            parts: [
+              { id: "p1", text: "Daily coffee drinking is associated with heart attacks" },
+              { id: "p2", text: "The association is causal" },
+            ],
+            terms: ["every day", "heart attack"],
+            uncheckable: null,
+          },
+      note,
+    )
+  })
+}
+
 /** A comparison's reading: its claims one at a time, then the memo built step by step. */
 function compare(m, note) {
   const step = () => {
@@ -758,18 +790,20 @@ export async function handleResearch(req, res, path, { json, readBody, noteEvent
     }
     const { input, type } = await readBody(req)
     if (typeof input !== "string" || !input.trim()) return fail(400, "The question is required."), true
-    if (type && !["learn", "compare"].includes(type))
-      return fail(400, "Only Learn & understand and Compare & decide missions can be started so far."), true
+    if (type && !["learn", "compare", "verify"].includes(type))
+      return fail(400, "Only Learn & understand, Compare & decide and Verify a claim missions can be started so far."), true
     const m = mission({
       id: `r_${Math.random().toString(16).slice(2, 18)}`,
       input,
       title: input,
       busy: "brief",
       ...(type === "compare" ? { type, format: "memo" } : {}),
+      ...(type === "verify" ? { type, format: "verdict", restatement: null, parts: [], terms: [], uncheckable: null } : {}),
     })
     missions.set(m.id, m)
     note(m.id)
     if (type === "compare") readComparison(m, note)
+    else if (type === "verify") readClaim(m, note)
     else readBrief(m, note)
     json(res, 202, { object: "gots.research.mission", mission: full(m) })
     return true
@@ -784,6 +818,29 @@ export async function handleResearch(req, res, path, { json, readBody, noteEvent
   switch (action) {
     case "brief":
       if (moved(["brief"])) return fail(409, "The mission has moved on; reload it."), true
+      if (m.type === "verify") {
+        if (m.uncheckable) return fail(409, "This claim can't be checked; start another."), true
+        if (typeof body.restatement !== "string" || !body.restatement.trim()) return fail(400, "The restatement is required."), true
+        const parts = (body.parts ?? []).map((p) => (typeof p === "string" ? p : p?.text)).filter((p) => typeof p === "string" && p.trim())
+        if (parts.length < 1 || parts.length > 4) return fail(400, "Check 1 to 4 parts."), true
+        const terms = []
+        for (const t of body.terms ?? [])
+          if (typeof t === "string" && t.trim() && !terms.some((o) => o.toLowerCase() === t.trim().toLowerCase())) terms.push(t.trim())
+        if (terms.length > 8) return fail(400, "Take 8 terms at most literally."), true
+        change(
+          m,
+          {
+            restatement: body.restatement.trim(),
+            parts: parts.map((text, i) => ({ id: `p${i + 1}`, text })),
+            terms,
+            stage: "scope",
+            outline: parts,
+            error: null,
+          },
+          note,
+        )
+        break
+      }
       if (m.type === "compare") {
         const names = [...new Set((body.options ?? []).map((o) => (typeof o === "string" ? o : o?.name)).filter((o) => typeof o === "string" && o.trim()))]
         const criteria = (body.criteria ?? []).filter((k) => typeof k?.name === "string" && k.name.trim())

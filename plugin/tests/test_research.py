@@ -603,6 +603,128 @@ class CompareTest(unittest.TestCase):
         self.assertIn("k1: Speed (weight 5 of 5)", prompt)
 
 
+class FakeVerifyLlm(FakeLlm):
+    """A verification's brief: the claim read back neutrally, as parts, or as not checkable."""
+
+    def complete_structured(self, **kwargs):
+        purpose = kwargs["purpose"].rsplit(".", 1)[-1]
+        if purpose != "brief":
+            return super().complete_structured(**kwargs)
+        self.calls.append(kwargs)
+        if "best editor" in kwargs["input"][0]["text"]:
+            parsed = {
+                "title": "The best editor",
+                "restatement": "Vim is the best editor.",
+                "parts": ["Vim is the best editor"],
+                "terms": [],
+                "checkable": False,
+                "reason": "It is a matter of taste.",
+            }
+        else:
+            parsed = {
+                "title": "Coffee and heart attacks",
+                "restatement": "Drinking coffee daily raises the risk of a heart attack.",
+                "parts": ["Coffee is drunk daily", "The risk of a heart attack rises", "", "A", "B", "C"],
+                "terms": ["daily", "heart attack"],
+                "checkable": True,
+                "reason": "",
+            }
+        return SimpleNamespace(parsed=parsed, text="")
+
+
+class VerifyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "gots.db"
+        self.llm = FakeVerifyLlm()
+        research.ctx = SimpleNamespace(llm=self.llm)
+        notify = mock.patch.object(research.push, "notify")
+        self.notify = notify.start()
+        self.addCleanup(notify.stop)
+        self.addCleanup(self.dir.cleanup)
+        self.addCleanup(setattr, research, "ctx", None)
+
+    def told(self) -> list:
+        return [call.args[0] for call in self.notify.call_args_list]
+
+    def test_a_claim_is_read_back_as_parts_and_confirmed_without_an_outline_call(self) -> None:
+        loaded = "Coffee KILLS you: every daily cup is a heart attack waiting to happen!!"
+        found = research.create(self.path, None, loaded, "verify")
+        self.assertEqual((found["type"], found["stage"], found["busy"]), ("verify", "brief", "brief"))
+        research._job(self.path, found["id"])
+        found = research.mission(self.path, found["id"])
+        # The read-back is kept beside the user's own words, which stay as they were typed.
+        self.assertEqual(found["input"], loaded)
+        self.assertEqual(found["restatement"], "Drinking coffee daily raises the risk of a heart attack.")
+        # Blank parts are dropped and at most four are kept, numbered in order.
+        self.assertEqual(
+            found["parts"],
+            [
+                {"id": "p1", "text": "Coffee is drunk daily"},
+                {"id": "p2", "text": "The risk of a heart attack rises"},
+                {"id": "p3", "text": "A"},
+                {"id": "p4", "text": "B"},
+            ],
+        )
+        self.assertEqual(found["terms"], ["daily", "heart attack"])
+        self.assertIsNone(found["uncheckable"])
+        self.assertEqual((found["stage"], found["busy"], found["title"]), ("brief", None, "Coffee and heart attacks"))
+        self.assertEqual(self.told(), ["research_brief"])
+
+        base = {"restatement": "Drinking coffee every day raises heart attack risk."}
+        with self.assertRaisesRegex(research.ResearchError, "1 to 4 parts"):
+            research.confirm_brief(self.path, found["id"], {**base, "parts": ["a", "b", "c", "d", "e"]})
+        with self.assertRaisesRegex(research.ResearchError, "1 to 4 parts"):
+            research.confirm_brief(self.path, found["id"], {**base, "parts": [" ", ""]})
+        with self.assertRaisesRegex(research.ResearchError, "8 terms at most"):
+            research.confirm_brief(self.path, found["id"], {**base, "parts": ["a"], "terms": [str(i) for i in range(9)]})
+        with self.assertRaisesRegex(research.ResearchError, "A term is too long"):
+            research.confirm_brief(self.path, found["id"], {**base, "parts": ["a"], "terms": ["x" * 61]})
+        with self.assertRaisesRegex(research.ResearchError, "restatement is required"):
+            research.confirm_brief(self.path, found["id"], {"restatement": " ", "parts": ["a"]})
+
+        found = research.confirm_brief(
+            self.path,
+            found["id"],
+            {
+                **base,
+                "parts": ["", "Heart attack risk rises", {"text": "Coffee is drunk daily"}],
+                "terms": [" every day ", "", "Heart attack", "heart attack", 7],
+            },
+        )
+        # The edited terms are kept, trimmed, blanks and repeats (whatever their case) dropped.
+        self.assertEqual(found["terms"], ["every day", "Heart attack"])
+        # The edited parts are renumbered, they are the outline, and no outline call is made.
+        self.assertEqual(found["restatement"], "Drinking coffee every day raises heart attack risk.")
+        self.assertEqual(
+            found["parts"],
+            [{"id": "p1", "text": "Heart attack risk rises"}, {"id": "p2", "text": "Coffee is drunk daily"}],
+        )
+        self.assertEqual(
+            (found["stage"], found["busy"], found["outline"]),
+            ("scope", None, ["Heart attack risk rises", "Coffee is drunk daily"]),
+        )
+        self.assertEqual(found["input"], loaded)
+        self.assertEqual([c["purpose"] for c in self.llm.calls], ["gots.research.brief"])
+        self.assertEqual(self.told(), ["research_brief", "research_scope"])
+
+    def test_a_claim_that_cannot_be_checked_stops_at_the_brief(self) -> None:
+        found = research.create(self.path, None, "Vim is the best editor", "verify")
+        research._job(self.path, found["id"])
+        found = research.mission(self.path, found["id"])
+        self.assertEqual((found["stage"], found["busy"], found["error"]), ("brief", None, None))
+        self.assertEqual(found["uncheckable"], "It is a matter of taste.")
+        self.assertEqual(found["restatement"], "Vim is the best editor.")
+        with self.assertRaisesRegex(research.ResearchError, "can't be checked") as refused:
+            research.confirm_brief(self.path, found["id"], {"restatement": "Vim is fast.", "parts": ["Vim is fast"]})
+        self.assertEqual(refused.exception.status, 409)
+        after = research.mission(self.path, found["id"])
+        self.assertEqual(
+            (after["stage"], after["restatement"], after["parts"], after["outline"]),
+            ("brief", "Vim is the best editor.", found["parts"], []),
+        )
+
+
 class ResearcherRunTest(unittest.TestCase):
     """The researcher's run as the routes start, retry and stop it, and as the watcher follows it
     across a store upgrade."""
