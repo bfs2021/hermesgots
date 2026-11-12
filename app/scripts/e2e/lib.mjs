@@ -393,9 +393,9 @@ export const choiceButton = (scope, choice) =>
 export const questionPage = (scope) => scope.locator("[data-question-page]:not([inert])")
 
 /**
- * Answers the question in `scope` — by picking one of its choices, or by typing into it — and sends
- * it, waiting on nothing further. A card holding a call's questions shows one page of them, and an
- * answer belongs to that page: the others are questions the host is not asking yet.
+ * Answers the question in `scope` — by picking one of its choices, or by typing into it — and
+ * presses `press`, waiting on nothing further. A card holding a call's questions is one form shown a
+ * page at a time: the answer goes on the page showing, and a page before the last presses Next.
  */
 export async function answerWith(scope, { pick, type }, press = "Send") {
   const page = (await questionPage(scope).count()) ? questionPage(scope) : scope

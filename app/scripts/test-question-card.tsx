@@ -375,6 +375,7 @@ test("a host that asks one question at a time takes the whole form, sending each
       [{ q0: "staging" }, { q1: "rename it" }],
       "the next question is answered as soon as it is asked, with no tap",
     )
+    assert.equal(button("Next")?.disabled, true, "and the form can't be paged while it goes")
 
     await act(async () => host.hold())
     await settle()

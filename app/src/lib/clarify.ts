@@ -138,6 +138,20 @@ export function clarifyWire(answer: string | string[] | null): string {
 }
 
 /**
+ * An answer as `clarifyWire` sent it, read back as what was picked — what the thread draws until
+ * the host's own result lands, and what the host itself records (`_clean_answer`).
+ */
+export function clarifyUnwire(sent: string, multiSelect: boolean): string | string[] | null {
+  if (!sent.trim()) return null
+  if (!multiSelect) return sent
+  try {
+    const picks: unknown = JSON.parse(sent)
+    if (Array.isArray(picks)) return picks.map(String)
+  } catch {}
+  return [sent]
+}
+
+/**
  * A question Hermes's run route records as answered with the word it was skipped by: the route
  * stores the reply as sent, where its own surfaces turn the word into no answer. A choice the
  * question really offered under that name is an answer.

@@ -463,7 +463,7 @@ export function QuestionCard({
             type="button"
             size="lg"
             className="h-11 flex-1 sm:min-w-40 sm:flex-none"
-            disabled={!answers[current.id]}
+            disabled={pending || !answers[current.id]}
             onClick={() => goTo(page + 1)}
           >
             Next
