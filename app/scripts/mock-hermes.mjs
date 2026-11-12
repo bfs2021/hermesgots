@@ -3109,6 +3109,9 @@ const LIVE_CLARIFY = process.env.MOCK_LIVE_CLARIFY === "1"
 // Hermes 0.23.1 words a question asked off its own local viewers with a newline and a localized
 // hint after it (`gateway.clarify.skip_hint`), and settles an answer and raises the call's next
 // question on the run's stream before the answer's own response is written. Both are this mode's.
+const SKIP_HINT = '\nReply "skip" to skip this question.'
+const CLARIFY_REPLY_MS = 100
+
 /** A multi-select answer as Hermes reads one: a JSON list, else the one typed answer. */
 function listOf(said) {
   try {
@@ -3118,8 +3121,6 @@ function listOf(said) {
   return [said]
 }
 
-const SKIP_HINT = '\nReply "skip" to skip this question.'
-const CLARIFY_REPLY_MS = 100
 const runs = new Map()
 // Sessions a finished subagent still owes a wake turn to — `waking` on runs/live, what the plugin
 // reports between a turn ending and its wake turn starting, so no screen reads the session at rest

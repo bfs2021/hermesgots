@@ -129,10 +129,11 @@ export const SKIPPED = "\u0000skipped"
 
 /**
  * An answer in the one string Hermes's run route takes: a multi-select answer is a JSON list, the
- * only shape it splits back into choices, and a skipped question is the empty string.
+ * only shape it splits back into choices, and a skipped question — none picked — is the empty
+ * string, which the route's caller sends as Hermes's own skip.
  */
 export function clarifyWire(answer: string | string[] | null): string {
-  if (Array.isArray(answer)) return JSON.stringify(answer)
+  if (Array.isArray(answer)) return answer.length ? JSON.stringify(answer) : ""
   return answer ?? ""
 }
 

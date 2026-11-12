@@ -173,4 +173,5 @@ test("an answer goes to Hermes's run route in the shape it reads back", () => {
   assert.equal(clarifyWire(["Auth, with a comma"]), '["Auth, with a comma"]', "one pick is too")
   assert.equal(clarifyWire("Postgres"), "Postgres", "one answer is its words")
   assert.equal(clarifyWire(null), "", "a skipped question has none")
+  assert.equal(clarifyWire([]), "", "and so has one with nothing picked")
 })
