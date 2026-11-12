@@ -62,7 +62,7 @@ import {
   type Connection,
   type Queued,
 } from "./api"
-import { clarifyRead, questionAt } from "@/lib/clarify"
+import { clarifyRead, clarifyWire, questionAt } from "@/lib/clarify"
 import { WAITING_ON_ANSWER } from "@/lib/format"
 import { PROMPT_RETRY_MS } from "@/lib/freshness"
 import { heldParts, messageParts } from "./messages"
@@ -350,7 +350,7 @@ function QuestionCard({
           type="button"
           data-submit
           className="rounded-md bg-primary px-3 py-1 text-primary-foreground"
-          onClick={() => onAnswer(waiting.choices.length ? picked.join(", ") : typed)}
+          onClick={() => onAnswer(waiting.choices.length ? clarifyWire(picked) : typed)}
         >
           Answer
         </button>

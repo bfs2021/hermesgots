@@ -3109,6 +3109,15 @@ const LIVE_CLARIFY = process.env.MOCK_LIVE_CLARIFY === "1"
 // Hermes 0.23.1 words a question asked off its own local viewers with a newline and a localized
 // hint after it (`gateway.clarify.skip_hint`), and settles an answer and raises the call's next
 // question on the run's stream before the answer's own response is written. Both are this mode's.
+/** A multi-select answer as Hermes reads one: a JSON list, else the one typed answer. */
+function listOf(said) {
+  try {
+    const parsed = JSON.parse(said)
+    if (Array.isArray(parsed)) return parsed.filter((one) => String(one).trim())
+  } catch {}
+  return [said]
+}
+
 const SKIP_HINT = '\nReply "skip" to skip this question.'
 const CLARIFY_REPLY_MS = 100
 const runs = new Map()
@@ -3914,9 +3923,16 @@ function startRun(req, body, options = {}) {
           outcome = settled.outcome
           break
         }
-        // Hermes reads the word "skip" as a question skipped, as it does an answer with no words.
-        const said = (settled.answer ?? "").trim()
-        answers[question.id] = !said || said.toLowerCase() === "skip" ? null : settled.answer
+        // Hermes's run route records its own skip value as a question skipped, and stores any other
+        // reply as sent — the word "skip" included; a multi-select answer is split only from a JSON
+        // list (`_clean_answer` in `tools/clarify_tool.py`).
+        const said = settled.answer ?? ""
+        answers[question.id] =
+          !said.trim() || said === "\u0000skipped"
+            ? null
+            : question.multi_select
+              ? listOf(said)
+              : said
         push("clarify.settled", { prompt_id: run.clarify.prompt_id, execution_generation: 0 })
       }
       pendingClarifies.delete(id)

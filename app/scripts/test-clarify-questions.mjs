@@ -8,7 +8,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { clarifyRead, questionAt } from "../src/lib/clarify.ts"
+import { clarifyRead, clarifyWire, questionAt } from "../src/lib/clarify.ts"
 import { questionsAround, questionsOf } from "../src/lib/clarify-questions.ts"
 
 const ASKED = JSON.stringify({
@@ -164,4 +164,13 @@ test("a response of Hermes's own word for a skip reads as a question skipped", (
     ]),
   )
   assert.deepEqual(offered.asked[0].answers, ["skip"], "a choice the question offered is an answer")
+})
+
+test("an answer goes to Hermes's run route in the shape it reads back", () => {
+  // Hermes splits a multi-select answer only when it is a JSON list: picks joined with a comma were
+  // recorded as one choice, "Auth, Search".
+  assert.equal(clarifyWire(["Auth", "Search"]), '["Auth","Search"]', "several picks are a list")
+  assert.equal(clarifyWire(["Auth, with a comma"]), '["Auth, with a comma"]', "one pick is too")
+  assert.equal(clarifyWire("Postgres"), "Postgres", "one answer is its words")
+  assert.equal(clarifyWire(null), "", "a skipped question has none")
 })
